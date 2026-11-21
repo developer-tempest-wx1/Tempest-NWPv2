@@ -315,3 +315,186 @@ def find_valid_prior_restart(
 
     summary = "; ".join(rejection_reasons[:3]) if rejection_reasons else "No candidates found"
     return None, f"No valid restart state found for domain '{domain}' with nz={nz} ({summary})"
+
+
+_V2_REQUIRED_VARS = (
+    "u",
+    "v",
+    "w",
+    "theta_p",
+    "pi_p",
+    "qv",
+    "qc",
+    "qr",
+    "qi",
+    "qs",
+    "qg",
+    "hs_m",
+    "t_skin",
+    "soil_t",
+    "soil_m",
+)
+
+
+def _parse_iso_utc(raw: Any) -> Optional[datetime.datetime]:
+    if raw is None:
+        return None
+    s = str(raw).strip()
+    if not s:
+        return None
+    dt = datetime.datetime.fromisoformat(s.replace("Z", "+00:00"))
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=datetime.timezone.utc)
+    return dt.astimezone(datetime.timezone.utc)
+
+
+def validate_v2_restart(
+    path: Path | str,
+    *,
+    expected_domain_name: Optional[str] = None,
+    expected_shape: Optional[Tuple[int, int, int]] = None,
+    max_age_hours: Optional[float] = None,
+    reference_utc: Optional[datetime.datetime] = None,
+) -> Tuple[bool, str]:
+    """Validate a native Tempest-NWP v2 WX-1 restart container (`tempest_v2_restart`)."""
+    p = Path(path)
+    if not p.exists() or not p.is_file():
+        return False, f"Restart file missing: {p}"
+
+    try:
+        with wx1.open_dataset(p) as ds:
+            attrs = dict(ds.attrs)
+            if attrs.get("kind") != "tempest_v2_restart":
+                return False, f"Unexpected WX-1 kind={attrs.get('kind')!r} (expected 'tempest_v2_restart')"
+
+            actual_domain = str(attrs.get("domain_name", "")).strip()
+            if expected_domain_name is not None:
+                exp_norm = normalize_domain_name(expected_domain_name)
+                act_norm = normalize_domain_name(actual_domain)
+                if act_norm != exp_norm and actual_domain.lower() != expected_domain_name.strip().lower():
+                    return False, f"Domain mismatch: got {actual_domain!r}, expected {expected_domain_name!r}"
+
+            v_dt = _parse_iso_utc(attrs.get("valid_time_utc"))
+            if v_dt is None:
+                return False, "Missing or invalid valid_time_utc attribute"
+
+            if max_age_hours is not None:
+                ref_dt = (
+                    reference_utc.astimezone(datetime.timezone.utc)
+                    if (reference_utc is not None and reference_utc.tzinfo is not None)
+                    else (
+                        reference_utc.replace(tzinfo=datetime.timezone.utc)
+                        if reference_utc is not None
+                        else datetime.datetime.now(datetime.timezone.utc)
+                    )
+                )
+                age_h = (ref_dt - v_dt).total_seconds() / 3600.0
+                if age_h < -1e-3:
+                    return False, f"Restart valid_time_utc {v_dt.isoformat()} is in the future vs {ref_dt.isoformat()}"
+                if age_h > float(max_age_hours):
+                    return False, f"Restart expired: age {age_h:.2f}h > {float(max_age_hours):.2f}h"
+
+            missing = [vn for vn in _V2_REQUIRED_VARS if vn not in ds]
+            if missing:
+                return False, f"Missing required v2 restart variables: {missing}"
+
+            thp = np.asarray(ds["theta_p"].values, dtype=np.float32)
+            if expected_shape is not None and tuple(thp.shape) != tuple(expected_shape):
+                return False, f"Shape mismatch: got {tuple(thp.shape)}, expected {tuple(expected_shape)}"
+
+            nz, ny, nx = (int(thp.shape[0]), int(thp.shape[1]), int(thp.shape[2]))
+            expected_shapes = {
+                "u": (nz, ny, nx + 1),
+                "v": (nz, ny + 1, nx),
+                "w": (nz + 1, ny, nx),
+                "theta_p": (nz, ny, nx),
+                "pi_p": (nz, ny, nx),
+                "hs_m": (ny, nx),
+                "t_skin": (ny, nx),
+                "soil_t": (4, ny, nx),
+                "soil_m": (4, ny, nx),
+            }
+            for vn in _V2_REQUIRED_VARS:
+                arr = np.asarray(ds[vn].values)
+                if vn in expected_shapes and tuple(arr.shape) != expected_shapes[vn]:
+                    return False, f"Variable {vn} shape {tuple(arr.shape)} != {expected_shapes[vn]}"
+                if not np.all(np.isfinite(arr)):
+                    return False, f"Non-finite values in variable {vn}"
+
+            u_arr = np.asarray(ds["u"].values, dtype=np.float32)
+            v_arr = np.asarray(ds["v"].values, dtype=np.float32)
+            pi_arr = np.asarray(ds["pi_p"].values, dtype=np.float32)
+            if float(np.max(np.abs(thp))) > 250.0:
+                return False, f"Unphysical theta_p excursion max|theta_p|={float(np.max(np.abs(thp))):.2f} K"
+            if float(np.max(np.abs(pi_arr))) > 0.8:
+                return False, f"Unphysical pi_p excursion max|pi_p|={float(np.max(np.abs(pi_arr))):.3f}"
+            if float(np.max(np.abs(u_arr))) > 220.0 or float(np.max(np.abs(v_arr))) > 220.0:
+                return False, "Unphysical wind speed > 220 m/s in restart"
+            for qn in ("qv", "qc", "qr", "qi", "qs", "qg"):
+                q_arr = np.asarray(ds[qn].values, dtype=np.float32)
+                if float(np.min(q_arr)) < -1e-6:
+                    return False, f"Negative moisture mixing ratio in {qn}: min={float(np.min(q_arr)):.3e}"
+    except Exception as exc:
+        return False, f"Failed to read WX-1 v2 restart {p}: {exc}"
+
+    return True, f"OK: valid tempest_v2_restart ({actual_domain} {nz}x{ny}x{nx} @ {v_dt.isoformat()})"
+
+
+def find_latest_valid_cycle_restart(
+    runs_root: Path | str,
+    domain_name: str,
+    target_valid_utc: datetime.datetime,
+    *,
+    max_age_hours: float = 24.0,
+    expected_shape: Optional[Tuple[int, int, int]] = None,
+    exact_valid_match: bool = True,
+    exact_tolerance_s: float = 60.0,
+) -> Optional[Path]:
+    """Search per-cycle run directories (`runs_root/*/restarts/*.wx1`) for a valid warm-start restart."""
+    root = Path(runs_root)
+    if not root.exists():
+        return None
+
+    target_dt = (
+        target_valid_utc.astimezone(datetime.timezone.utc)
+        if target_valid_utc.tzinfo is not None
+        else target_valid_utc.replace(tzinfo=datetime.timezone.utc)
+    )
+
+    cand_files: list[Path] = []
+    for run_dir in root.iterdir():
+        if run_dir.is_symlink() or not run_dir.is_dir():
+            continue
+        for sub_name in ("restarts", "cycle_restarts"):
+            sub = run_dir / sub_name
+            if sub.exists() and sub.is_dir():
+                cand_files.extend(sub.glob("*.wx1"))
+
+    accepted: list[Tuple[datetime.datetime, float, Path]] = []
+    for cand in cand_files:
+        ok, _msg = validate_v2_restart(
+            cand,
+            expected_domain_name=domain_name,
+            expected_shape=expected_shape,
+            max_age_hours=max_age_hours,
+            reference_utc=target_dt,
+        )
+        if not ok:
+            continue
+        with wx1.open_dataset(cand) as ds:
+            v_dt = _parse_iso_utc(ds.attrs.get("valid_time_utc"))
+        if v_dt is None:
+            continue
+        diff_s = (target_dt - v_dt).total_seconds()
+        if exact_valid_match:
+            if abs(diff_s) > float(exact_tolerance_s):
+                continue
+        else:
+            if diff_s < -float(exact_tolerance_s) or diff_s > float(max_age_hours) * 3600.0:
+                continue
+        accepted.append((v_dt, cand.stat().st_mtime, cand))
+
+    if not accepted:
+        return None
+    accepted.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return accepted[0][2]
