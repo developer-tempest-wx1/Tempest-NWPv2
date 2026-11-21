@@ -29,7 +29,7 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tupl
 from tempest_v2.notifier import notify_run_event
 from tempest_v2.projection import DomainSpec, get_domain_spec
 from tempest_v2.restart_validator import find_latest_valid_cycle_restart
-from tempest_v2.runner import create_run_layout, run_two_nest_pipeline
+from tempest_v2.runner import create_run_layout, run_three_nest_pipeline, run_two_nest_pipeline
 
 logger = logging.getLogger("tempest_v2.daemon")
 
@@ -45,12 +45,17 @@ class DaemonConfig:
     cycle_delay_minutes: int = 35
     poll_interval_s: float = 60.0
     keep_runs: int = 16
+    d1_lead_hours: float = 24.0
     d2_lead_hours: float = 24.0
     d3_lead_hours: float = 24.0
     nz: int = 65
+    dt_d1_s: float = 60.0
     dt_d2_s: float = 20.0
     dt_d3_s: float = 4.0
     physics_every: int = 5
+    enable_d1: bool = False
+    enable_ocean_si3: bool = True
+    include_3d_diagnostics: bool = True
     cycle_restart_hours: Tuple[float, ...] = (6.0,)
     restart_max_age_hours: float = 24.0
     ensemble_members: int = 0
@@ -207,6 +212,7 @@ def run_single_cycle(
     init_time_utc: datetime.datetime,
     *,
     run_tag: Optional[str] = None,
+    d1_spec: Optional[DomainSpec] = None,
     d2_spec: Optional[DomainSpec] = None,
     d3_spec: Optional[DomainSpec] = None,
     pipeline_fn: Optional[Callable[..., Dict[str, Any]]] = None,
@@ -220,8 +226,10 @@ def run_single_cycle(
     run_dir = layout["run_dir"]
     run_id = run_dir.name
 
+    d1_name = d1_spec.name if d1_spec is not None else "d1_global_0p25"
     d2_name = d2_spec.name if d2_spec is not None else "d2_eu_lcc"
     d3_name = d3_spec.name if d3_spec is not None else "d3_benelux_de_1p5km"
+    d1_shape = (int(d1_spec.nz), int(d1_spec.ny), int(d1_spec.nx)) if d1_spec is not None else None
     d2_shape = (int(d2_spec.nz), int(d2_spec.ny), int(d2_spec.nx)) if d2_spec is not None else None
     d3_shape = (int(d3_spec.nz), int(d3_spec.ny), int(d3_spec.nx)) if d3_spec is not None else None
 
@@ -242,12 +250,22 @@ def run_single_cycle(
         expected_shape=d2_shape,
         exact_valid_match=True,
     )
+    d1_restart: Optional[Path] = None
+    if cfg.enable_d1 and pipeline_fn is None:
+        d1_restart = find_latest_valid_cycle_restart(
+            cfg.runs_root,
+            d1_name,
+            init_dt,
+            max_age_hours=cfg.restart_max_age_hours,
+            expected_shape=d1_shape,
+            exact_valid_match=True,
+        )
 
     sfc_grib: Optional[Path] = None
     pl_grib: Optional[Path] = None
     if d3_restart is not None:
         ic_source = "restart"
-        logger.info("[%s] Warm-starting cycle from %s (d2=%s)", run_id, d3_restart, d2_restart)
+        logger.info("[%s] Warm-starting cycle from %s (d2=%s, d1=%s)", run_id, d3_restart, d2_restart, d1_restart)
     else:
         ic_source = "ecmwf"
         logger.info("[%s] Cold-starting cycle via ECMWF step-0 analysis", run_id)
@@ -284,7 +302,17 @@ def run_single_cycle(
             )
             obs_dir_used = run_obs_dir
 
-    # 3. Execute 2-nest D2->D3 + optional 51+-member ensemble inside `layout["run_dir"]`
+    osisaf_path: Optional[Path] = None
+    if obs_dir_used is not None and Path(obs_dir_used).is_dir():
+        main_osi = sorted(Path(obs_dir_used).rglob("osi_saf_sea_ice.wx1"))
+        if main_osi:
+            osisaf_path = main_osi[-1]
+        else:
+            osisaf_matches = sorted(Path(obs_dir_used).rglob("osisaf*.wx1"))
+            if osisaf_matches:
+                osisaf_path = osisaf_matches[-1]
+
+    # 3. Execute operational 2-nest (D2->D3) or 3-nest (D1->D2->D3) + optional ensemble inside `layout["run_dir"]`
     if cfg.enable_notifier:
         notify_run_event(
             "start",
@@ -295,28 +323,47 @@ def run_single_cycle(
             ntfy_topic=cfg.notify_topic,
         )
 
-    runner_call = pipeline_fn if pipeline_fn is not None else run_two_nest_pipeline
-    pipe_res = runner_call(
-        forecast_hours=cfg.d3_lead_hours,
-        nz=cfg.nz,
-        ic_source=ic_source,
-        sfc_grib=sfc_grib,
-        pl_grib=pl_grib,
-        restart_path=d3_restart,
-        d2_restart_path=d2_restart,
-        obs_dir=obs_dir_used,
-        run_dir=run_dir,
-        cycle_restart_hours=cfg.cycle_restart_hours,
-        ensemble_members=cfg.ensemble_members,
-        ensemble_lead_hours=cfg.ensemble_lead_hours,
-        ensemble_seed=cfg.ensemble_seed,
-        d2_spec=d2_spec,
-        d3_spec=d3_spec,
-        enable_da=cfg.enable_da,
-        dt_d2_s=cfg.dt_d2_s,
-        dt_d3_s=cfg.dt_d3_s,
-        physics_every=cfg.physics_every,
-    )
+    common_kwargs: Dict[str, Any] = {
+        "forecast_hours": cfg.d3_lead_hours,
+        "nz": cfg.nz,
+        "ic_source": ic_source,
+        "sfc_grib": sfc_grib,
+        "pl_grib": pl_grib,
+        "restart_path": d3_restart,
+        "d2_restart_path": d2_restart,
+        "obs_dir": obs_dir_used,
+        "run_dir": run_dir,
+        "cycle_restart_hours": cfg.cycle_restart_hours,
+        "ensemble_members": cfg.ensemble_members,
+        "ensemble_lead_hours": cfg.ensemble_lead_hours,
+        "ensemble_seed": cfg.ensemble_seed,
+        "d2_spec": d2_spec,
+        "d3_spec": d3_spec,
+        "enable_da": cfg.enable_da,
+        "dt_d2_s": cfg.dt_d2_s,
+        "dt_d3_s": cfg.dt_d3_s,
+        "physics_every": cfg.physics_every,
+    }
+    if pipeline_fn is not None:
+        pipe_res = pipeline_fn(**common_kwargs)
+    elif cfg.enable_d1:
+        pipe_res = run_three_nest_pipeline(
+            **common_kwargs,
+            d1_forecast_hours=cfg.d1_lead_hours,
+            d1_spec=d1_spec,
+            d1_restart_path=d1_restart,
+            dt_d1_s=cfg.dt_d1_s,
+            enable_ocean_si3=cfg.enable_ocean_si3,
+            include_3d_diagnostics=cfg.include_3d_diagnostics,
+            osisaf_wx1_path=osisaf_path,
+        )
+    else:
+        pipe_res = run_two_nest_pipeline(
+            **common_kwargs,
+            enable_ocean_si3=cfg.enable_ocean_si3,
+            include_3d_diagnostics=cfg.include_3d_diagnostics,
+            osisaf_wx1_path=osisaf_path,
+        )
 
     latest_link = update_latest_symlink(cfg.runs_root, run_dir)
     pruned = prune_old_runs(cfg.runs_root, cfg.keep_runs, protected_dirs=[run_dir])
@@ -331,6 +378,7 @@ def run_single_cycle(
         "warm_started": bool(ic_source == "restart"),
         "restart_path": str(d3_restart) if d3_restart is not None else None,
         "d2_restart_path": str(d2_restart) if d2_restart is not None else None,
+        "d1_restart_path": str(d1_restart) if d1_restart is not None else None,
         "pruned_runs": [str(p) for p in pruned],
         "elapsed_s": elapsed_s,
         "pipeline": pipe_res,
@@ -357,6 +405,7 @@ def run_daemon_loop(
     max_cycles: Optional[int] = None,
     stop_event: Optional[threading.Event] = None,
     explicit_cycle_times: Optional[Sequence[datetime.datetime]] = None,
+    d1_spec: Optional[DomainSpec] = None,
     d2_spec: Optional[DomainSpec] = None,
     d3_spec: Optional[DomainSpec] = None,
     pipeline_fn: Optional[Callable[..., Dict[str, Any]]] = None,
@@ -422,6 +471,7 @@ def run_daemon_loop(
                         res = run_single_cycle(
                             cfg,
                             target_dt,
+                            d1_spec=d1_spec,
                             d2_spec=d2_spec,
                             d3_spec=d3_spec,
                             pipeline_fn=pipeline_fn,

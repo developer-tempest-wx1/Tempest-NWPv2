@@ -14,7 +14,21 @@ import numpy as np
 from tempest_v2.ic_builder import unstagger_uv
 from tempest_v2.projection import CP_D, GRAVITY_M_S2, KAPPA, P0_PA, R_D, DomainSpec, VerticalGrid
 
-STANDARD_PLEV_HPA: tuple[int, ...] = (1000, 925, 850, 700, 500, 300, 200)
+STANDARD_PLEV_HPA: tuple[int, ...] = (
+    1000,
+    925,
+    850,
+    700,
+    600,
+    500,
+    400,
+    300,
+    250,
+    200,
+    150,
+    100,
+    50,
+)
 STANDARD_PLEV_PA: np.ndarray = np.array([h * 100.0 for h in STANDARD_PLEV_HPA], dtype=np.float32)
 
 _EPS_MW = 0.62198
@@ -116,20 +130,40 @@ def compute_pressure_level_fields(
     w_3d = 0.5 * (w_raw[:-1] + w_raw[1:]) if w_raw.shape[0] == spec.nz + 1 else w_raw
 
     nz, ny, nx = spec.nz, spec.ny, spec.nx
+    qc_3d = np.maximum(np.asarray(state_3d.get("qc", np.zeros((nz, ny, nx))), dtype=np.float64), 0.0)
+    qr_3d = np.maximum(np.asarray(state_3d.get("qr", np.zeros((nz, ny, nx))), dtype=np.float64), 0.0)
+    qi_3d = np.maximum(np.asarray(state_3d.get("qi", np.zeros((nz, ny, nx))), dtype=np.float64), 0.0)
+    qs_3d = np.maximum(np.asarray(state_3d.get("qs", np.zeros((nz, ny, nx))), dtype=np.float64), 0.0)
+    qg_3d = np.maximum(np.asarray(state_3d.get("qg", np.zeros((nz, ny, nx))), dtype=np.float64), 0.0)
+
     np_out = len(p_targets)
     shape_out = (np_out, ny, nx)
 
     t_pl = np.empty(shape_out, dtype=np.float32)
     gh_pl = np.empty(shape_out, dtype=np.float32)
+    z_pl = np.empty(shape_out, dtype=np.float32)
+    theta_pl = np.empty(shape_out, dtype=np.float32)
     q_pl = np.empty(shape_out, dtype=np.float32)
     rh_pl = np.empty(shape_out, dtype=np.float32)
     u_pl = np.empty(shape_out, dtype=np.float32)
     v_pl = np.empty(shape_out, dtype=np.float32)
     w_pl = np.empty(shape_out, dtype=np.float32)
+    omega_pl = np.empty(shape_out, dtype=np.float32)
+    vo_pl = np.empty(shape_out, dtype=np.float32)
+    div_pl = np.empty(shape_out, dtype=np.float32)
+    qc_pl = np.empty(shape_out, dtype=np.float32)
+    qr_pl = np.empty(shape_out, dtype=np.float32)
+    qi_pl = np.empty(shape_out, dtype=np.float32)
+    qs_pl = np.empty(shape_out, dtype=np.float32)
+    qg_pl = np.empty(shape_out, dtype=np.float32)
+
+    dx_eff = np.maximum(float(spec.dx_m) / np.maximum(spec.map_factor, 0.05), 1.0)
+    dy_eff = float(spec.dy_m)
 
     jj, ii = np.meshgrid(np.arange(ny), np.arange(nx), indexing="ij")
     for ip, pt in enumerate(p_targets):
-        lpt = np.log(max(float(pt), 1.0))
+        pt_f = max(float(pt), 1.0)
+        lpt = np.log(pt_f)
         k_hi = np.clip(np.sum(ln_p > lpt, axis=0), 1, nz - 1)
         k_lo = k_hi - 1
 
@@ -144,11 +178,16 @@ def compute_pressure_level_fields(
         u_i = (1.0 - wt) * u_3d[k_lo, jj, ii] + wt * u_3d[k_hi, jj, ii]
         v_i = (1.0 - wt) * v_3d[k_lo, jj, ii] + wt * v_3d[k_hi, jj, ii]
         w_i = (1.0 - wt) * w_3d[k_lo, jj, ii] + wt * w_3d[k_hi, jj, ii]
+        qc_i = (1.0 - wt) * qc_3d[k_lo, jj, ii] + wt * qc_3d[k_hi, jj, ii]
+        qr_i = (1.0 - wt) * qr_3d[k_lo, jj, ii] + wt * qr_3d[k_hi, jj, ii]
+        qi_i = (1.0 - wt) * qi_3d[k_lo, jj, ii] + wt * qi_3d[k_hi, jj, ii]
+        qs_i = (1.0 - wt) * qs_3d[k_lo, jj, ii] + wt * qs_3d[k_hi, jj, ii]
+        qg_i = (1.0 - wt) * qg_3d[k_lo, jj, ii] + wt * qg_3d[k_hi, jj, ii]
 
         below = pt > p_3d[0]
         if np.any(below):
             t0 = np.maximum(t_3d[0], 200.0)
-            t_ext = t0 * ((pt / np.maximum(p_3d[0], 100.0)) ** (R_D * _GAMMA_STD / GRAVITY_M_S2))
+            t_ext = t0 * ((pt_f / np.maximum(p_3d[0], 100.0)) ** (R_D * _GAMMA_STD / GRAVITY_M_S2))
             z_ext = z_s[0] - (t_ext - t0) / _GAMMA_STD
             t_i = np.where(below, t_ext, t_i)
             z_i = np.where(below, z_ext, z_i)
@@ -157,11 +196,16 @@ def compute_pressure_level_fields(
             u_i = np.where(below, u_3d[0], u_i)
             v_i = np.where(below, v_3d[0], v_i)
             w_i = np.where(below, w_3d[0], w_i)
+            qc_i = np.where(below, qc_3d[0], qc_i)
+            qr_i = np.where(below, qr_3d[0], qr_i)
+            qi_i = np.where(below, qi_3d[0], qi_i)
+            qs_i = np.where(below, qs_3d[0], qs_i)
+            qg_i = np.where(below, qg_3d[0], qg_i)
 
         above = pt < p_3d[-1]
         if np.any(above):
             t_top = np.maximum(t_3d[-1], 160.0)
-            z_ext = z_s[-1] + (R_D * t_top / GRAVITY_M_S2) * np.log(np.maximum(p_3d[-1], 10.0) / pt)
+            z_ext = z_s[-1] + (R_D * t_top / GRAVITY_M_S2) * np.log(np.maximum(p_3d[-1], 10.0) / pt_f)
             t_i = np.where(above, t_top, t_i)
             z_i = np.where(above, z_ext, z_i)
             q_i = np.where(above, qv[-1], q_i)
@@ -169,23 +213,65 @@ def compute_pressure_level_fields(
             u_i = np.where(above, u_3d[-1], u_i)
             v_i = np.where(above, v_3d[-1], v_i)
             w_i = np.where(above, w_3d[-1], w_i)
+            qc_i = np.where(above, qc_3d[-1], qc_i)
+            qr_i = np.where(above, qr_3d[-1], qr_i)
+            qi_i = np.where(above, qi_3d[-1], qi_i)
+            qs_i = np.where(above, qs_3d[-1], qs_i)
+            qg_i = np.where(above, qg_3d[-1], qg_i)
+
+        q_clamped = np.clip(q_i, 0.0, 0.05)
+        tv_i = np.maximum(t_i * (1.0 + 0.608 * q_clamped), 150.0)
+        rho_i = pt_f / (R_D * tv_i)
+        omega_i = -rho_i * GRAVITY_M_S2 * w_i
+        theta_i = t_i * ((P0_PA / pt_f) ** KAPPA)
+
+        if nx >= 2 and ny >= 2:
+            du_dx = np.gradient(u_i, axis=1) / dx_eff
+            dv_dx = np.gradient(v_i, axis=1) / dx_eff
+            du_dy = np.gradient(u_i, dy_eff, axis=0)
+            dv_dy = np.gradient(v_i, dy_eff, axis=0)
+            vo_i = dv_dx - du_dy
+            div_i = du_dx + dv_dy
+        else:
+            vo_i = np.zeros_like(u_i)
+            div_i = np.zeros_like(u_i)
 
         t_pl[ip] = t_i.astype(np.float32)
         gh_pl[ip] = z_i.astype(np.float32)
-        q_pl[ip] = np.clip(q_i, 0.0, 0.05).astype(np.float32)
+        z_pl[ip] = (GRAVITY_M_S2 * z_i).astype(np.float32)
+        theta_pl[ip] = theta_i.astype(np.float32)
+        q_pl[ip] = q_clamped.astype(np.float32)
         rh_pl[ip] = np.clip(r_i, 0.0, 100.0).astype(np.float32)
         u_pl[ip] = u_i.astype(np.float32)
         v_pl[ip] = v_i.astype(np.float32)
         w_pl[ip] = w_i.astype(np.float32)
+        omega_pl[ip] = omega_i.astype(np.float32)
+        vo_pl[ip] = vo_i.astype(np.float32)
+        div_pl[ip] = div_i.astype(np.float32)
+        qc_pl[ip] = np.maximum(qc_i, 0.0).astype(np.float32)
+        qr_pl[ip] = np.maximum(qr_i, 0.0).astype(np.float32)
+        qi_pl[ip] = np.maximum(qi_i, 0.0).astype(np.float32)
+        qs_pl[ip] = np.maximum(qs_i, 0.0).astype(np.float32)
+        qg_pl[ip] = np.maximum(qg_i, 0.0).astype(np.float32)
 
     return {
         "t_pl": t_pl,
         "gh_pl": gh_pl,
+        "z_pl": z_pl,
+        "theta_pl": theta_pl,
         "q_pl": q_pl,
         "rh_pl": rh_pl,
         "u_pl": u_pl,
         "v_pl": v_pl,
         "w_pl": w_pl,
+        "omega_pl": omega_pl,
+        "vo_pl": vo_pl,
+        "div_pl": div_pl,
+        "qc_pl": qc_pl,
+        "qr_pl": qr_pl,
+        "qi_pl": qi_pl,
+        "qs_pl": qs_pl,
+        "qg_pl": qg_pl,
     }
 
 

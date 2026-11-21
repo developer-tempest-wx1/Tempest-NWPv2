@@ -60,14 +60,28 @@ def compute_mslp_pa(
     return (p0 * np.exp((GRAVITY_M_S2 * z_0) / (R_D * np.maximum(tv0, 160.0)))).astype(np.float32)
 
 
+def _expand_obs_search_dirs(obs_dir: Path) -> List[Path]:
+    roots = [obs_dir]
+    runs_sub = obs_dir / "runs"
+    for parent in (obs_dir, runs_sub):
+        if parent.is_dir():
+            ts_dirs = sorted(
+                d for d in parent.iterdir() if d.is_dir() and len(d.name) >= 11 and d.name.endswith("Z")
+            )
+            if ts_dirs:
+                roots.append(ts_dirs[-1])
+    search_dirs: List[Path] = []
+    seen: set[Path] = set()
+    for r in roots:
+        for sub in (r, r / "sfc", r / "upperair", r / "satellite", r / "marine"):
+            if sub not in seen:
+                seen.add(sub)
+                search_dirs.append(sub)
+    return search_dirs
+
+
 def _read_obs_prefix(obs_dir: Path, prefix: str) -> Optional[Dict[str, np.ndarray]]:
-    search_dirs = [
-        obs_dir,
-        obs_dir / "sfc",
-        obs_dir / "upperair",
-        obs_dir / "satellite",
-        obs_dir / "marine",
-    ]
+    search_dirs = _expand_obs_search_dirs(Path(obs_dir))
     found_dir: Optional[Path] = None
     main_path: Optional[Path] = None
     for d in search_dirs:
@@ -76,7 +90,13 @@ def _read_obs_prefix(obs_dir: Path, prefix: str) -> Optional[Dict[str, np.ndarra
             found_dir = d
             main_path = cand
             break
-    if main_path is None or found_dir is None:
+        if any(
+            (d / f"{prefix}_{suf}.wx1").is_file()
+            for suf in ("u_wind", "lat", "latitude", "temp", "pressure", "ztd", "ice_conc")
+        ):
+            found_dir = d
+            break
+    if found_dir is None:
         return None
 
     all_keys = (
@@ -87,6 +107,9 @@ def _read_obs_prefix(obs_dir: Path, prefix: str) -> Optional[Dict[str, np.ndarra
         "longitude",
         "elev",
         "temp",
+        "temperature",
+        "salinity",
+        "depth",
         "u_wind",
         "v_wind",
         "time",
@@ -98,20 +121,25 @@ def _read_obs_prefix(obs_dir: Path, prefix: str) -> Optional[Dict[str, np.ndarra
         "ice_thick",
     )
     fields: Dict[str, np.ndarray] = {}
-    with wx1.open_dataset(main_path) as ds:
-        for k in all_keys:
-            if k in ds:
-                fields[k] = np.asarray(ds[k].values)
-        if not fields and len(ds.data_vars) == 1:
-            only_var = next(iter(ds.data_vars))
-            fields[str(only_var)] = np.asarray(ds[only_var].values)
+    if main_path is not None and main_path.is_file():
+        with wx1.open_dataset(main_path) as ds:
+            for k in all_keys:
+                if k in ds:
+                    fields[k] = np.asarray(ds[k].values)
+            if not fields and len(ds.data_vars) == 1:
+                only_var = next(iter(ds.data_vars))
+                fields[str(only_var)] = np.asarray(ds[only_var].values)
 
     for k in (
         "pressure",
         "lat",
         "lon",
+        "latitude",
+        "longitude",
         "elev",
         "temp",
+        "salinity",
+        "depths",
         "u_wind",
         "v_wind",
         "time",
@@ -136,6 +164,8 @@ def _read_obs_prefix(obs_dir: Path, prefix: str) -> Optional[Dict[str, np.ndarra
         fields["lat"] = fields["latitude"]
     if "lon" not in fields and "longitude" in fields:
         fields["lon"] = fields["longitude"]
+    if "temp" not in fields and "temperature" in fields:
+        fields["temp"] = fields["temperature"]
     if "lat" not in fields or "lon" not in fields:
         return None
     return fields
@@ -462,14 +492,19 @@ def load_station_obs_wx1(
     # 4. Spaceborne AMV & Scatterometer Winds (EUMETSAT MTG, Metop ASCAT, GOES, Himawari)
     sat_sources = (
         ("eumetsat_amv", "eumetsat"),
+        ("eumetsat_amv", "satellite_eumetsat_meteosat_amv_winds"),
         ("ascat", "eumetsat_ascat"),
         ("goes_amv", "satellite_goes_amv_winds"),
         ("himawari_amv", "satellite_jma_himawari9_winds"),
     )
+    seen_sat_prefixes: set[str] = set()
     for provider, prefix in sat_sources:
         data = _read_obs_prefix(odir, prefix)
         if data is None:
             continue
+        if provider == "eumetsat_amv" and "eumetsat_amv" in seen_sat_prefixes:
+            continue
+        seen_sat_prefixes.add(provider)
         n = len(data["lat"])
         lats = np.asarray(data["lat"], dtype=np.float64)
         lons = np.asarray(data["lon"], dtype=np.float64)
@@ -515,6 +550,33 @@ def load_station_obs_wx1(
                     time_offset_sec=t_off,
                 )
             )
+
+    # 4b. Copernicus / Coriolis GDAC Argo float near-surface (5 m) in-situ temperature -> SST observations
+    argo_data = _read_obs_prefix(odir, "argo_ocean_profiles")
+    if argo_data is not None and "temp" in argo_data:
+        a_lats = np.asarray(argo_data["lat"], dtype=np.float64)
+        a_lons = np.asarray(argo_data["lon"], dtype=np.float64)
+        a_temps = np.asarray(argo_data["temp"], dtype=np.float64)
+        if a_temps.ndim == 2 and a_temps.shape[0] == len(a_lats) and a_temps.shape[1] >= 1:
+            for idx in range(len(a_lats)):
+                lat, lon = float(a_lats[idx]), float(a_lons[idx])
+                chk = _in_domain_and_window(lat, lon, float("nan"))
+                if chk is None:
+                    continue
+                t_top = float(a_temps[idx, 0])
+                if math.isfinite(t_top) and 271.0 <= t_top <= 310.0:
+                    obs_list.append(
+                        VarObservation(
+                            station_id=f"argo_{idx:04d}",
+                            var_type="sst",
+                            lat=lat,
+                            lon=lon,
+                            alt_m=0.0,
+                            value=t_top,
+                            error_variance=0.6**2,
+                            time_offset_sec=0.0,
+                        )
+                    )
 
     # 5. Spatial TITAN Buddy Check QC on surface stations (t2m, ps/mslp, wind u/v)
     if enable_titan_qc and len(stn_rows) >= 4:
@@ -682,6 +744,39 @@ def run_domain_3dvar(
             converged=c_res.converged,
         )
     else:
+        eff_traj = trajectory
+        if eff_traj is None and any(abs(float(o.time_offset_sec)) > 60.0 for o in obs_list) and spec.nx >= 3 and spec.ny >= 3:
+            # 4D-FGAT kinematic first-guess trajectory x_b(t) = x_b(0) - t * (u_b * d/dx + v_b * d/dy) x_b
+            t_offs = [float(o.time_offset_sec) for o in obs_list]
+            t_lo = min(-900.0, min(t_offs))
+            t_hi = max(900.0, max(t_offs))
+            dx_eff = np.maximum(float(spec.dx_m) / np.maximum(spec.map_factor, 0.05), 100.0)
+            dy_eff = max(float(spec.dy_m), 100.0)
+            u_b = np.asarray(bg_centered["u"], dtype=np.float64)
+            v_b = np.asarray(bg_centered["v"], dtype=np.float64)
+
+            def _advect_state(dt_sec: float) -> Dict[str, np.ndarray]:
+                if abs(dt_sec) < 1.0:
+                    return bg_centered
+                out_t: Dict[str, np.ndarray] = {}
+                for k_f, arr_f in bg_centered.items():
+                    a64 = np.asarray(arr_f, dtype=np.float64)
+                    if a64.ndim == 3:
+                        dadx = np.gradient(a64, axis=2) / dx_eff[None, :, :]
+                        dady = np.gradient(a64, dy_eff, axis=1)
+                        adv = np.clip(-dt_sec * (u_b * dadx + v_b * dady), -0.25 * np.std(a64) - 1e-4, 0.25 * np.std(a64) + 1e-4)
+                        out_t[k_f] = (a64 + adv).astype(np.float32)
+                    elif a64.ndim == 2 and k_f == "ps":
+                        dadx = np.gradient(a64, axis=1) / dx_eff
+                        dady = np.gradient(a64, dy_eff, axis=0)
+                        adv = np.clip(-dt_sec * (u_b[0] * dadx + v_b[0] * dady), -400.0, 400.0)
+                        out_t[k_f] = (a64 + adv).astype(np.float32)
+                    else:
+                        out_t[k_f] = arr_f
+                return out_t
+
+            eff_traj = {t_lo: _advect_state(t_lo), 0.0: bg_centered, t_hi: _advect_state(t_hi)}
+
         hop = VarObservationOperator(
             spec, hs, bg_centered, theta_sfc_ref=theta_sfc_ref, p_sfc_ref=p_sfc_ref, n_ref_hz=n_ref_hz
         )
@@ -700,7 +795,7 @@ def run_domain_3dvar(
             cfg,
             balance_op=balance_op,
             land_mask=(np.asarray(lsm) >= 0.5),
-            trajectory=trajectory,
+            trajectory=eff_traj,
         )
 
     updated_c = apply_analysis_increments_with_bounds(bg_centered, res.analysis_increments)
@@ -727,22 +822,44 @@ def run_domain_3dvar(
     if "sst" in updated_c and "sst_bulk" in ana_surf:
         ana_surf["sst_bulk"] = updated_c["sst"].astype(np.float32)
 
-    # Apply OSI-SAF cryosphere sea-ice concentration / thickness when available in obs_dir
+    # Apply OSI-SAF cryosphere sea-ice concentration / thickness on both projected (D2/D3) and global spherical (D1) grids
     if obs_dir is not None:
         osi = _read_obs_prefix(Path(obs_dir), "osi_saf_sea_ice")
         if osi is not None and "ice_conc" in osi:
             ic_vals = np.asarray(osi["ice_conc"], dtype=np.float64)
+            it_vals = np.asarray(
+                osi.get("ice_thick", np.clip(0.4 + 1.8 * (np.maximum(ic_vals, 0.0) ** 1.5), 0.1, 4.5)),
+                dtype=np.float64,
+            )
             ic_lats = np.asarray(osi["lat"], dtype=np.float64)
             ic_lons = np.asarray(osi["lon"], dtype=np.float64)
-            ice_mask = np.isfinite(ic_vals) & (ic_vals >= 0.15)
-            if np.any(ice_mask) and spec.is_projected and spec.projection is not None:
-                xm, ym = spec.projection.latlon_to_xy(ic_lats[ice_mask], ic_lons[ice_mask])
-                ii = np.round((xm - float(spec.x_m[0])) / spec.dx_m).astype(np.int64)
-                jj = np.round((ym - float(spec.y_m[0])) / spec.dy_m).astype(np.int64)
+            ice_mask = np.isfinite(ic_vals) & (ic_vals >= 0.15) & np.isfinite(ic_lats) & np.isfinite(ic_lons)
+            if np.any(ice_mask):
+                if spec.is_projected and spec.projection is not None:
+                    xm, ym = spec.projection.latlon_to_xy(ic_lats[ice_mask], ic_lons[ice_mask])
+                    ii = np.round((xm - float(spec.x_m[0])) / spec.dx_m).astype(np.int64)
+                    jj = np.round((ym - float(spec.y_m[0])) / spec.dy_m).astype(np.int64)
+                else:
+                    lon_m = ic_lons[ice_mask] % 360.0 if float(spec.x_m[-1]) > 180.0 else (((ic_lons[ice_mask] + 180.0) % 360.0) - 180.0)
+                    dx_deg = float(spec.x_m[1] - spec.x_m[0]) if len(spec.x_m) > 1 else 1.0
+                    dy_deg = float(spec.y_m[1] - spec.y_m[0]) if len(spec.y_m) > 1 else 1.0
+                    ii = np.round((lon_m - float(spec.x_m[0])) / dx_deg).astype(np.int64)
+                    jj = np.round((ic_lats[ice_mask] - float(spec.y_m[0])) / dy_deg).astype(np.int64)
                 valid_ij = (ii >= 0) & (ii < spec.nx) & (jj >= 0) & (jj < spec.ny)
-                for j_pt, i_pt in zip(jj[valid_ij], ii[valid_ij]):
-                    if float(lsm[j_pt, i_pt]) < 0.5 and "sst_bulk" in ana_surf:
-                        ana_surf["sst_bulk"][j_pt, i_pt] = np.float32(271.35)
+                ic_m = ic_vals[ice_mask][valid_ij]
+                it_m = it_vals[ice_mask][valid_ij]
+                for j_pt, i_pt, c_pt, h_pt in zip(jj[valid_ij], ii[valid_ij], ic_m, it_m):
+                    if float(lsm[j_pt, i_pt]) < 0.5:
+                        if "sst_bulk" in ana_surf:
+                            ana_surf["sst_bulk"][j_pt, i_pt] = np.float32(271.35)
+                        if "sea_ice_frac" in ana_surf:
+                            ana_surf["sea_ice_frac"][j_pt, i_pt] = np.float32(min(0.997, max(0.0, c_pt)))
+                        if "sea_ice_thick" in ana_surf:
+                            ana_surf["sea_ice_thick"][j_pt, i_pt] = np.float32(max(0.15, h_pt))
+                        if "sea_ice_tsfc" in ana_surf:
+                            ana_surf["sea_ice_tsfc"][j_pt, i_pt] = np.float32(min(float(ana_surf["sea_ice_tsfc"][j_pt, i_pt]), 271.15))
+                        if "sea_ice_albedo" in ana_surf:
+                            ana_surf["sea_ice_albedo"][j_pt, i_pt] = np.float32(0.72)
 
     inc_c = {
         "u": res.analysis_increments.get("u", np.zeros_like(u_c)),
@@ -754,14 +871,16 @@ def run_domain_3dvar(
 
     # Radar Latent Heat Nudging (LHN) via compute_lhn_tendencies
     if radar_rain_rate_mm_h is None and obs_dir is not None:
-        rad_p = Path(obs_dir) / "radar_obs.wx1"
-        if rad_p.is_file():
-            with wx1.open_dataset(rad_p) as rds:
-                vname = "rain_rate_mm_h" if "rain_rate_mm_h" in rds else next(iter(rds.data_vars), None)
-                if vname is not None:
-                    arr_r = np.asarray(rds[vname].values, dtype=np.float64)
-                    if arr_r.shape == (spec.ny, spec.nx):
-                        radar_rain_rate_mm_h = arr_r
+        for cand_d in _expand_obs_search_dirs(Path(obs_dir)):
+            rad_p = cand_d / "radar_obs.wx1"
+            if rad_p.is_file():
+                with wx1.open_dataset(rad_p) as rds:
+                    vname = "rain_rate_mm_h" if "rain_rate_mm_h" in rds else next(iter(rds.data_vars), None)
+                    if vname is not None:
+                        arr_r = np.asarray(rds[vname].values, dtype=np.float64)
+                        if arr_r.shape == (spec.ny, spec.nx):
+                            radar_rain_rate_mm_h = arr_r
+                            break
 
     if radar_rain_rate_mm_h is not None:
         mod_rr_mm_h = (

@@ -585,12 +585,14 @@ def test_diagnostics_pressure_levels_convective_and_wx1_roundtrip(tmp_path: Path
         "qg": np.zeros((32, 8, 8), dtype=np.float32),
     }
     pl = compute_pressure_level_fields(spec, hs, st_isa)
-    # At 500 hPa (index 4 in 1000,925,850,700,500,300,200): exact ISA gh ~ 5574 m, T ~ 251.9 K
+    # At 500 hPa (index 5 in 13-level 1000..50 hPa): exact ISA gh ~ 5574 m, T ~ 251.9 K
+    idx_500 = list(STANDARD_PLEV_PA).index(50_000.0)
     t500_exact = 288.15 * ((50_000.0 / 101_325.0) ** (287.058 * gamma / 9.80665))
     z500_exact = (288.15 - t500_exact) / gamma
-    assert abs(float(np.mean(pl["t_pl"][4])) - t500_exact) < 0.8
-    assert abs(float(np.mean(pl["gh_pl"][4])) - z500_exact) < 35.0
-    assert abs(float(np.mean(pl["u_pl"][4])) - 12.0) < 1e-4
+    assert abs(float(np.mean(pl["t_pl"][idx_500])) - t500_exact) < 0.8
+    assert abs(float(np.mean(pl["gh_pl"][idx_500])) - z500_exact) < 35.0
+    assert abs(float(np.mean(pl["z_pl"][idx_500])) - 9.80665 * z500_exact) < 350.0
+    assert abs(float(np.mean(pl["u_pl"][idx_500])) - 12.0) < 1e-4
 
     # Sounding A: stable ISA -> zero CAPE; Sounding B: warm moist surface (303 K, qv=0.018) -> CAPE > 1500 J/kg
     surf_base = {
@@ -655,11 +657,290 @@ def test_diagnostics_pressure_levels_convective_and_wx1_roundtrip(tmp_path: Path
     )
     with wx1.open_dataset(fc_path) as ds:
         assert "plev" in ds.coords
+        assert len(ds.coords["plev"]) == 13
         np.testing.assert_allclose(ds.coords["plev"].values, STANDARD_PLEV_PA)
-        for vname in ("t_pl", "gh_pl", "q_pl", "rh_pl", "u_pl", "v_pl", "w_pl"):
+        for vname in (
+            "t_pl",
+            "gh_pl",
+            "z_pl",
+            "theta_pl",
+            "q_pl",
+            "rh_pl",
+            "u_pl",
+            "v_pl",
+            "w_pl",
+            "omega_pl",
+            "vo_pl",
+            "div_pl",
+            "qc_pl",
+            "qr_pl",
+            "qi_pl",
+            "qs_pl",
+            "qg_pl",
+        ):
             assert vname in ds.data_vars
-            assert ds[vname].shape == (7, 8, 8)
+            assert ds[vname].shape == (13, 8, 8)
             assert np.all(np.isfinite(ds[vname].values))
-        for vname in ("td2m", "rh2m", "gust10m", "tcc", "cape_sb", "shear_0_6km", "vis_m", "sst", "sss", "ssh", "sea_ice_frac"):
+        for vname in ("ps", "mslp", "td2m", "rh2m", "gust10m", "tcc", "cape_sb", "shear_0_6km", "vis_m", "sst", "sss", "ssh", "sea_ice_frac"):
             assert vname in ds.data_vars
             assert np.all(np.isfinite(ds[vname].values))
+
+
+def test_three_nest_d1_to_d2_to_d3_coupled_ocean_si3_and_diagnostics(tmp_path: Path) -> None:
+    """End-to-end GPU test of D1 (spherical+cuFFT) -> D2 -> D3 coupled with NEMO+SI3 and 3D/2D diagnostics."""
+    import json
+    import xarray as xr
+    import wx1
+    from tempest_v2.projection import LCCProjection, _make_lcc_domain
+    from tempest_v2.runner import run_three_nest_pipeline
+
+    d1_spec = _make_coarse_spherical_domain(ny=25, nx=32, nz=16, z_top_m=22_000.0)
+    proj = LCCProjection(lat1_deg=48.0, lat2_deg=54.0, lat0_deg=51.0, lon0_deg=5.0)
+    d2_spec = _make_lcc_domain(
+        "d2_mini_3nest",
+        ny=12,
+        nx=12,
+        dx_m=15_000.0,
+        projection=proj,
+        vertical=VerticalGrid(nz=16, z_top_m=22_000.0, stretch_power=1.2),
+        center_lat_deg=52.0,
+        center_lon_deg=4.5,
+    )
+    d3_spec = _make_lcc_domain(
+        "d3_mini_3nest",
+        ny=12,
+        nx=12,
+        dx_m=5_000.0,
+        projection=proj,
+        vertical=VerticalGrid(nz=16, z_top_m=22_000.0, stretch_power=1.2),
+        center_lat_deg=52.0,
+        center_lon_deg=4.5,
+    )
+
+    def _mk_static(spec: DomainSpec, global_band: bool = False):
+        hs = np.zeros((spec.ny, spec.nx), dtype=np.float64)
+        lsm = np.zeros((spec.ny, spec.nx), dtype=np.float32)
+        if global_band:
+            # Equatorial landmass around Americas/Africa + wet Arctic & North Atlantic
+            land_mask = (np.abs(spec.lat2d) < 35.0) & (spec.lon2d > 40.0) & (spec.lon2d < 140.0)
+            lsm[land_mask] = 1.0
+        else:
+            lsm[:, spec.nx // 2 :] = 1.0  # left half sea, right half land
+        bathy = np.where(lsm < 0.5, 220.0, 0.0).astype(np.float32)
+        sstatic = {
+            "lat_deg": spec.lat2d.astype(np.float32),
+            "lon_deg": spec.lon2d.astype(np.float32),
+            "lsm": lsm,
+            "lake_mask": np.zeros((spec.ny, spec.nx), dtype=np.float32),
+            "soil_type": np.where(lsm >= 0.5, 9.0, 0.0).astype(np.float32),
+            "bathy_depth_m": bathy,
+            "z0m_base": np.where(lsm >= 0.5, 0.05, 0.001).astype(np.float32),
+            "albedo_base": np.where(lsm >= 0.5, 0.20, 0.07).astype(np.float32),
+            "veg_frac": np.where(lsm >= 0.5, 0.60, 0.0).astype(np.float32),
+        }
+        return hs, sstatic
+
+    # Synthetic global Aurora WX-1 initial condition + OSI-SAF polar sea ice WX-1
+    levels = [1000, 925, 850, 700, 600, 500, 400, 300, 250, 200, 150, 100, 50]
+    lats_a = np.linspace(-90.0, 90.0, 19, dtype=np.float32)
+    lons_a = np.arange(0.0, 360.0, 15.0, dtype=np.float32)
+    lat2_a, _lon2_a = np.meshgrid(lats_a, lons_a, indexing="ij")
+    t2m_a = np.where(np.abs(lat2_a) > 65.0, 263.0, 284.0).astype(np.float32)
+    data_vars = {
+        "msl": (("time", "lat", "lon"), np.full((1, len(lats_a), len(lons_a)), 101_325.0, dtype=np.float32)),
+        "2t": (("time", "lat", "lon"), t2m_a[None, :, :]),
+    }
+    for lev in levels:
+        t_lev = np.maximum(215.0, t2m_a * ((lev / 1000.0) ** 0.2)).astype(np.float32)
+        data_vars[f"t_{lev}"] = (("time", "lat", "lon"), t_lev[None, :, :])
+        data_vars[f"u_{lev}"] = (("time", "lat", "lon"), np.full((1, len(lats_a), len(lons_a)), 8.0, dtype=np.float32))
+        data_vars[f"v_{lev}"] = (("time", "lat", "lon"), np.full((1, len(lats_a), len(lons_a)), 1.5, dtype=np.float32))
+        data_vars[f"q_{lev}"] = (("time", "lat", "lon"), np.full((1, len(lats_a), len(lons_a)), 0.004 * (lev / 1000.0), dtype=np.float32))
+    aurora_path = tmp_path / "aurora_global_test.wx1"
+    wx1.write_dataset(
+        aurora_path,
+        xr.Dataset(
+            data_vars=data_vars,
+            coords={
+                "time": ("time", np.array(["2026-11-21T00:00:00"], dtype="datetime64[s]")),
+                "lat": ("lat", lats_a),
+                "lon": ("lon", lons_a),
+            },
+        ),
+        dataset_id="aurora-global-test",
+    )
+
+    arctic_lats = np.repeat(np.array([72.0, 78.0, 84.0], dtype=np.float64), 8)
+    arctic_lons = np.tile(np.linspace(0.0, 315.0, 8, dtype=np.float64), 3)
+    obs_dir = tmp_path / "obs_live_cycle"
+    for sub in ("sfc", "upperair", "satellite", "marine"):
+        (obs_dir / sub).mkdir(parents=True, exist_ok=True)
+
+    # 1. Multi-file OSI-SAF sea-ice product in marine/ (exact format from ingest_osi_saf.save_osi_saf_wx1)
+    from tempest_v2.ingest_osi_saf import save_osi_saf_wx1
+
+    osisaf_path = save_osi_saf_wx1(
+        {
+            "lat": arctic_lats.astype(np.float32),
+            "lon": arctic_lons.astype(np.float32),
+            "ice_conc": np.full(len(arctic_lats), 0.90, dtype=np.float32),
+            "ice_thick": np.full(len(arctic_lats), 1.40, dtype=np.float32),
+            "ice_uncertainty": np.full(len(arctic_lats), 0.03, dtype=np.float32),
+        },
+        obs_dir / "marine",
+    )
+
+    # 2. Multi-file Metop ASCAT ocean surface winds in satellite/ (no main eumetsat_ascat.wx1 file!)
+    wx1.write_array(
+        obs_dir / "satellite" / "eumetsat_ascat_u_wind.wx1",
+        np.array([9.5, 8.8], dtype=np.float32),
+        dataset_id="ascat_u",
+        variable_path="u_wind",
+        dimensions=["n"],
+    )
+    wx1.write_array(
+        obs_dir / "satellite" / "eumetsat_ascat_v_wind.wx1",
+        np.array([2.0, 1.5], dtype=np.float32),
+        dataset_id="ascat_v",
+        variable_path="v_wind",
+        dimensions=["n"],
+    )
+    wx1.write_array(
+        obs_dir / "satellite" / "eumetsat_ascat_latitude.wx1",
+        np.array([52.0, 55.0], dtype=np.float32),
+        dataset_id="ascat_lat",
+        variable_path="latitude",
+        dimensions=["n"],
+    )
+    wx1.write_array(
+        obs_dir / "satellite" / "eumetsat_ascat_longitude.wx1",
+        np.array([4.3, 15.0], dtype=np.float32),
+        dataset_id="ascat_lon",
+        variable_path="longitude",
+        dimensions=["n"],
+    )
+
+    # 3. 3D Argo float CTD profile in marine/
+    argo_z = np.array([5.0, 25.0, 100.0, 300.0], dtype=np.float64)
+    wx1.write_array(obs_dir / "marine" / "argo_ocean_profiles.wx1", np.array([52.0], dtype=np.float64), dataset_id="a_lat", variable_path="latitude", dimensions=["f"])
+    wx1.write_array(obs_dir / "marine" / "argo_ocean_profiles_lon.wx1", np.array([4.2], dtype=np.float64), dataset_id="a_lon", variable_path="longitude", dimensions=["f"])
+    wx1.write_array(obs_dir / "marine" / "argo_ocean_depths.wx1", argo_z, dataset_id="a_z", variable_path="depth", dimensions=["z"])
+    wx1.write_array(obs_dir / "marine" / "argo_ocean_profiles_temp.wx1", np.array([[285.5, 284.0, 281.0, 278.5]], dtype=np.float64), dataset_id="a_t", variable_path="temperature", dimensions=["f", "z"])
+    wx1.write_array(obs_dir / "marine" / "argo_ocean_profiles_salinity.wx1", np.array([[34.6, 34.8, 35.0, 35.1]], dtype=np.float64), dataset_id="a_s", variable_path="salinity", dimensions=["f", "z"])
+
+    # 4. WMO WIS2 surface report in sfc/ with non-zero time offset to exercise 4D-FGAT
+    now_ts = datetime.datetime.now(datetime.timezone.utc).replace(minute=0, second=0, microsecond=0).timestamp()
+    for suf, arr in (
+        ("", np.array([101_200.0])),
+        ("_lat", np.array([52.05])),
+        ("_lon", np.array([4.55])),
+        ("_temp", np.array([285.2])),
+        ("_u_wind", np.array([8.2])),
+        ("_v_wind", np.array([1.6])),
+        ("_elev", np.array([2.0])),
+        ("_time", np.array([now_ts - 1200.0])),
+    ):
+        var_p = suf[1:] if suf else "pressure"
+        wx1.write_array(obs_dir / "sfc" / f"wis2_obs{suf}.wx1", arr, dataset_id=f"w{suf}", variable_path=var_p, dimensions=["s"])
+
+    # 5. Radar QPE on D3 for Latent Heat Nudging (LHN)
+    wx1.write_dataset(
+        obs_dir / "radar_obs.wx1",
+        xr.Dataset({"rain_rate_mm_h": (("y", "x"), np.full((d3_spec.ny, d3_spec.nx), 1.5, dtype=np.float32))}),
+        dataset_id="radar-d3-test",
+    )
+
+    summary = run_three_nest_pipeline(
+        forecast_hours=0.1,
+        d1_forecast_hours=0.1,
+        nz=16,
+        ic_source="aurora",
+        aurora_wx1_path=aurora_path,
+        obs_dir=obs_dir,
+        runs_root=tmp_path / "runs",
+        cycle_restart_hours=(0.1,),
+        d1_spec=d1_spec,
+        d2_spec=d2_spec,
+        d3_spec=d3_spec,
+        d1_static=_mk_static(d1_spec, global_band=True),
+        d2_static=_mk_static(d2_spec),
+        d3_static=_mk_static(d3_spec),
+        dt_d1_s=60.0,
+        dt_d2_s=20.0,
+        dt_d3_s=10.0,
+        physics_every=1,
+        d1_lbc_interval_s=180.0,
+        lbc_interval_s=180.0,
+        enable_da=True,
+        enable_ocean_si3=True,
+        include_3d_diagnostics=True,
+        ocean_nz=8,
+        ocean_coupling_interval_s=180.0,
+        osisaf_wx1_path=osisaf_path,
+    )
+
+    run_dir = Path(summary["run_dir"])
+    for sub in ("d1", "d2", "d3", "ocean", "restarts"):
+        assert (run_dir / sub).is_dir()
+
+    assert "var3d" in summary["da"]
+    assert "d1" in summary["da"] and "var3d" in summary["da"]["d1"]
+    assert "d2" in summary["da"] and "var3d" in summary["da"]["d2"]
+
+    manifest = json.loads(Path(summary["manifest_path"]).read_text())
+    assert manifest["ocean"]["enabled"] is True
+    assert manifest["include_3d_diagnostics"] is True
+    for dom in ("d1", "d2", "d3"):
+        assert manifest[dom]["restart_path"] is not None and Path(manifest[dom]["restart_path"]).is_file()
+        assert manifest[dom]["ocean_restart_path"] is not None and Path(manifest[dom]["ocean_restart_path"]).is_file()
+        fc_paths = [Path(p) for p in summary[dom]["output_paths"]]
+        assert len(fc_paths) >= 2
+        with wx1.open_dataset(fc_paths[-1]) as ds:
+            assert len(ds.coords["plev"]) == 13
+            for vn in (
+                "t_pl",
+                "gh_pl",
+                "z_pl",
+                "theta_pl",
+                "q_pl",
+                "rh_pl",
+                "u_pl",
+                "v_pl",
+                "w_pl",
+                "omega_pl",
+                "vo_pl",
+                "div_pl",
+                "qc_pl",
+                "qr_pl",
+                "qi_pl",
+                "qs_pl",
+                "qg_pl",
+                "ps",
+                "mslp",
+                "cape_sb",
+                "td2m",
+                "gust10m",
+                "vis_m",
+                "sst",
+                "sss",
+                "ssh",
+                "mld",
+                "sea_ice_frac",
+                "sea_ice_thick",
+                "oce_temp",
+                "oce_sal",
+                "oce_u",
+                "oce_v",
+                "oce_tke",
+                "oce_avm",
+                "oce_avt",
+                "si3_a_i",
+                "si3_v_i",
+            ):
+                assert vn in ds.data_vars, f"Missing {vn} in {dom} forecast WX-1"
+                assert np.all(np.isfinite(ds[vn].values))
+
+    oce_st, oce_meta = NemoSi3GPUSolver.load_restart_wx1(summary["d1"]["ocean_restart_path"])
+    assert oce_meta["kind"] == "tempest_v2_ocean_si3_restart"
+    assert float(np.max(oce_st["ice_frac"])) > 0.50
+    assert np.all(np.isfinite(oce_st["temp_k"]))

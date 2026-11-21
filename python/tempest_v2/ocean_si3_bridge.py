@@ -324,8 +324,11 @@ class NemoSi3GPUSolver:
         surf_state: Dict[str, np.ndarray],
         *,
         osisaf_wx1_path: Optional[Path | str] = None,
+        obs_dir: Optional[Path | str] = None,
     ) -> Dict[str, np.ndarray]:
-        """Construct balanced 3D ocean T/S stratification + 5-cat SI3 ice from surface IC & OSI-SAF."""
+        """Construct balanced 3D ocean T/S stratification + 5-cat SI3 ice from surface IC, Argo 3D CTD & OSI-SAF."""
+        from tempest_v2.verification import _read_obs_prefix
+
         st = self.empty_state()
         wet = self.ocean_mask >= 0.5
         lat = self.spec.lat2d.astype(np.float64)
@@ -353,29 +356,93 @@ class NemoSi3GPUSolver:
             st["avm"][k] = np.where(wet, 1.2e-4, 0.0).astype(np.float32)
             st["avt"][k] = np.where(wet, 1.2e-5, 0.0).astype(np.float32)
 
+        # Assimilate 3D Argo float CTD (T, S) profiles when present in obs_dir or osisaf_wx1_path parent
+        argo_root = Path(obs_dir) if obs_dir is not None else (Path(osisaf_wx1_path).parent if osisaf_wx1_path is not None else None)
+        if argo_root is not None and argo_root.exists():
+            argo = _read_obs_prefix(argo_root, "argo_ocean_profiles")
+            if argo is not None and "temp" in argo and "salinity" in argo:
+                a_lat = np.asarray(argo["lat"], dtype=np.float64)
+                a_lon = np.asarray(argo["lon"], dtype=np.float64)
+                a_t = np.asarray(argo["temp"], dtype=np.float64)
+                a_s = np.asarray(argo["salinity"], dtype=np.float64)
+                a_z = np.asarray(
+                    argo.get(
+                        "depths",
+                        argo.get(
+                            "depth",
+                            np.array([5.0, 15.0, 25.0, 40.0, 60.0, 80.0, 100.0, 130.0, 170.0, 220.0, 280.0, 360.0, 460.0, 600.0, 800.0, 1050.0, 1300.0, 1550.0, 1800.0, 2000.0]),
+                        ),
+                    ),
+                    dtype=np.float64,
+                )
+                if a_t.ndim == 2 and a_s.ndim == 2 and len(a_lat) == a_t.shape[0] and len(a_z) == a_t.shape[1]:
+                    for idx_a in range(len(a_lat)):
+                        if not (np.isfinite(a_lat[idx_a]) and np.isfinite(a_lon[idx_a])):
+                            continue
+                        dlat_r = np.radians(lat - float(a_lat[idx_a]))
+                        dlon_r = np.radians(((lon - float(a_lon[idx_a]) + 180.0) % 360.0) - 180.0) * np.cos(np.radians(0.5 * (lat + float(a_lat[idx_a]))))
+                        dist_km = 6371.0 * np.hypot(dlat_r, dlon_r)
+                        w_h = np.where(wet & (dist_km < 350.0), 0.75 * np.exp(-0.5 * (dist_km / 150.0) ** 2), 0.0)
+                        if not np.any(w_h > 1e-3):
+                            continue
+                        t_prof = np.interp(z_t, a_z, a_t[idx_a])
+                        s_prof = np.interp(z_t, a_z, a_s[idx_a])
+                        for k in range(self.nz):
+                            if np.isfinite(t_prof[k]) and 271.0 <= t_prof[k] <= 310.0:
+                                active_k = wet & (z_w[k] < self.bathy_m)
+                                st["temp_k"][k] = np.where(active_k, (1.0 - w_h) * st["temp_k"][k] + w_h * t_prof[k], 0.0).astype(np.float32)
+                            if np.isfinite(s_prof[k]) and 2.0 <= s_prof[k] <= 42.0:
+                                active_k = wet & (z_w[k] < self.bathy_m)
+                                st["sal_psu"][k] = np.where(active_k, (1.0 - w_h) * st["sal_psu"][k] + w_h * s_prof[k], 0.0).astype(np.float32)
+
         # Determine initial sea-ice fraction & thickness (OSI-SAF WX-1 -> surf_state -> thermal fallback)
         sic = np.asarray(surf_state.get("sea_ice_frac", np.zeros((self.ny, self.nx), dtype=np.float32)), dtype=np.float64)
         sit = np.asarray(surf_state.get("sea_ice_thick", np.zeros((self.ny, self.nx), dtype=np.float32)), dtype=np.float64)
 
+        olat = np.asarray([], dtype=np.float64)
+        olon = np.asarray([], dtype=np.float64)
+        oconc = np.asarray([], dtype=np.float64)
+        othk = np.asarray([], dtype=np.float64)
         if osisaf_wx1_path is not None and Path(osisaf_wx1_path).is_file():
-            with wx1.open_dataset(osisaf_wx1_path) as ds:
-                olat = np.asarray(ds["lat"].values, dtype=np.float64) if "lat" in ds else np.asarray([], dtype=np.float64)
-                olon = np.asarray(ds["lon"].values, dtype=np.float64) if "lon" in ds else np.asarray([], dtype=np.float64)
+            p_osi = Path(osisaf_wx1_path)
+            with wx1.open_dataset(p_osi) as ds:
+                if "lat" in ds and "lon" in ds:
+                    olat = np.asarray(ds["lat"].values, dtype=np.float64)
+                    olon = np.asarray(ds["lon"].values, dtype=np.float64)
                 conc_k = next((k for k in ("ice_conc", "conc") if k in ds), None)
                 thk_k = next((k for k in ("ice_thick", "thick") if k in ds), None)
-                if conc_k is not None and len(olat) > 0:
+                if conc_k is not None:
                     oconc = np.asarray(ds[conc_k].values, dtype=np.float64)
-                    othk = np.asarray(ds[thk_k].values, dtype=np.float64) if thk_k else np.clip(0.4 + 1.8 * (oconc ** 1.5), 0.1, 4.5)
-                    tree = cKDTree(np.column_stack([np.radians(olat), np.radians(((olon + 180.0) % 360.0) - 180.0)]))
-                    q_pts = np.column_stack([np.radians(lat.ravel()), np.radians(((lon.ravel() + 180.0) % 360.0) - 180.0)])
-                    dist, idx = tree.query(q_pts, distance_upper_bound=np.radians(1.5))
-                    valid = np.isfinite(dist) & (idx < len(oconc))
-                    sic_n = np.zeros_like(sic.ravel())
-                    sit_n = np.zeros_like(sit.ravel())
-                    sic_n[valid] = np.clip(oconc[idx[valid]], 0.0, 0.997)
-                    sit_n[valid] = np.clip(othk[idx[valid]], 0.0, 8.0)
-                    sic = np.where(sic_n.reshape(self.ny, self.nx) > 0.01, sic_n.reshape(self.ny, self.nx), sic)
-                    sit = np.where(sic_n.reshape(self.ny, self.nx) > 0.01, sit_n.reshape(self.ny, self.nx), sit)
+                if thk_k is not None:
+                    othk = np.asarray(ds[thk_k].values, dtype=np.float64)
+            if len(olat) == 0:
+                osi_multi = _read_obs_prefix(p_osi.parent, p_osi.stem)
+                if osi_multi is not None and "ice_conc" in osi_multi:
+                    olat = np.asarray(osi_multi["lat"], dtype=np.float64)
+                    olon = np.asarray(osi_multi["lon"], dtype=np.float64)
+                    oconc = np.asarray(osi_multi["ice_conc"], dtype=np.float64)
+                    othk = np.asarray(osi_multi.get("ice_thick", np.clip(0.4 + 1.8 * (np.maximum(oconc, 0.0) ** 1.5), 0.1, 4.5)), dtype=np.float64)
+        elif obs_dir is not None and Path(obs_dir).exists():
+            osi_multi = _read_obs_prefix(Path(obs_dir), "osi_saf_sea_ice")
+            if osi_multi is not None and "ice_conc" in osi_multi:
+                olat = np.asarray(osi_multi["lat"], dtype=np.float64)
+                olon = np.asarray(osi_multi["lon"], dtype=np.float64)
+                oconc = np.asarray(osi_multi["ice_conc"], dtype=np.float64)
+                othk = np.asarray(osi_multi.get("ice_thick", np.clip(0.4 + 1.8 * (np.maximum(oconc, 0.0) ** 1.5), 0.1, 4.5)), dtype=np.float64)
+
+        if len(olat) > 0 and len(oconc) == len(olat):
+            if len(othk) != len(oconc):
+                othk = np.clip(0.4 + 1.8 * (np.maximum(oconc, 0.0) ** 1.5), 0.1, 4.5)
+            tree = cKDTree(np.column_stack([np.radians(olat), np.radians(((olon + 180.0) % 360.0) - 180.0)]))
+            q_pts = np.column_stack([np.radians(lat.ravel()), np.radians(((lon.ravel() + 180.0) % 360.0) - 180.0)])
+            dist, idx = tree.query(q_pts, distance_upper_bound=np.radians(1.5))
+            valid = np.isfinite(dist) & (idx < len(oconc))
+            sic_n = np.zeros_like(sic.ravel())
+            sit_n = np.zeros_like(sit.ravel())
+            sic_n[valid] = np.clip(oconc[idx[valid]], 0.0, 0.997)
+            sit_n[valid] = np.clip(othk[idx[valid]], 0.0, 8.0)
+            sic = np.where(sic_n.reshape(self.ny, self.nx) > 0.01, sic_n.reshape(self.ny, self.nx), sic)
+            sit = np.where(sic_n.reshape(self.ny, self.nx) > 0.01, sit_n.reshape(self.ny, self.nx), sit)
 
         if float(np.max(sic)) < 1e-4:
             # Polar sea-ice thermal initialization when SST at freezing point and |lat| > 58 deg

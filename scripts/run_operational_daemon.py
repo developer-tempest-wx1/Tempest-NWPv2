@@ -35,8 +35,13 @@ def main() -> None:
     parser.add_argument("--init-time", type=str, default=None, help="Optional UTC ISO init time (with --once)")
     parser.add_argument("--cycle-hours", type=str, default="0,6,12,18", help="Comma-separated UTC cycle hours")
     parser.add_argument("--delay-minutes", type=int, default=35, help="Minutes after cycle hour before running")
+    parser.add_argument("--d1-hours", type=float, default=24.0)
     parser.add_argument("--d2-hours", type=float, default=24.0)
     parser.add_argument("--d3-hours", type=float, default=24.0)
+    parser.add_argument("--dt-d1", type=float, default=60.0)
+    parser.add_argument("--enable-d1", action="store_true", help="Enable global 0.25 deg D1 -> D2 -> D3 3-nest pipeline")
+    parser.add_argument("--no-ocean-si3", action="store_true", help="Disable coupled NEMO 5.0.2 + SI3 GPU ocean/sea-ice")
+    parser.add_argument("--no-3d-diagnostics", action="store_true", help="Disable 3D pressure-level & CAPE/synoptic WX-1 diagnostics")
     parser.add_argument("--nz", type=int, choices=[65, 90, 137], default=65)
     parser.add_argument("--physics-every", type=int, default=5)
     parser.add_argument("--cycle-restart-hours", type=str, default="6.0", help="Comma-separated cycle restart leads")
@@ -59,8 +64,13 @@ def main() -> None:
         cycle_hours_utc=cycle_hours,
         cycle_delay_minutes=args.delay_minutes,
         keep_runs=args.keep_runs,
+        d1_lead_hours=args.d1_hours,
         d2_lead_hours=args.d2_hours,
         d3_lead_hours=args.d3_hours,
+        dt_d1_s=args.dt_d1,
+        enable_d1=args.enable_d1,
+        enable_ocean_si3=not args.no_ocean_si3,
+        include_3d_diagnostics=not args.no_3d_diagnostics,
         nz=args.nz,
         physics_every=args.physics_every,
         cycle_restart_hours=cyc_rst_hrs,

@@ -27,6 +27,7 @@ from tempest_v2.projection import get_domain_spec  # noqa: E402
 from tempest_v2.runner import (  # noqa: E402
     forecast_output_schedule_hours,
     run_domain_forecast,
+    run_three_nest_pipeline,
     run_two_nest_pipeline,
 )
 from tempest_v2.verification import (  # noqa: E402
@@ -40,9 +41,10 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Tempest-NWP v2 — Classical GPU Non-Hydrostatic NWP (0% AI / 0% ML)"
     )
-    parser.add_argument("--mode", choices=["d2_to_d3", "d3", "d2"], default="d2_to_d3")
+    parser.add_argument("--mode", choices=["d1_to_d2_to_d3", "d2_to_d3", "d3", "d2", "d1"], default="d2_to_d3")
     parser.add_argument("--nz", type=int, choices=[65, 90, 137], default=65)
     parser.add_argument("--hours", type=float, default=6.0)
+    parser.add_argument("--d1-hours", type=float, default=None, help="Optional global D1 forecast length [h]")
     parser.add_argument(
         "--ecmwf",
         action="store_true",
@@ -53,10 +55,15 @@ def main() -> None:
     parser.add_argument("--pl-grib", type=Path, default=None)
     parser.add_argument("--aurora-ic", type=Path, default=None)
     parser.add_argument("--restart-in", type=Path, default=None)
+    parser.add_argument("--osisaf-wx1", type=Path, default=None, help="Optional OSI-SAF sea-ice WX-1 observation file")
     parser.add_argument("--obs-dir", type=Path, default=PROJECT_ROOT / "data" / "observations")
     parser.add_argument("--download-live", action="store_true", help="Fetch live ECMWF/KNMI/DWD feeds before running")
     parser.add_argument("--enable-da", action="store_true", help="Assimilate KNMI + DWD station obs via Balanced 3D-Var + IAU")
+    parser.add_argument("--enable-ocean-si3", action="store_true", help="Enable coupled NEMO 5.0.2 + SI3 GPU ocean/sea-ice")
+    parser.add_argument("--no-ocean-si3", action="store_true", help="Disable coupled NEMO+SI3 even in D1 modes")
+    parser.add_argument("--no-3d-diagnostics", action="store_true", help="Disable 3D pressure-level & CAPE/synoptic WX-1 diagnostics")
     parser.add_argument("--physics-every", type=int, default=5, help="Substep physics cadence every N dynamics steps")
+    parser.add_argument("--dt-d1", type=float, default=60.0)
     parser.add_argument("--dt-d2", type=float, default=20.0)
     parser.add_argument("--dt-d3", type=float, default=4.0)
     parser.add_argument("--outdir", type=Path, default=PROJECT_ROOT / "data" / "forecasts")
@@ -72,6 +79,7 @@ def main() -> None:
 
     sfc_grib = args.sfc_grib
     pl_grib = args.pl_grib
+    obs_dir_eff = args.obs_dir
     if args.download_live:
         if args.ic_source == "ecmwf" and (sfc_grib is None or pl_grib is None):
             raw_dir = (args.runs_root / "raw_ecmwf") if args.runs_root is not None else (args.outdir / "raw_ecmwf")
@@ -79,9 +87,68 @@ def main() -> None:
                 step=0, prefer_0p1=False, output_dir=raw_dir
             )
         if args.enable_da:
+            from tempest_v2.download_all_observations import run_observation_ingest_pipeline
+
             args.obs_dir.mkdir(parents=True, exist_ok=True)
-            ingest_knmi_observations(args.obs_dir)
-            ingest_dwd_poi_observations(args.obs_dir, max_stations=250)
+            radar_target_spec = get_domain_spec("d3", nz=args.nz)
+            obs_dir_eff, _ = run_observation_ingest_pipeline(
+                args.obs_dir,
+                da_hours=6.0,
+                include_sondehub=True,
+                spec_for_radar=radar_target_spec,
+            )
+
+    use_ocean = False if args.no_ocean_si3 else (
+        True if (args.enable_ocean_si3 or args.mode in ("d1_to_d2_to_d3", "d1")) else False
+    )
+    include_3d_diag = not args.no_3d_diagnostics
+
+    if args.mode == "d1_to_d2_to_d3":
+        summary = run_three_nest_pipeline(
+            forecast_hours=args.hours,
+            d1_forecast_hours=args.d1_hours,
+            nz=args.nz,
+            ic_source=args.ic_source,
+            sfc_grib=sfc_grib,
+            pl_grib=pl_grib,
+            aurora_wx1_path=args.aurora_ic,
+            restart_path=args.restart_in,
+            obs_dir=obs_dir_eff if args.enable_da else None,
+            outdir=args.outdir,
+            runs_root=args.runs_root,
+            cycle_restart_hours=cyc_rst_hours,
+            ensemble_members=args.ensemble_members,
+            ensemble_lead_hours=args.ensemble_hours,
+            ensemble_seed=args.ensemble_seed,
+            ecmwf_schedule=args.ecmwf,
+            enable_da=args.enable_da,
+            dt_d1_s=args.dt_d1,
+            dt_d2_s=args.dt_d2,
+            dt_d3_s=args.dt_d3,
+            physics_every=args.physics_every,
+            enable_ocean_si3=use_ocean,
+            include_3d_diagnostics=include_3d_diag,
+            osisaf_wx1_path=args.osisaf_wx1,
+        )
+        printable = {
+            "run_dir": str(summary.get("run_dir")),
+            "d1_elapsed_s": summary["d1"]["elapsed_s"],
+            "d2_elapsed_s": summary["d2"]["elapsed_s"],
+            "d3_elapsed_s": summary["d3"]["elapsed_s"],
+            "d1_outputs": [str(p) for p in summary["d1"]["output_paths"]],
+            "d2_outputs": [str(p) for p in summary["d2"]["output_paths"]],
+            "d3_outputs": [str(p) for p in summary["d3"]["output_paths"]],
+            "ocean_restarts": {
+                k: str(summary[k].get("ocean_restart_path"))
+                for k in ("d1", "d2", "d3")
+                if summary[k].get("ocean_restart_path") is not None
+            },
+            "cycle_restart_paths": [str(p) for p in summary.get("cycle_restart_paths", [])],
+            "da": summary["da"],
+            "ensemble": summary.get("ensemble"),
+        }
+        print(json.dumps(printable, indent=2, default=str))
+        return
 
     if args.mode == "d2_to_d3":
         summary = run_two_nest_pipeline(
@@ -92,7 +159,7 @@ def main() -> None:
             pl_grib=pl_grib,
             aurora_wx1_path=args.aurora_ic,
             restart_path=args.restart_in,
-            obs_dir=args.obs_dir if args.enable_da else None,
+            obs_dir=obs_dir_eff if args.enable_da else None,
             outdir=args.outdir,
             runs_root=args.runs_root,
             cycle_restart_hours=cyc_rst_hours,
@@ -104,6 +171,9 @@ def main() -> None:
             dt_d2_s=args.dt_d2,
             dt_d3_s=args.dt_d3,
             physics_every=args.physics_every,
+            enable_ocean_si3=use_ocean,
+            include_3d_diagnostics=include_3d_diag,
+            osisaf_wx1_path=args.osisaf_wx1,
         )
         printable = {
             "run_dir": str(summary.get("run_dir")),
@@ -134,15 +204,17 @@ def main() -> None:
 
     da_report = {}
     iau_f = None
-    if args.enable_da and args.obs_dir.exists():
-        obs_list, stn_rows = load_station_obs_wx1(args.obs_dir, spec, valid_time_utc=init_dt)
+    if args.enable_da and obs_dir_eff.exists():
+        obs_list, stn_rows = load_station_obs_wx1(obs_dir_eff, spec, valid_time_utc=init_dt)
         if obs_list:
             da_report["verify_bg"] = verify_against_stations(spec, state_3d, surf_state, hs_m, stn_rows)
-            state_3d, surf_state, iau_f, vres = run_domain_3dvar(spec, state_3d, surf_state, hs_m, sstatic["lsm"], obs_list)
+            state_3d, surf_state, iau_f, vres = run_domain_3dvar(
+                spec, state_3d, surf_state, hs_m, sstatic["lsm"], obs_list, obs_dir=obs_dir_eff
+            )
             da_report["var3d"] = {"j0": vres.initial_cost_j0, "jf": vres.final_cost_j, "iters": vres.iterations}
             da_report["verify_ana"] = verify_against_stations(spec, state_3d, surf_state, hs_m, stn_rows)
 
-    dt_s = args.dt_d3 if args.mode == "d3" else args.dt_d2
+    dt_s = {"d1": args.dt_d1, "d2": args.dt_d2, "d3": args.dt_d3}[args.mode]
     sched = forecast_output_schedule_hours(args.hours, ecmwf_schedule=args.ecmwf, hourly=True)
     res = run_domain_forecast(
         spec,
@@ -159,6 +231,11 @@ def main() -> None:
         output_dir=args.outdir / f"{args.mode}_wx1",
         output_hours=sched,
         save_restart_path=args.outdir / f"restart_{spec.name}.wx1",
+        enable_ocean_si3=use_ocean,
+        osisaf_wx1_path=args.osisaf_wx1,
+        obs_dir=obs_dir_eff if args.enable_da else None,
+        ocean_restart_out=(args.outdir / f"restart_ocean_{spec.name}.wx1") if use_ocean else None,
+        include_3d_diagnostics=include_3d_diag,
     )
     print(
         json.dumps(
@@ -168,6 +245,7 @@ def main() -> None:
                 "num_tiles": res["num_tiles"],
                 "outputs": [str(p) for p in res["output_paths"]],
                 "restart": str(res["restart_path"]),
+                "ocean_restart": str(res["ocean_restart_path"]) if res.get("ocean_restart_path") else None,
                 "da": da_report,
             },
             indent=2,

@@ -38,6 +38,7 @@ from tempest_v2.ic_builder import (
     unstagger_uv,
 )
 from tempest_v2.lbc_manager import LBCInterpolator, export_child_lbc_step
+from tempest_v2.ocean_si3_bridge import NemoSi3GPUSolver
 from tempest_v2.projection import DomainSpec, get_domain_spec
 from tempest_v2.verification import (
     compute_mslp_pa,
@@ -52,8 +53,10 @@ RUN_LAYOUT_SUBDIRS = (
     "config",
     "obs",
     "da",
+    "d1",
     "d2",
     "d3",
+    "ocean",
     "restarts",
     "ensemble",
     "verification",
@@ -189,6 +192,9 @@ def write_forecast_wx1(
     mslp = compute_mslp_pa(
         spec, hs_m, state_3d, theta_sfc_ref=theta_sfc_ref, p_sfc_ref=p_sfc_ref, n_ref_hz=n_ref_hz
     )
+    hs_arr = np.asarray(hs_m, dtype=np.float64)
+    t2m_for_ps = np.maximum(np.asarray(surf_state.get("t2m", np.full((spec.ny, spec.nx), 285.0)), dtype=np.float64), 180.0)
+    ps_pa = (mslp.astype(np.float64) * np.exp(-9.80665 * hs_arr / (287.058 * t2m_for_ps))).astype(np.float32)
 
     u10_r = surf_state.get("u10m")
     v10_r = surf_state.get("v10m")
@@ -214,6 +220,7 @@ def write_forecast_wx1(
         "q2m": (("y", "x"), _var2d("q2m", 0.005), {"units": "kg kg-1", "standard_name": "specific_humidity"}),
         "u10m_geo": (("y", "x"), u10_geo.astype(np.float32), {"units": "m s-1", "standard_name": "eastward_wind"}),
         "v10m_geo": (("y", "x"), v10_geo.astype(np.float32), {"units": "m s-1", "standard_name": "northward_wind"}),
+        "ps": (("y", "x"), ps_pa, {"units": "Pa", "standard_name": "surface_air_pressure"}),
         "mslp": (("y", "x"), mslp.astype(np.float32), {"units": "Pa", "standard_name": "air_pressure_at_mean_sea_level"}),
         "rain_acc": (("y", "x"), _var2d("rain_acc"), {"units": "kg m-2"}),
         "snow_acc": (("y", "x"), _var2d("snow_acc"), {"units": "kg m-2"}),
@@ -226,9 +233,21 @@ def write_forecast_wx1(
         "pblh": (("y", "x"), _var2d("pblh"), {"units": "m"}),
         "t_skin": (("y", "x"), _var2d("t_skin", 285.0), {"units": "K"}),
         "snow_swe": (("y", "x"), _var2d("snow_swe"), {"units": "kg m-2"}),
+        "snow_temp": (("y", "x"), _var2d("snow_temp", 273.15), {"units": "K"}),
+        "snow_rho": (("y", "x"), _var2d("snow_rho", 150.0), {"units": "kg m-3"}),
+        "snow_albedo": (("y", "x"), _var2d("snow_albedo", 0.75), {"units": "1"}),
+        "canopy_water": (("y", "x"), _var2d("canopy_water"), {"units": "kg m-2"}),
         "dt_cool": (("y", "x"), _var2d("dt_cool"), {"units": "K"}),
         "dt_warm": (("y", "x"), _var2d("dt_warm"), {"units": "K"}),
+        "sst_bulk": (("y", "x"), _var2d("sst_bulk", 285.0), {"units": "K"}),
+        "lake_tml": (("y", "x"), _var2d("lake_tml", 283.0), {"units": "K"}),
+        "lake_tbot": (("y", "x"), _var2d("lake_tbot", 277.15), {"units": "K"}),
+        "lake_hmld": (("y", "x"), _var2d("lake_hmld", 4.0), {"units": "m"}),
         "lake_hice": (("y", "x"), _var2d("lake_hice"), {"units": "m"}),
+        "sea_ice_frac": (("y", "x"), _var2d("sea_ice_frac"), {"units": "1"}),
+        "sea_ice_thick": (("y", "x"), _var2d("sea_ice_thick"), {"units": "m"}),
+        "sea_ice_tsfc": (("y", "x"), _var2d("sea_ice_tsfc", 271.35), {"units": "K"}),
+        "sea_ice_albedo": (("y", "x"), _var2d("sea_ice_albedo", 0.066), {"units": "1"}),
         "lat": (("y", "x"), spec.lat2d.astype(np.float32), {"units": "degrees_north"}),
         "lon": (("y", "x"), spec.lon2d.astype(np.float32), {"units": "degrees_east"}),
     }
@@ -257,11 +276,21 @@ def write_forecast_wx1(
         pl_units = {
             "t_pl": "K",
             "gh_pl": "m",
+            "z_pl": "m2 s-2",
+            "theta_pl": "K",
             "q_pl": "kg kg-1",
             "rh_pl": "%",
             "u_pl": "m s-1",
             "v_pl": "m s-1",
             "w_pl": "m s-1",
+            "omega_pl": "Pa s-1",
+            "vo_pl": "s-1",
+            "div_pl": "s-1",
+            "qc_pl": "kg kg-1",
+            "qr_pl": "kg kg-1",
+            "qi_pl": "kg kg-1",
+            "qs_pl": "kg kg-1",
+            "qg_pl": "kg kg-1",
         }
         coords["plev"] = ("plev", STANDARD_PLEV_PA, {"units": "Pa", "standard_name": "air_pressure"})
         for k, arr in pl_fields.items():
@@ -321,6 +350,36 @@ def write_forecast_wx1(
             if k in od:
                 data_vars[k] = (("y", "x"), np.asarray(od[k], dtype=np.float32), {"units": unit})
 
+        if "temp_k" in ocean_diag:
+            nz_o = int(np.asarray(ocean_diag["temp_k"]).shape[0])
+            coords["z_oce"] = ("z_oce", np.arange(nz_o, dtype=np.int32))
+            oce_3d_map = (
+                ("oce_temp", "temp_k", "K"),
+                ("oce_sal", "sal_psu", "g kg-1"),
+                ("oce_u", "u_oce", "m s-1"),
+                ("oce_v", "v_oce", "m s-1"),
+                ("oce_tke", "tke", "m2 s-2"),
+                ("oce_avm", "avm", "m2 s-1"),
+                ("oce_avt", "avt", "m2 s-1"),
+            )
+            for out_k, src_k, unit in oce_3d_map:
+                if src_k in ocean_diag:
+                    data_vars[out_k] = (("z_oce", "y", "x"), np.asarray(ocean_diag[src_k], dtype=np.float32), {"units": unit})
+            if "a_i" in ocean_diag:
+                n_cat = int(np.asarray(ocean_diag["a_i"]).shape[0])
+                coords["ice_cat"] = ("ice_cat", np.arange(n_cat, dtype=np.int32))
+                si3_cat_map = (
+                    ("si3_a_i", "a_i", "1"),
+                    ("si3_v_i", "v_i", "m"),
+                    ("si3_v_s", "v_s", "m"),
+                    ("si3_t_su", "t_su", "K"),
+                    ("si3_a_ip", "a_ip", "1"),
+                    ("si3_v_ip", "v_ip", "m"),
+                )
+                for out_k, src_k, unit in si3_cat_map:
+                    if src_k in ocean_diag:
+                        data_vars[out_k] = (("ice_cat", "y", "x"), np.asarray(ocean_diag[src_k], dtype=np.float32), {"units": unit})
+
     ds = xr.Dataset(
         data_vars=data_vars,
         coords=coords,
@@ -364,8 +423,16 @@ def run_domain_forecast(
     theta_sfc_ref: float = 288.15,
     p_sfc_ref: float = 101_325.0,
     n_ref_hz: float = 0.01,
+    enable_ocean_si3: bool = False,
+    ocean_coupling_interval_s: float = 1800.0,
+    ocean_nz: int = 16,
+    osisaf_wx1_path: Optional[Path | str] = None,
+    obs_dir: Optional[Path | str] = None,
+    ocean_restart_in: Optional[Path | str] = None,
+    ocean_restart_out: Optional[Path | str] = None,
+    include_3d_diagnostics: bool = True,
 ) -> Dict[str, Any]:
-    """Integrate one nest on GPU with Davies LBCs, IAU spinup, WX-1 outputs & restart."""
+    """Integrate one nest on GPU with optional NEMO+SI3 coupling, Davies LBCs, IAU, WX-1 outputs & restart."""
     init_dt = (
         init_time_utc.astimezone(datetime.timezone.utc)
         if init_time_utc.tzinfo
@@ -376,6 +443,25 @@ def run_domain_forecast(
     doy = float(init_dt.timetuple().tm_yday)
     utc_s = float(init_dt.hour * 3600 + init_dt.minute * 60 + init_dt.second)
 
+    eff_static = dict(surface_static)
+    if static_overrides:
+        eff_static.update(static_overrides)
+
+    # CRITICAL VRAM ORDER: allocate NEMO+SI3 before NonHydrostaticGPUSolver so auto-tiling sees post-ocean free VRAM.
+    ocean_solver: Optional[NemoSi3GPUSolver] = None
+    if enable_ocean_si3:
+        ocean_solver = NemoSi3GPUSolver(
+            spec,
+            eff_static,
+            nz=int(ocean_nz),
+            ah_lap=max(50.0, min(1200.0, 0.015 * spec.dx_m)),
+        )
+
+    use_spherical = bool(spec.is_spherical)
+    bc_x_val = 1 if spec.is_periodic_lon else 2
+    bc_y_val = 0 if (use_spherical or spec.is_periodic_lon) else 2
+    has_parent_lbc = (lbc_interpolator is not None) or ((not use_spherical) and (not spec.is_periodic_lon))
+
     solver = NonHydrostaticGPUSolver(
         spec.vertical,
         dx_m=spec.dx_m,
@@ -385,14 +471,16 @@ def run_domain_forecast(
         f_cor=spec.coriolis_f,
         has_moist=True,
         has_physics=enable_physics,
-        bc_x=2,
-        bc_y=2,
+        bc_x=bc_x_val,
+        bc_y=bc_y_val,
         use_coriolis=True,
         has_iau=(iau_forcing is not None),
+        is_spherical=use_spherical,
+        polar_filter_lat_deg=60.0 if use_spherical else 0.0,
         sponge_depth_m=min(6000.0, 0.22 * spec.vertical.z_top_m),
         sponge_tau_max_s=0.01,
-        lbc_rim_width=max(2, min(8, spec.nx // 4)),
-        lbc_tau_max_s=0.04,
+        lbc_rim_width=max(2, min(8, spec.nx // 4)) if has_parent_lbc else 0,
+        lbc_tau_max_s=0.04 if has_parent_lbc else 0.0,
         theta_sfc_k=theta_sfc_ref,
         p_sfc_pa=p_sfc_ref,
         n_ref_s=n_ref_hz,
@@ -404,12 +492,23 @@ def run_domain_forecast(
     t0_wall = time.perf_counter()
 
     try:
-        solver.upload_state(state_3d)
-        eff_static = dict(surface_static)
-        if static_overrides:
-            eff_static.update(static_overrides)
+        cur_state = state_3d
+        cur_surf = dict(surf_state)
+        cur_oce_state: Optional[Dict[str, np.ndarray]] = None
+
+        if ocean_solver is not None:
+            if ocean_restart_in is not None and Path(ocean_restart_in).is_file():
+                cur_oce_state, _ = NemoSi3GPUSolver.load_restart_wx1(ocean_restart_in)
+            else:
+                cur_oce_state = ocean_solver.init_from_atmosphere_and_osisaf(
+                    cur_surf, osisaf_wx1_path=osisaf_wx1_path, obs_dir=obs_dir
+                )
+            ocean_solver.upload_state(cur_oce_state)
+            cur_surf = ocean_solver.couple_to_surface_state(cur_oce_state, cur_surf)
+
+        solver.upload_state(cur_state)
         solver.set_surface_static(eff_static)
-        solver.upload_surface(surf_state)
+        solver.upload_surface(cur_surf)
         solver.set_physics_config(
             enable_microphysics=1 if enable_physics else 0,
             enable_pbl=1 if enable_physics else 0,
@@ -421,17 +520,18 @@ def run_domain_forecast(
             julian_day=doy,
             utc_seconds=utc_s,
         )
-        if lbc_interpolator is not None:
-            init_lbc = _lbc_dict_to_staggered(lbc_interpolator.get_lbc_at_time(0.0), state_3d)
-        else:
-            init_lbc = {k: state_3d[k].copy() for k in ("u", "v", "w", "theta_p", "pi_p")}
-        solver.set_lbc_target(init_lbc)
+        if has_parent_lbc:
+            if lbc_interpolator is not None:
+                init_lbc = _lbc_dict_to_staggered(lbc_interpolator.get_lbc_at_time(0.0), state_3d)
+            else:
+                init_lbc = {k: state_3d[k].copy() for k in ("u", "v", "w", "theta_p", "pi_p")}
+            solver.set_lbc_target(init_lbc)
 
         iau_active = iau_forcing is not None and iau_duration_s > 0.0
         if iau_active:
             solver.set_iau_forcing(iau_forcing)  # type: ignore[arg-type]
 
-        # Build sorted breakpoint times (outputs, LBC exports, cycle restarts, IAU turn-off, LBC refreshes)
+        # Build sorted breakpoint times (outputs, LBC exports, cycle restarts, ocean coupling, IAU, LBC refreshes)
         breaks = {0, total_steps}
         out_dir = Path(output_dir) if output_dir is not None else None
         out_step_map: Dict[int, float] = {}
@@ -463,6 +563,13 @@ def run_domain_forecast(
                 breaks.add(total_steps)
                 child_step_map[total_steps] = len(child_step_map)
 
+        cpl_step_set: set[int] = set()
+        if ocean_solver is not None and total_steps > 0:
+            cpl_stride = max(1, int(round(max(float(dt_s), float(ocean_coupling_interval_s)) / float(dt_s))))
+            for s_idx in range(0, total_steps + 1, cpl_stride):
+                breaks.add(s_idx)
+                cpl_step_set.add(s_idx)
+
         iau_off_step = int(round(float(iau_duration_s) / float(dt_s))) if iau_active else -1
         if 0 < iau_off_step < total_steps:
             breaks.add(iau_off_step)
@@ -473,11 +580,18 @@ def run_domain_forecast(
                 breaks.add(s_idx)
 
         ordered_breaks = sorted(breaks)
-        cur_state = state_3d
-        cur_surf = surf_state
+        prev_oce_step = 0
+        prev_oce_rain = np.asarray(cur_surf.get("rain_acc", np.zeros((spec.ny, spec.nx))), dtype=np.float32).copy()
+        prev_oce_snow = (
+            np.asarray(cur_surf.get("snow_acc", np.zeros((spec.ny, spec.nx))), dtype=np.float32)
+            + np.asarray(cur_surf.get("graupel_acc", np.zeros((spec.ny, spec.nx))), dtype=np.float32)
+        ).copy()
+        prev_out_step = 0
+        prev_out_precip = prev_oce_rain.astype(np.float64) + prev_oce_snow.astype(np.float64)
 
         def _handle_step_events(step_idx: int) -> None:
-            nonlocal cur_state, cur_surf, iau_active
+            nonlocal cur_state, cur_surf, cur_oce_state, iau_active
+            nonlocal prev_oce_step, prev_oce_rain, prev_oce_snow, prev_out_step, prev_out_precip
             sim_sec = step_idx * float(dt_s)
             v_dt = init_dt + datetime.timedelta(seconds=sim_sec)
 
@@ -485,10 +599,41 @@ def run_domain_forecast(
                 step_idx in out_step_map
                 or step_idx in child_step_map
                 or step_idx in cycle_restart_step_map
+                or step_idx in cpl_step_set
                 or step_idx == total_steps
             ):
                 cur_state = solver.download_state()
                 cur_surf = solver.download_surface()
+
+            if (
+                ocean_solver is not None
+                and step_idx > prev_oce_step
+                and (step_idx in cpl_step_set or step_idx in out_step_map or step_idx == total_steps)
+            ):
+                dt_cpl = (step_idx - prev_oce_step) * float(dt_s)
+                mslp_pa = compute_mslp_pa(
+                    spec, hs_m, cur_state, theta_sfc_ref=theta_sfc_ref, p_sfc_ref=p_sfc_ref, n_ref_hz=n_ref_hz
+                )
+                forcing = ocean_solver.build_forcing_from_atmosphere(
+                    spec,
+                    cur_state,
+                    cur_surf,
+                    mslp_pa=mslp_pa,
+                    prev_rain=prev_oce_rain,
+                    prev_snow=prev_oce_snow,
+                    dt_interval_s=dt_cpl,
+                )
+                ocean_solver.step(forcing, dt_cpl)
+                cur_oce_state = ocean_solver.download_state()
+                cur_surf = ocean_solver.couple_to_surface_state(cur_oce_state, cur_surf)
+                if step_idx < total_steps:
+                    solver.upload_surface(cur_surf)
+                prev_oce_rain = np.asarray(cur_surf.get("rain_acc", prev_oce_rain), dtype=np.float32).copy()
+                prev_oce_snow = (
+                    np.asarray(cur_surf.get("snow_acc", np.zeros_like(prev_oce_snow)), dtype=np.float32)
+                    + np.asarray(cur_surf.get("graupel_acc", np.zeros_like(prev_oce_snow)), dtype=np.float32)
+                ).copy()
+                prev_oce_step = step_idx
 
             if step_idx in child_step_map and lbc_export_child is not None:
                 c_spec, c_hs, lbc_dir_c, _ = lbc_export_child
@@ -521,8 +666,18 @@ def run_domain_forecast(
                     theta_sfc_ref=theta_sfc_ref,
                     p_sfc_ref=p_sfc_ref,
                     n_ref_hz=n_ref_hz,
+                    include_3d_diagnostics=include_3d_diagnostics,
+                    ocean_diag=cur_oce_state,
+                    prev_precip_total=prev_out_precip if step_idx > prev_out_step else None,
+                    interval_s=max(0.0, (step_idx - prev_out_step) * float(dt_s)),
                 )
                 out_paths.append(fp)
+                prev_out_precip = (
+                    np.asarray(cur_surf.get("rain_acc", np.zeros((spec.ny, spec.nx))), dtype=np.float64)
+                    + np.asarray(cur_surf.get("snow_acc", np.zeros((spec.ny, spec.nx))), dtype=np.float64)
+                    + np.asarray(cur_surf.get("graupel_acc", np.zeros((spec.ny, spec.nx))), dtype=np.float64)
+                )
+                prev_out_step = step_idx
 
             if step_idx in cycle_restart_step_map and cyc_dir is not None:
                 hr = cycle_restart_step_map[step_idx]
@@ -540,6 +695,13 @@ def run_domain_forecast(
                     n_ref_hz=n_ref_hz,
                 )
                 cycle_restart_paths.append(rp)
+                if ocean_solver is not None and cur_oce_state is not None:
+                    ocean_solver.save_restart_wx1(
+                        cyc_dir / f"{spec.name}_ocean_cycle_f{tag}_{v_dt:%Y%m%d_%H%M}Z.wx1",
+                        v_dt,
+                        cur_oce_state,
+                        sim_time_sec=sim_sec,
+                    )
 
             if iau_active and step_idx >= iau_off_step and step_idx < total_steps:
                 zero_iau = {k: np.zeros_like(v) for k, v in iau_forcing.items()}  # type: ignore[union-attr]
@@ -588,10 +750,20 @@ def run_domain_forecast(
                 n_ref_hz=n_ref_hz,
             )
 
+        ocean_restart_path: Optional[Path] = None
+        if ocean_restart_out is not None and ocean_solver is not None and cur_oce_state is not None:
+            ocean_restart_path = ocean_solver.save_restart_wx1(
+                ocean_restart_out,
+                end_dt,
+                cur_oce_state,
+                sim_time_sec=total_steps * float(dt_s),
+            )
+
         elapsed_s = time.perf_counter() - t0_wall
         return {
             "state_3d": cur_state,
             "surf_state": cur_surf,
+            "ocean_state": cur_oce_state,
             "valid_time_utc": end_dt,
             "elapsed_s": elapsed_s,
             "num_tiles": solver.num_tiles,
@@ -599,10 +771,170 @@ def run_domain_forecast(
             "output_paths": out_paths,
             "lbc_paths": lbc_paths,
             "restart_path": restart_out,
+            "ocean_restart_path": ocean_restart_path,
             "cycle_restart_paths": cycle_restart_paths,
         }
     finally:
         solver.close()
+        if ocean_solver is not None:
+            ocean_solver.close()
+
+
+def _resolve_static(
+    spec: DomainSpec,
+    override: Optional[Tuple[np.ndarray, Dict[str, np.ndarray]]],
+) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
+    if override is not None:
+        return override
+    return build_domain_static_fields(spec)
+
+
+def _build_zero_state_for_spec(spec: DomainSpec) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray]]:
+    nz, ny, nx = spec.nz, spec.ny, spec.nx
+    state_3d = {
+        k: np.zeros(
+            (nz + 1 if k == "w" else nz, ny + (1 if k == "v" else 0), nx + (1 if k == "u" else 0)),
+            dtype=np.float32,
+        )
+        for k in ("u", "v", "w", "theta_p", "pi_p", "qv", "qc", "qr", "qi", "qs", "qg")
+    }
+    surf_state = {k: np.zeros((ny, nx), dtype=np.float32) for k in NonHydrostaticGPUSolver.SURFACE_2D_FIELDS}
+    surf_state["soil_t"] = np.full((4, ny, nx), 285.0, dtype=np.float32)
+    surf_state["soil_m"] = np.full((4, ny, nx), 0.28, dtype=np.float32)
+    surf_state["sst_bulk"] = np.full((ny, nx), 285.0, dtype=np.float32)
+    surf_state["sea_ice_tsfc"] = np.full((ny, nx), 271.35, dtype=np.float32)
+    surf_state["sea_ice_albedo"] = np.full((ny, nx), 0.066, dtype=np.float32)
+    return state_3d, surf_state
+
+
+def _load_domain_ic(
+    spec: DomainSpec,
+    hs_m: np.ndarray,
+    sstatic: Dict[str, np.ndarray],
+    *,
+    ic_source: str,
+    restart_path: Optional[Path | str] = None,
+    sfc_grib: Optional[Path | str] = None,
+    pl_grib: Optional[Path | str] = None,
+    aurora_wx1_path: Optional[Path | str] = None,
+    allow_zero_restart_fallback: bool = False,
+) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], Optional[datetime.datetime]]:
+    if ic_source == "restart":
+        if restart_path is not None:
+            st, sf, meta = load_tempest_restart_wx1(restart_path)
+            dt = datetime.datetime.fromisoformat(meta["valid_time_utc"].replace("Z", "+00:00"))
+            return st, sf, dt
+        if sfc_grib is not None and pl_grib is not None:
+            return ecmwf_grib_to_domain_state(sfc_grib, pl_grib, spec, hs_m, surface_static=sstatic)
+        if allow_zero_restart_fallback:
+            st, sf = _build_zero_state_for_spec(spec)
+            return st, sf, None
+    if ic_source == "aurora" and aurora_wx1_path is not None:
+        st, sf = aurora_wx1_to_ic(aurora_wx1_path, spec, hs_m)
+        dt = datetime.datetime.now(datetime.timezone.utc).replace(minute=0, second=0, microsecond=0)
+        return st, sf, dt
+    if sfc_grib is not None and pl_grib is not None:
+        return ecmwf_grib_to_domain_state(sfc_grib, pl_grib, spec, hs_m, surface_static=sstatic)
+    raise ValueError("Provide valid ECMWF GRIB2 paths, Aurora WX-1 path, or restart WX-1 path.")
+
+
+def _run_d3_da(
+    d3_spec: DomainSpec,
+    st_d3: Dict[str, np.ndarray],
+    sf_d3: Dict[str, np.ndarray],
+    hs_d3: np.ndarray,
+    ss_d3: Dict[str, np.ndarray],
+    init_dt: datetime.datetime,
+    obs_dir: Optional[Path | str],
+    enable_da: bool,
+) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], Optional[Dict[str, np.ndarray]], Dict[str, Any]]:
+    da_metrics: Dict[str, Any] = {}
+    iau_d3 = None
+    if enable_da and obs_dir is not None and Path(obs_dir).exists():
+        obs_list, stn_rows = load_station_obs_wx1(obs_dir, d3_spec, valid_time_utc=init_dt)
+        if obs_list:
+            da_metrics["verify_bg"] = verify_against_stations(d3_spec, st_d3, sf_d3, hs_d3, stn_rows)
+            st_d3, sf_d3, iau_d3, var_res = run_domain_3dvar(
+                d3_spec, st_d3, sf_d3, hs_d3, ss_d3["lsm"], obs_list, obs_dir=obs_dir
+            )
+            da_metrics["var3d"] = {
+                "j0": var_res.initial_cost_j0,
+                "jf": var_res.final_cost_j,
+                "iterations": var_res.iterations,
+                "converged": var_res.converged,
+            }
+            da_metrics["verify_ana"] = verify_against_stations(d3_spec, st_d3, sf_d3, hs_d3, stn_rows)
+    return st_d3, sf_d3, iau_d3, da_metrics
+
+
+def _domain_manifest_entry(spec: DomainSpec, res: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "domain": spec.name,
+        "elapsed_s": float(res["elapsed_s"]),
+        "restart_path": str(res["restart_path"]) if res.get("restart_path") else None,
+        "ocean_restart_path": str(res["ocean_restart_path"]) if res.get("ocean_restart_path") else None,
+        "cycle_restart_paths": [str(p) for p in res.get("cycle_restart_paths", [])],
+        "output_paths": [str(p) for p in res.get("output_paths", [])],
+    }
+
+
+def _extract_cf_map(paths: Sequence[Path]) -> Dict[float, Path]:
+    cf_map: Dict[float, Path] = {}
+    for p in paths:
+        name = Path(p).name
+        if "_T+" in name and name.endswith("h.wx1"):
+            try:
+                cf_map[float(name.split("_T+")[1][:-5])] = Path(p)
+            except ValueError:
+                pass
+    return cf_map
+
+
+def _run_pipeline_ensemble(
+    targets: Dict[str, Tuple[DomainSpec, np.ndarray, Dict[str, np.ndarray], Dict[str, np.ndarray], Dict[str, np.ndarray], float, int, Optional[LBCInterpolator], Optional[Dict[str, np.ndarray]], Dict[str, Any]]],
+    *,
+    ensemble_domain: str,
+    ensemble_members: int,
+    ensemble_lead_hours: Optional[float],
+    ensemble_seed: Optional[int],
+    forecast_hours: float,
+    sched: List[float],
+    init_dt: datetime.datetime,
+    ens_dir: Path,
+) -> Optional[Dict[str, Any]]:
+    if int(ensemble_members) <= 0:
+        return None
+    from tempest_v2.ensemble import EnsembleConfig, run_ensemble_forecast
+
+    key = ensemble_domain.strip().lower()
+    if key not in targets:
+        key = "d3"
+    spec_e, hs_e, ss_e, st_e, sf_e, dt_e, phys_e, lbc_e, iau_e, res_e = targets[key]
+    ens_hours = float(ensemble_lead_hours) if ensemble_lead_hours is not None else float(forecast_hours)
+    ens_sched = sorted({float(hr) for hr in sched if float(hr) <= ens_hours + 1e-6} | {ens_hours})
+    cf_map = _extract_cf_map(res_e.get("output_paths", []))
+    ens_cfg = EnsembleConfig(
+        n_members=int(ensemble_members),
+        seed=int(ensemble_seed) if ensemble_seed is not None else int(init_dt.strftime("%Y%m%d%H")),
+    )
+    return run_ensemble_forecast(
+        spec_e,
+        hs_e,
+        ss_e,
+        st_e,
+        sf_e,
+        init_dt,
+        forecast_hours=ens_hours,
+        ens_dir=ens_dir,
+        cfg=ens_cfg,
+        dt_s=dt_e,
+        physics_every=phys_e,
+        lbc_interpolator=lbc_e,
+        base_iau_forcing=iau_e,
+        base_iau_duration_s=900.0 if iau_e is not None else 0.0,
+        output_hours=ens_sched,
+        existing_cf_outputs=cf_map if cf_map else None,
+    )
 
 
 def run_two_nest_pipeline(
@@ -633,38 +965,45 @@ def run_two_nest_pipeline(
     dt_d3_s: float = 4.0,
     physics_every: int = 5,
     lbc_interval_s: float = 1800.0,
+    enable_ocean_si3: bool = False,
+    include_3d_diagnostics: bool = True,
+    ocean_nz: int = 16,
+    ocean_coupling_interval_s: float = 1800.0,
+    osisaf_wx1_path: Optional[Path | str] = None,
+    d2_ocean_restart_in: Optional[Path | str] = None,
+    d3_ocean_restart_in: Optional[Path | str] = None,
+    d2_static: Optional[Tuple[np.ndarray, Dict[str, np.ndarray]]] = None,
+    d3_static: Optional[Tuple[np.ndarray, Dict[str, np.ndarray]]] = None,
 ) -> Dict[str, Any]:
     """Run operational D2 (7.5 km Europe) -> WX-1 LBC -> D3 (1.5 km Benelux+DE) pipeline."""
     t0_pipe = time.perf_counter()
     d2_spec = d2_spec if d2_spec is not None else get_domain_spec("d2", nz=nz)
     d3_spec = d3_spec if d3_spec is not None else get_domain_spec("d3", nz=nz)
-    hs_d2, ss_d2 = build_domain_static_fields(d2_spec)
-    hs_d3, ss_d3 = build_domain_static_fields(d3_spec)
+    hs_d2, ss_d2 = _resolve_static(d2_spec, d2_static)
+    hs_d3, ss_d3 = _resolve_static(d3_spec, d3_static)
 
-    if ic_source == "restart" and restart_path is not None:
-        st_d3, sf_d3, meta = load_tempest_restart_wx1(restart_path)
-        init_dt = datetime.datetime.fromisoformat(meta["valid_time_utc"].replace("Z", "+00:00"))
-        if d2_restart_path is not None:
-            st_d2, sf_d2, _ = load_tempest_restart_wx1(d2_restart_path)
-        elif sfc_grib is not None and pl_grib is not None:
-            st_d2, sf_d2, _ = ecmwf_grib_to_domain_state(sfc_grib, pl_grib, d2_spec, hs_d2, surface_static=ss_d2)
-        else:
-            st_d2 = {k: np.zeros((nz if k != "w" else nz + 1, d2_spec.ny, d2_spec.nx + (1 if k == "u" else 0)), dtype=np.float32)
-                     if k != "v" else np.zeros((nz, d2_spec.ny + 1, d2_spec.nx), dtype=np.float32)
-                     for k in ("u", "v", "w", "theta_p", "pi_p", "qv", "qc", "qr", "qi", "qs", "qg")}
-            sf_d2 = {k: np.zeros((d2_spec.ny, d2_spec.nx), dtype=np.float32)
-                     for k in NonHydrostaticGPUSolver.SURFACE_2D_FIELDS}
-            sf_d2["soil_t"] = np.full((4, d2_spec.ny, d2_spec.nx), 285.0, dtype=np.float32)
-            sf_d2["soil_m"] = np.full((4, d2_spec.ny, d2_spec.nx), 0.28, dtype=np.float32)
-    elif ic_source == "aurora" and aurora_wx1_path is not None:
-        init_dt = datetime.datetime.now(datetime.timezone.utc).replace(minute=0, second=0, microsecond=0)
-        st_d2, sf_d2 = aurora_wx1_to_ic(aurora_wx1_path, d2_spec, hs_d2)
-        st_d3, sf_d3 = aurora_wx1_to_ic(aurora_wx1_path, d3_spec, hs_d3)
-    elif sfc_grib is not None and pl_grib is not None:
-        st_d2, sf_d2, init_dt = ecmwf_grib_to_domain_state(sfc_grib, pl_grib, d2_spec, hs_d2, surface_static=ss_d2)
-        st_d3, sf_d3, _ = ecmwf_grib_to_domain_state(sfc_grib, pl_grib, d3_spec, hs_d3, surface_static=ss_d3)
-    else:
-        raise ValueError("Provide valid ECMWF GRIB2 paths, Aurora WX-1 path, or restart WX-1 path.")
+    st_d3, sf_d3, init_dt = _load_domain_ic(
+        d3_spec,
+        hs_d3,
+        ss_d3,
+        ic_source=ic_source,
+        restart_path=restart_path,
+        sfc_grib=sfc_grib,
+        pl_grib=pl_grib,
+        aurora_wx1_path=aurora_wx1_path,
+    )
+    assert init_dt is not None
+    st_d2, sf_d2, _ = _load_domain_ic(
+        d2_spec,
+        hs_d2,
+        ss_d2,
+        ic_source=ic_source,
+        restart_path=d2_restart_path,
+        sfc_grib=sfc_grib,
+        pl_grib=pl_grib,
+        aurora_wx1_path=aurora_wx1_path,
+        allow_zero_restart_fallback=True,
+    )
 
     layout: Optional[Dict[str, Path]] = None
     if run_dir is not None:
@@ -679,6 +1018,8 @@ def run_two_nest_pipeline(
         d3_out_dir = layout["d3"]
         d2_restart_out = layout["restarts"] / f"restart_{d2_spec.name}.wx1"
         d3_restart_out = layout["restarts"] / f"restart_{d3_spec.name}.wx1"
+        d2_ocean_out = (layout["ocean"] / f"restart_ocean_{d2_spec.name}.wx1") if enable_ocean_si3 else None
+        d3_ocean_out = (layout["ocean"] / f"restart_ocean_{d3_spec.name}.wx1") if enable_ocean_si3 else None
         cyc_restart_dir: Optional[Path] = layout["restarts"]
         manifest_path: Optional[Path] = out_root / "manifest.json"
     else:
@@ -689,12 +1030,17 @@ def run_two_nest_pipeline(
         d3_out_dir = out_root / "d3_wx1"
         d2_restart_out = None
         d3_restart_out = out_root / f"restart_{d3_spec.name}.wx1"
+        d2_ocean_out = None
+        d3_ocean_out = (out_root / f"restart_ocean_{d3_spec.name}.wx1") if enable_ocean_si3 else None
         cyc_restart_dir = None
         manifest_path = None
 
     sched = forecast_output_schedule_hours(forecast_hours, ecmwf_schedule=ecmwf_schedule, hourly=True)
 
-    # 1. Outer nest D2 -> export child WX-1 LBCs
+    st_d2, sf_d2, iau_d2, da_d2 = _run_d3_da(
+        d2_spec, st_d2, sf_d2, hs_d2, ss_d2, init_dt, obs_dir, enable_da
+    )
+
     res_d2 = run_domain_forecast(
         d2_spec,
         hs_d2,
@@ -706,32 +1052,29 @@ def run_two_nest_pipeline(
         dt_s=dt_d2_s,
         physics_every=max(1, physics_every // 2),
         lbc_export_child=(d3_spec, hs_d3, lbc_dir, lbc_interval_s),
+        iau_forcing=iau_d2,
+        iau_duration_s=900.0 if iau_d2 is not None else 0.0,
         output_dir=d2_out_dir,
         output_hours=sched if d2_out_dir is not None else None,
         save_restart_path=d2_restart_out,
         save_cycle_restart_hours=cycle_restart_hours if cyc_restart_dir is not None else (),
         cycle_restart_dir=cyc_restart_dir,
+        enable_ocean_si3=enable_ocean_si3,
+        ocean_coupling_interval_s=ocean_coupling_interval_s,
+        ocean_nz=ocean_nz,
+        osisaf_wx1_path=osisaf_wx1_path,
+        obs_dir=obs_dir,
+        ocean_restart_in=d2_ocean_restart_in,
+        ocean_restart_out=d2_ocean_out,
+        include_3d_diagnostics=include_3d_diagnostics,
     )
 
-    # 2. Balanced 3D-Var + verification on D3 if observations exist
-    da_metrics: Dict[str, Any] = {}
-    iau_d3 = None
-    if enable_da and obs_dir is not None and Path(obs_dir).exists():
-        obs_list, stn_rows = load_station_obs_wx1(obs_dir, d3_spec, valid_time_utc=init_dt)
-        if obs_list:
-            da_metrics["verify_bg"] = verify_against_stations(d3_spec, st_d3, sf_d3, hs_d3, stn_rows)
-            st_d3, sf_d3, iau_d3, var_res = run_domain_3dvar(
-                d3_spec, st_d3, sf_d3, hs_d3, ss_d3["lsm"], obs_list, obs_dir=obs_dir
-            )
-            da_metrics["var3d"] = {
-                "j0": var_res.initial_cost_j0,
-                "jf": var_res.final_cost_j,
-                "iterations": var_res.iterations,
-                "converged": var_res.converged,
-            }
-            da_metrics["verify_ana"] = verify_against_stations(d3_spec, st_d3, sf_d3, hs_d3, stn_rows)
+    st_d3, sf_d3, iau_d3, da_metrics = _run_d3_da(
+        d3_spec, st_d3, sf_d3, hs_d3, ss_d3, init_dt, obs_dir, enable_da
+    )
+    if da_d2:
+        da_metrics["d2"] = da_d2
 
-    # 3. Inner 1.5 km nest D3 (Control Forecast CF) with Davies LBCs & IAU
     lbc_interp = LBCInterpolator(lbc_dir, d3_spec.name)
     res_d3 = run_domain_forecast(
         d3_spec,
@@ -751,72 +1094,38 @@ def run_two_nest_pipeline(
         save_restart_path=d3_restart_out,
         save_cycle_restart_hours=cycle_restart_hours if cyc_restart_dir is not None else (),
         cycle_restart_dir=cyc_restart_dir,
+        enable_ocean_si3=enable_ocean_si3,
+        ocean_coupling_interval_s=ocean_coupling_interval_s,
+        ocean_nz=ocean_nz,
+        osisaf_wx1_path=osisaf_wx1_path,
+        obs_dir=obs_dir,
+        ocean_restart_in=d3_ocean_restart_in,
+        ocean_restart_out=d3_ocean_out,
+        include_3d_diagnostics=include_3d_diagnostics,
     )
 
     if enable_da and obs_dir is not None and da_metrics.get("verify_bg"):
         _, stn_rows = load_station_obs_wx1(obs_dir, d3_spec, valid_time_utc=init_dt)
-        da_metrics["verify_end"] = verify_against_stations(d3_spec, res_d3["state_3d"], res_d3["surf_state"], hs_d3, stn_rows)
+        da_metrics["verify_end"] = verify_against_stations(
+            d3_spec, res_d3["state_3d"], res_d3["surf_state"], hs_d3, stn_rows
+        )
 
     all_cyc_restarts = [str(p) for p in (res_d2.get("cycle_restart_paths", []) + res_d3.get("cycle_restart_paths", []))]
-    ens_summary: Optional[Dict[str, Any]] = None
-    if int(ensemble_members) > 0:
-        from tempest_v2.ensemble import EnsembleConfig, run_ensemble_forecast
-
-        ens_hours = float(ensemble_lead_hours) if ensemble_lead_hours is not None else float(forecast_hours)
-        ens_sched = [hr for hr in sched if float(hr) <= ens_hours + 1e-6]
-        if ens_hours not in ens_sched:
-            ens_sched.append(ens_hours)
-            ens_sched = sorted(set(ens_sched))
-
-        def _extract_cf_map(paths: Sequence[Path], prefix: str) -> Dict[float, Path]:
-            cf_map: Dict[float, Path] = {}
-            for p in paths:
-                name = Path(p).name
-                if "_T+" in name and name.endswith("h.wx1"):
-                    try:
-                        hr_str = name.split("_T+")[1][:-5]
-                        cf_map[float(hr_str)] = Path(p)
-                    except ValueError:
-                        pass
-            return cf_map
-
-        is_d2_ens = ensemble_domain.strip().lower() == "d2"
-        spec_e = d2_spec if is_d2_ens else d3_spec
-        hs_e = hs_d2 if is_d2_ens else hs_d3
-        ss_e = ss_d2 if is_d2_ens else ss_d3
-        st_e = st_d2 if is_d2_ens else st_d3
-        sf_e = sf_d2 if is_d2_ens else sf_d3
-        dt_e = dt_d2_s if is_d2_ens else dt_d3_s
-        phys_e = max(1, physics_every // 2) if is_d2_ens else physics_every
-        lbc_e = None if is_d2_ens else lbc_interp
-        iau_e = None if is_d2_ens else iau_d3
-        cf_map = _extract_cf_map(
-            (res_d2 if is_d2_ens else res_d3).get("output_paths", []),
-            spec_e.name,
-        )
-        ens_cfg = EnsembleConfig(
-            n_members=int(ensemble_members),
-            seed=int(ensemble_seed) if ensemble_seed is not None else int(init_dt.strftime("%Y%m%d%H")),
-        )
-        ens_dir = layout["ensemble"] if layout is not None else (out_root / "ensemble")
-        ens_summary = run_ensemble_forecast(
-            spec_e,
-            hs_e,
-            ss_e,
-            st_e,
-            sf_e,
-            init_dt,
-            forecast_hours=ens_hours,
-            ens_dir=ens_dir,
-            cfg=ens_cfg,
-            dt_s=dt_e,
-            physics_every=phys_e,
-            lbc_interpolator=lbc_e,
-            base_iau_forcing=iau_e,
-            base_iau_duration_s=900.0 if iau_e is not None else 0.0,
-            output_hours=ens_sched,
-            existing_cf_outputs=cf_map if cf_map else None,
-        )
+    ens_dir = layout["ensemble"] if layout is not None else (out_root / "ensemble")
+    ens_summary = _run_pipeline_ensemble(
+        {
+            "d2": (d2_spec, hs_d2, ss_d2, st_d2, sf_d2, dt_d2_s, max(1, physics_every // 2), None, None, res_d2),
+            "d3": (d3_spec, hs_d3, ss_d3, st_d3, sf_d3, dt_d3_s, physics_every, lbc_interp, iau_d3, res_d3),
+        },
+        ensemble_domain=ensemble_domain,
+        ensemble_members=ensemble_members,
+        ensemble_lead_hours=ensemble_lead_hours,
+        ensemble_seed=ensemble_seed,
+        forecast_hours=forecast_hours,
+        sched=sched,
+        init_dt=init_dt,
+        ens_dir=ens_dir,
+    )
 
     if layout is not None and manifest_path is not None:
         manifest = {
@@ -825,20 +1134,16 @@ def run_two_nest_pipeline(
             "warm_start": bool(ic_source == "restart"),
             "forecast_hours": float(forecast_hours),
             "nz": int(nz),
-            "d2": {
-                "domain": d2_spec.name,
-                "elapsed_s": float(res_d2["elapsed_s"]),
-                "restart_path": str(res_d2["restart_path"]) if res_d2.get("restart_path") else None,
-                "cycle_restart_paths": [str(p) for p in res_d2.get("cycle_restart_paths", [])],
-                "output_paths": [str(p) for p in res_d2.get("output_paths", [])],
+            "include_3d_diagnostics": bool(include_3d_diagnostics),
+            "ocean": {
+                "enabled": bool(enable_ocean_si3),
+                "nz": int(ocean_nz),
+                "coupling_interval_s": float(ocean_coupling_interval_s),
+                "d2_restart_path": str(res_d2["ocean_restart_path"]) if res_d2.get("ocean_restart_path") else None,
+                "d3_restart_path": str(res_d3["ocean_restart_path"]) if res_d3.get("ocean_restart_path") else None,
             },
-            "d3": {
-                "domain": d3_spec.name,
-                "elapsed_s": float(res_d3["elapsed_s"]),
-                "restart_path": str(res_d3["restart_path"]) if res_d3.get("restart_path") else None,
-                "cycle_restart_paths": [str(p) for p in res_d3.get("cycle_restart_paths", [])],
-                "output_paths": [str(p) for p in res_d3.get("output_paths", [])],
-            },
+            "d2": _domain_manifest_entry(d2_spec, res_d2),
+            "d3": _domain_manifest_entry(d3_spec, res_d3),
             "da": da_metrics,
             "ensemble": ens_summary,
             "cycle_restart_paths": all_cyc_restarts,
@@ -854,5 +1159,284 @@ def run_two_nest_pipeline(
         "layout": layout,
         "manifest_path": manifest_path,
         "cycle_restart_paths": res_d2.get("cycle_restart_paths", []) + res_d3.get("cycle_restart_paths", []),
+        "ensemble": ens_summary,
+    }
+
+
+def run_three_nest_pipeline(
+    *,
+    forecast_hours: float = 24.0,
+    d1_forecast_hours: Optional[float] = None,
+    nz: int = 65,
+    ic_source: str = "ecmwf",
+    sfc_grib: Optional[Path | str] = None,
+    pl_grib: Optional[Path | str] = None,
+    aurora_wx1_path: Optional[Path | str] = None,
+    restart_path: Optional[Path | str] = None,
+    d2_restart_path: Optional[Path | str] = None,
+    d1_restart_path: Optional[Path | str] = None,
+    obs_dir: Optional[Path | str] = None,
+    outdir: Path | str = "data/forecasts",
+    runs_root: Optional[Path | str] = None,
+    run_dir: Optional[Path | str] = None,
+    run_tag: Optional[str] = None,
+    cycle_restart_hours: Sequence[float] = (6.0,),
+    ensemble_members: int = 0,
+    ensemble_lead_hours: Optional[float] = None,
+    ensemble_seed: Optional[int] = None,
+    ensemble_domain: str = "d3",
+    d1_spec: Optional[DomainSpec] = None,
+    d2_spec: Optional[DomainSpec] = None,
+    d3_spec: Optional[DomainSpec] = None,
+    ecmwf_schedule: bool = False,
+    enable_da: bool = True,
+    dt_d1_s: float = 60.0,
+    dt_d2_s: float = 20.0,
+    dt_d3_s: float = 4.0,
+    physics_every: int = 5,
+    d1_lbc_interval_s: float = 3600.0,
+    lbc_interval_s: float = 1800.0,
+    enable_ocean_si3: bool = True,
+    include_3d_diagnostics: bool = True,
+    ocean_nz: int = 16,
+    ocean_coupling_interval_s: float = 1800.0,
+    osisaf_wx1_path: Optional[Path | str] = None,
+    d1_ocean_restart_in: Optional[Path | str] = None,
+    d2_ocean_restart_in: Optional[Path | str] = None,
+    d3_ocean_restart_in: Optional[Path | str] = None,
+    d1_static: Optional[Tuple[np.ndarray, Dict[str, np.ndarray]]] = None,
+    d2_static: Optional[Tuple[np.ndarray, Dict[str, np.ndarray]]] = None,
+    d3_static: Optional[Tuple[np.ndarray, Dict[str, np.ndarray]]] = None,
+) -> Dict[str, Any]:
+    """Run coupled global D1 (0.25 deg) -> regional D2 (7.5 km) -> D3 (1.5 km) pipeline with NEMO+SI3 & 3D diagnostics."""
+    t0_pipe = time.perf_counter()
+    d1_spec = d1_spec if d1_spec is not None else get_domain_spec("d1", nz=nz)
+    d2_spec = d2_spec if d2_spec is not None else get_domain_spec("d2", nz=nz)
+    d3_spec = d3_spec if d3_spec is not None else get_domain_spec("d3", nz=nz)
+    hs_d1, ss_d1 = _resolve_static(d1_spec, d1_static)
+    hs_d2, ss_d2 = _resolve_static(d2_spec, d2_static)
+    hs_d3, ss_d3 = _resolve_static(d3_spec, d3_static)
+
+    st_d3, sf_d3, init_dt = _load_domain_ic(
+        d3_spec,
+        hs_d3,
+        ss_d3,
+        ic_source=ic_source,
+        restart_path=restart_path,
+        sfc_grib=sfc_grib,
+        pl_grib=pl_grib,
+        aurora_wx1_path=aurora_wx1_path,
+    )
+    assert init_dt is not None
+    st_d2, sf_d2, _ = _load_domain_ic(
+        d2_spec,
+        hs_d2,
+        ss_d2,
+        ic_source=ic_source,
+        restart_path=d2_restart_path,
+        sfc_grib=sfc_grib,
+        pl_grib=pl_grib,
+        aurora_wx1_path=aurora_wx1_path,
+        allow_zero_restart_fallback=True,
+    )
+    st_d1, sf_d1, _ = _load_domain_ic(
+        d1_spec,
+        hs_d1,
+        ss_d1,
+        ic_source=ic_source,
+        restart_path=d1_restart_path,
+        sfc_grib=sfc_grib,
+        pl_grib=pl_grib,
+        aurora_wx1_path=aurora_wx1_path,
+        allow_zero_restart_fallback=True,
+    )
+
+    if run_dir is not None:
+        layout = _ensure_run_layout_dirs(Path(run_dir))
+    elif runs_root is not None:
+        layout = create_run_layout(runs_root, init_dt, run_tag=run_tag)
+    else:
+        layout = create_run_layout(Path(outdir), init_dt, run_tag=run_tag)
+
+    out_root = layout["run_dir"]
+    lbc_d2_dir = layout["d1"] / "lbc_d2"
+    lbc_d3_dir = layout["d2"] / "lbc_d3"
+    cyc_dir = layout["restarts"]
+    d1_ocean_out = (layout["ocean"] / f"restart_ocean_{d1_spec.name}.wx1") if enable_ocean_si3 else None
+    d2_ocean_out = (layout["ocean"] / f"restart_ocean_{d2_spec.name}.wx1") if enable_ocean_si3 else None
+    d3_ocean_out = (layout["ocean"] / f"restart_ocean_{d3_spec.name}.wx1") if enable_ocean_si3 else None
+
+    d1_hrs = max(float(forecast_hours), float(d1_forecast_hours)) if d1_forecast_hours is not None else float(forecast_hours)
+    sched_d1 = forecast_output_schedule_hours(d1_hrs, ecmwf_schedule=ecmwf_schedule, hourly=True)
+    sched = forecast_output_schedule_hours(forecast_hours, ecmwf_schedule=ecmwf_schedule, hourly=True)
+
+    # 1. Global D1 -> balanced 3D-Var/4D-FGAT + coupled NEMO+SI3 -> LBCs for Europe D2
+    st_d1, sf_d1, iau_d1, da_d1 = _run_d3_da(
+        d1_spec, st_d1, sf_d1, hs_d1, ss_d1, init_dt, obs_dir, enable_da
+    )
+    res_d1 = run_domain_forecast(
+        d1_spec,
+        hs_d1,
+        ss_d1,
+        st_d1,
+        sf_d1,
+        init_dt,
+        forecast_hours=d1_hrs,
+        dt_s=dt_d1_s,
+        physics_every=max(1, physics_every // 4),
+        lbc_export_child=(d2_spec, hs_d2, lbc_d2_dir, d1_lbc_interval_s),
+        iau_forcing=iau_d1,
+        iau_duration_s=900.0 if iau_d1 is not None else 0.0,
+        output_dir=layout["d1"],
+        output_hours=sched_d1,
+        save_restart_path=cyc_dir / f"restart_{d1_spec.name}.wx1",
+        save_cycle_restart_hours=cycle_restart_hours,
+        cycle_restart_dir=cyc_dir,
+        enable_ocean_si3=enable_ocean_si3,
+        ocean_coupling_interval_s=ocean_coupling_interval_s,
+        ocean_nz=ocean_nz,
+        osisaf_wx1_path=osisaf_wx1_path,
+        obs_dir=obs_dir,
+        ocean_restart_in=d1_ocean_restart_in,
+        ocean_restart_out=d1_ocean_out,
+        include_3d_diagnostics=include_3d_diagnostics,
+    )
+
+    # 2. Regional Europe D2 driven by D1 LBCs + balanced 3D-Var/4D-FGAT -> LBCs for Benelux+DE D3
+    st_d2, sf_d2, iau_d2, da_d2 = _run_d3_da(
+        d2_spec, st_d2, sf_d2, hs_d2, ss_d2, init_dt, obs_dir, enable_da
+    )
+    lbc_d2_interp = LBCInterpolator(lbc_d2_dir, d2_spec.name)
+    res_d2 = run_domain_forecast(
+        d2_spec,
+        hs_d2,
+        ss_d2,
+        st_d2,
+        sf_d2,
+        init_dt,
+        forecast_hours=forecast_hours,
+        dt_s=dt_d2_s,
+        physics_every=max(1, physics_every // 2),
+        lbc_interpolator=lbc_d2_interp,
+        lbc_export_child=(d3_spec, hs_d3, lbc_d3_dir, lbc_interval_s),
+        iau_forcing=iau_d2,
+        iau_duration_s=900.0 if iau_d2 is not None else 0.0,
+        output_dir=layout["d2"],
+        output_hours=sched,
+        save_restart_path=cyc_dir / f"restart_{d2_spec.name}.wx1",
+        save_cycle_restart_hours=cycle_restart_hours,
+        cycle_restart_dir=cyc_dir,
+        enable_ocean_si3=enable_ocean_si3,
+        ocean_coupling_interval_s=ocean_coupling_interval_s,
+        ocean_nz=ocean_nz,
+        osisaf_wx1_path=osisaf_wx1_path,
+        obs_dir=obs_dir,
+        ocean_restart_in=d2_ocean_restart_in,
+        ocean_restart_out=d2_ocean_out,
+        include_3d_diagnostics=include_3d_diagnostics,
+    )
+
+    # 3. Balanced 3D-Var/4D-FGAT + Radar LHN + IAU on 1.5 km D3
+    st_d3, sf_d3, iau_d3, da_metrics = _run_d3_da(
+        d3_spec, st_d3, sf_d3, hs_d3, ss_d3, init_dt, obs_dir, enable_da
+    )
+    if da_d1:
+        da_metrics["d1"] = da_d1
+    if da_d2:
+        da_metrics["d2"] = da_d2
+
+    # 4. Benelux+Germany 1.5 km D3 CF driven by D2 LBCs & coupled coastal ocean/SI3
+    lbc_d3_interp = LBCInterpolator(lbc_d3_dir, d3_spec.name)
+    res_d3 = run_domain_forecast(
+        d3_spec,
+        hs_d3,
+        ss_d3,
+        st_d3,
+        sf_d3,
+        init_dt,
+        forecast_hours=forecast_hours,
+        dt_s=dt_d3_s,
+        physics_every=physics_every,
+        lbc_interpolator=lbc_d3_interp,
+        iau_forcing=iau_d3,
+        iau_duration_s=900.0 if iau_d3 is not None else 0.0,
+        output_dir=layout["d3"],
+        output_hours=sched,
+        save_restart_path=cyc_dir / f"restart_{d3_spec.name}.wx1",
+        save_cycle_restart_hours=cycle_restart_hours,
+        cycle_restart_dir=cyc_dir,
+        enable_ocean_si3=enable_ocean_si3,
+        ocean_coupling_interval_s=ocean_coupling_interval_s,
+        ocean_nz=ocean_nz,
+        osisaf_wx1_path=osisaf_wx1_path,
+        obs_dir=obs_dir,
+        ocean_restart_in=d3_ocean_restart_in,
+        ocean_restart_out=d3_ocean_out,
+        include_3d_diagnostics=include_3d_diagnostics,
+    )
+
+    if enable_da and obs_dir is not None and da_metrics.get("verify_bg"):
+        _, stn_rows = load_station_obs_wx1(obs_dir, d3_spec, valid_time_utc=init_dt)
+        da_metrics["verify_end"] = verify_against_stations(
+            d3_spec, res_d3["state_3d"], res_d3["surf_state"], hs_d3, stn_rows
+        )
+
+    cyc_list = (
+        res_d1.get("cycle_restart_paths", [])
+        + res_d2.get("cycle_restart_paths", [])
+        + res_d3.get("cycle_restart_paths", [])
+    )
+    ens_summary = _run_pipeline_ensemble(
+        {
+            "d1": (d1_spec, hs_d1, ss_d1, st_d1, sf_d1, dt_d1_s, max(1, physics_every // 4), None, None, res_d1),
+            "d2": (d2_spec, hs_d2, ss_d2, st_d2, sf_d2, dt_d2_s, max(1, physics_every // 2), lbc_d2_interp, None, res_d2),
+            "d3": (d3_spec, hs_d3, ss_d3, st_d3, sf_d3, dt_d3_s, physics_every, lbc_d3_interp, iau_d3, res_d3),
+        },
+        ensemble_domain=ensemble_domain,
+        ensemble_members=ensemble_members,
+        ensemble_lead_hours=ensemble_lead_hours,
+        ensemble_seed=ensemble_seed,
+        forecast_hours=forecast_hours,
+        sched=sched,
+        init_dt=init_dt,
+        ens_dir=layout["ensemble"],
+    )
+
+    manifest_path = out_root / "manifest.json"
+    manifest = {
+        "init_time_utc": init_dt.isoformat(),
+        "ic_source": ic_source,
+        "warm_start": bool(ic_source == "restart"),
+        "forecast_hours": float(forecast_hours),
+        "d1_forecast_hours": float(d1_hrs),
+        "nz": int(nz),
+        "include_3d_diagnostics": bool(include_3d_diagnostics),
+        "ocean": {
+            "enabled": bool(enable_ocean_si3),
+            "nz": int(ocean_nz),
+            "coupling_interval_s": float(ocean_coupling_interval_s),
+            "d1_restart_path": str(res_d1["ocean_restart_path"]) if res_d1.get("ocean_restart_path") else None,
+            "d2_restart_path": str(res_d2["ocean_restart_path"]) if res_d2.get("ocean_restart_path") else None,
+            "d3_restart_path": str(res_d3["ocean_restart_path"]) if res_d3.get("ocean_restart_path") else None,
+        },
+        "d1": _domain_manifest_entry(d1_spec, res_d1),
+        "d2": _domain_manifest_entry(d2_spec, res_d2),
+        "d3": _domain_manifest_entry(d3_spec, res_d3),
+        "da": da_metrics,
+        "ensemble": ens_summary,
+        "cycle_restart_paths": [str(p) for p in cyc_list],
+        "wall_time_s": float(time.perf_counter() - t0_pipe),
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2))
+
+    return {
+        "d1": res_d1,
+        "d2": res_d2,
+        "d3": res_d3,
+        "da": da_metrics,
+        "run_dir": out_root,
+        "layout": layout,
+        "manifest_path": manifest_path,
+        "cycle_restart_paths": cyc_list,
         "ensemble": ens_summary,
     }
