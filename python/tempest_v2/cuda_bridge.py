@@ -61,6 +61,64 @@ class NhStatePtrsC(ctypes.Structure):
     ]
 
 
+class NhPhysicsConfigC(ctypes.Structure):
+    _fields_ = [
+        ("enable_microphysics", ctypes.c_int32),
+        ("enable_pbl", ctypes.c_int32),
+        ("enable_radiation", ctypes.c_int32),
+        ("enable_surface", ctypes.c_int32),
+        ("rad_interval_s", ctypes.c_double),
+        ("cloud_num_land", ctypes.c_double),
+        ("cloud_num_sea", ctypes.c_double),
+        ("julian_day", ctypes.c_double),
+        ("utc_seconds", ctypes.c_double),
+        ("co2_ppm", ctypes.c_double),
+    ]
+
+
+class NhSurfaceStaticPtrsC(ctypes.Structure):
+    _fields_ = [
+        ("lat_deg", ctypes.c_void_p),
+        ("lon_deg", ctypes.c_void_p),
+        ("lsm", ctypes.c_void_p),
+        ("lake_mask", ctypes.c_void_p),
+        ("soil_type", ctypes.c_void_p),
+        ("bathy_depth_m", ctypes.c_void_p),
+        ("z0m_base", ctypes.c_void_p),
+        ("albedo_base", ctypes.c_void_p),
+        ("veg_frac", ctypes.c_void_p),
+    ]
+
+
+class NhSurfaceStatePtrsC(ctypes.Structure):
+    _fields_ = [
+        ("t_skin", ctypes.c_void_p),
+        ("soil_t", ctypes.c_void_p),
+        ("soil_m", ctypes.c_void_p),
+        ("snow_swe", ctypes.c_void_p),
+        ("sst_bulk", ctypes.c_void_p),
+        ("dt_cool", ctypes.c_void_p),
+        ("dt_warm", ctypes.c_void_p),
+        ("lake_tbot", ctypes.c_void_p),
+        ("lake_hmld", ctypes.c_void_p),
+        ("lake_ctheta", ctypes.c_void_p),
+        ("lake_hice", ctypes.c_void_p),
+        ("rain_acc", ctypes.c_void_p),
+        ("snow_acc", ctypes.c_void_p),
+        ("graupel_acc", ctypes.c_void_p),
+        ("sw_down", ctypes.c_void_p),
+        ("lw_down", ctypes.c_void_p),
+        ("shf", ctypes.c_void_p),
+        ("lhf", ctypes.c_void_p),
+        ("ustar", ctypes.c_void_p),
+        ("pblh", ctypes.c_void_p),
+        ("t2m", ctypes.c_void_p),
+        ("q2m", ctypes.c_void_p),
+        ("u10m", ctypes.c_void_p),
+        ("v10m", ctypes.c_void_p),
+    ]
+
+
 def _default_lib_path() -> Path:
     repo_root = Path(__file__).resolve().parents[2]
     return repo_root / "crates" / "tempest-cuda" / "libtempest_cuda.so"
@@ -98,6 +156,16 @@ def load_cuda_library(lib_path: Optional[Path] = None) -> ctypes.CDLL:
         ctypes.c_int32,
     ]
     lib.nh_cuda_estimate_vram_bytes.restype = ctypes.c_uint64
+    lib.nh_cuda_estimate_vram_bytes_ex.argtypes = [
+        ctypes.c_int32,
+        ctypes.c_int32,
+        ctypes.c_int32,
+        ctypes.c_int32,
+        ctypes.c_int32,
+        ctypes.c_int32,
+        ctypes.c_int32,
+    ]
+    lib.nh_cuda_estimate_vram_bytes_ex.restype = ctypes.c_uint64
     lib.nh_cuda_create.argtypes = [
         ctypes.POINTER(NhGridConfigC),
         ctypes.c_void_p,
@@ -122,6 +190,16 @@ def load_cuda_library(lib_path: Optional[Path] = None) -> ctypes.CDLL:
     lib.nh_cuda_set_lbc_target.restype = ctypes.c_int32
     lib.nh_cuda_set_iau_forcing.argtypes = [ctypes.c_void_p, ctypes.POINTER(NhStatePtrsC)]
     lib.nh_cuda_set_iau_forcing.restype = ctypes.c_int32
+    lib.nh_cuda_set_physics_config.argtypes = [ctypes.c_void_p, ctypes.POINTER(NhPhysicsConfigC)]
+    lib.nh_cuda_set_physics_config.restype = ctypes.c_int32
+    lib.nh_cuda_set_surface_static.argtypes = [ctypes.c_void_p, ctypes.POINTER(NhSurfaceStaticPtrsC)]
+    lib.nh_cuda_set_surface_static.restype = ctypes.c_int32
+    lib.nh_cuda_upload_surface.argtypes = [ctypes.c_void_p, ctypes.POINTER(NhSurfaceStatePtrsC)]
+    lib.nh_cuda_upload_surface.restype = ctypes.c_int32
+    lib.nh_cuda_download_surface.argtypes = [ctypes.c_void_p, ctypes.POINTER(NhSurfaceStatePtrsC)]
+    lib.nh_cuda_download_surface.restype = ctypes.c_int32
+    lib.nh_cuda_step_physics.argtypes = [ctypes.c_void_p, ctypes.c_double]
+    lib.nh_cuda_step_physics.restype = ctypes.c_int32
     lib.nh_cuda_step_rk3.argtypes = [ctypes.c_void_p, ctypes.c_double, ctypes.c_int32]
     lib.nh_cuda_step_rk3.restype = ctypes.c_int32
 
@@ -150,17 +228,19 @@ def estimate_vram_bytes(
     moist: bool = True,
     has_lbc: bool = False,
     has_iau: bool = False,
+    has_physics: bool = False,
 ) -> int:
     """Exact GPU VRAM estimate in bytes for a tile `(nz, ny, nx)`."""
     lib = load_cuda_library()
     return int(
-        lib.nh_cuda_estimate_vram_bytes(
+        lib.nh_cuda_estimate_vram_bytes_ex(
             int(nz),
             int(ny),
             int(nx),
             1 if moist else 0,
             1 if has_lbc else 0,
             1 if has_iau else 0,
+            1 if has_physics else 0,
         )
     )
 
@@ -173,6 +253,7 @@ def plan_horizontal_tiling(
     moist: bool = True,
     has_lbc: bool = False,
     has_iau: bool = False,
+    has_physics: bool = False,
     max_vram_bytes: int = DEFAULT_MAX_VRAM_BYTES,
     halo: int = 6,
 ) -> Tuple[int, int, int]:
@@ -185,7 +266,13 @@ def plan_horizontal_tiling(
         tile_ny = min(ny, tile_ny)
         tile_nx = min(nx, tile_nx)
         est = estimate_vram_bytes(
-            nz, tile_ny, tile_nx, moist=moist, has_lbc=has_lbc, has_iau=has_iau
+            nz,
+            tile_ny,
+            tile_nx,
+            moist=moist,
+            has_lbc=has_lbc,
+            has_iau=has_iau,
+            has_physics=has_physics,
         )
         if est <= max_vram_bytes or (tile_ny <= 32 and tile_nx <= 32):
             return nt_y, nt_x, est
@@ -239,13 +326,93 @@ def _pack_state_ptrs(state: Dict[str, np.ndarray], moist: bool) -> Tuple[NhState
     return ptrs, kept
 
 
+def _pack_struct_ptrs(
+    cls: type,
+    mapping: Dict[str, np.ndarray],
+    field_names: Tuple[str, ...],
+) -> Tuple[ctypes.Structure, List[np.ndarray]]:
+    kept: List[np.ndarray] = []
+    kwargs: Dict[str, ctypes.c_void_p] = {}
+    for name in field_names:
+        arr = mapping.get(name)
+        if arr is None:
+            kwargs[name] = ctypes.c_void_p(0)
+        else:
+            c_arr = np.ascontiguousarray(arr, dtype=np.float32)
+            kept.append(c_arr)
+            kwargs[name] = ctypes.c_void_p(c_arr.ctypes.data)
+    return cls(**kwargs), kept
+
+
 class NonHydrostaticGPUSolver:
     """
     GPU-accelerated split-explicit RK3 non-hydrostatic dynamical core with
-    automatic 2D horizontal halo tiling (`nz` always kept intact per column).
+    Phase B2 physics suite and automatic 2D horizontal halo tiling (`nz` kept intact).
     """
 
     SPECIES = ("qv", "qc", "qr", "qi", "qs", "qg")
+    SURFACE_STATIC_FIELDS = (
+        "lat_deg",
+        "lon_deg",
+        "lsm",
+        "lake_mask",
+        "soil_type",
+        "bathy_depth_m",
+        "z0m_base",
+        "albedo_base",
+        "veg_frac",
+    )
+    SURFACE_SOIL_FIELDS = ("soil_t", "soil_m")
+    SURFACE_2D_FIELDS = (
+        "t_skin",
+        "snow_swe",
+        "sst_bulk",
+        "dt_cool",
+        "dt_warm",
+        "lake_tbot",
+        "lake_hmld",
+        "lake_ctheta",
+        "lake_hice",
+        "rain_acc",
+        "snow_acc",
+        "graupel_acc",
+        "sw_down",
+        "lw_down",
+        "shf",
+        "lhf",
+        "ustar",
+        "pblh",
+        "t2m",
+        "q2m",
+        "u10m",
+        "v10m",
+    )
+    SURFACE_STATE_STRUCT_ORDER = (
+        "t_skin",
+        "soil_t",
+        "soil_m",
+        "snow_swe",
+        "sst_bulk",
+        "dt_cool",
+        "dt_warm",
+        "lake_tbot",
+        "lake_hmld",
+        "lake_ctheta",
+        "lake_hice",
+        "rain_acc",
+        "snow_acc",
+        "graupel_acc",
+        "sw_down",
+        "lw_down",
+        "shf",
+        "lhf",
+        "ustar",
+        "pblh",
+        "t2m",
+        "q2m",
+        "u10m",
+        "v10m",
+    )
 
     def __init__(
         self,
@@ -257,6 +424,7 @@ class NonHydrostaticGPUSolver:
         msf: Optional[np.ndarray] = None,
         f_cor: Optional[np.ndarray] = None,
         has_moist: bool = False,
+        has_physics: bool = False,
         bc_x: int = 0,
         bc_y: int = 0,
         use_coriolis: bool = False,
@@ -299,6 +467,7 @@ class NonHydrostaticGPUSolver:
             raise ValueError("msf and f_cor must match hs_m shape (ny, nx)")
 
         self.has_moist = bool(has_moist)
+        self.has_physics = bool(has_physics)
         self.bc_x = int(bc_x)
         self.bc_y = int(bc_y)
         self.use_coriolis = bool(use_coriolis)
@@ -325,6 +494,7 @@ class NonHydrostaticGPUSolver:
             moist=self.has_moist,
             has_lbc=(self.bc_x == 2 or self.bc_y == 2),
             has_iau=self.has_iau,
+            has_physics=self.has_physics,
             max_vram_bytes=max_vram_bytes,
             halo=self.halo,
         )
@@ -337,10 +507,15 @@ class NonHydrostaticGPUSolver:
         self._state_host: Optional[Dict[str, np.ndarray]] = None
         self._lbc_host: Optional[Dict[str, np.ndarray]] = None
         self._iau_host: Optional[Dict[str, np.ndarray]] = None
+        self._pcfg: Optional[NhPhysicsConfigC] = None
+        self._surface_static_host: Optional[Dict[str, np.ndarray]] = None
+        self._surface_state_host: Optional[Dict[str, np.ndarray]] = None
         self._tiles = self._build_tiles()
 
         if len(self._tiles) == 1:
             self._handle = self._create_tile_handle(self._tiles[0])
+        if self.has_physics:
+            self.set_physics_config()
 
     @property
     def num_tiles(self) -> int:
@@ -465,7 +640,10 @@ class NonHydrostaticGPUSolver:
                 state[sp] = np.zeros((self.nz, self.ny, self.nx), dtype=np.float32)
         return state
 
-    def _slice_tile_state(self, src: Dict[str, np.ndarray], tile: _TileBox) -> Dict[str, np.ndarray]:
+    def _slice_tile_state(
+        self, src: Dict[str, np.ndarray], tile: _TileBox, *, moist: Optional[bool] = None
+    ) -> Dict[str, np.ndarray]:
+        use_moist = self.has_moist if moist is None else bool(moist)
         out = {
             "u": np.ascontiguousarray(src["u"][:, tile.pj0 : tile.pj1, tile.pi0 : tile.pi1 + 1], dtype=np.float32),
             "v": np.ascontiguousarray(src["v"][:, tile.pj0 : tile.pj1 + 1, tile.pi0 : tile.pi1], dtype=np.float32),
@@ -473,7 +651,7 @@ class NonHydrostaticGPUSolver:
             "theta_p": np.ascontiguousarray(src["theta_p"][:, tile.pj0 : tile.pj1, tile.pi0 : tile.pi1], dtype=np.float32),
             "pi_p": np.ascontiguousarray(src["pi_p"][:, tile.pj0 : tile.pj1, tile.pi0 : tile.pi1], dtype=np.float32),
         }
-        if self.has_moist:
+        if use_moist:
             for sp in self.SPECIES:
                 out[sp] = np.ascontiguousarray(src[sp][:, tile.pj0 : tile.pj1, tile.pi0 : tile.pi1], dtype=np.float32)
         return out
@@ -520,20 +698,159 @@ class NonHydrostaticGPUSolver:
         else:
             self._iau_host = {k: np.ascontiguousarray(v, dtype=np.float32).copy() for k, v in ddt_state.items()}
 
-    def step_rk3(self, dt_s: float, n_steps: int = 1, n_substeps: int = 0) -> None:
-        if len(self._tiles) == 1:
-            for _ in range(n_steps):
-                self._raise_if_err(
-                    self.lib.nh_cuda_step_rk3(self._handle, float(dt_s), int(n_substeps)),
-                    "step_rk3",
-                )
-            return
+    def default_surface_static(
+        self,
+        *,
+        lat_deg: float = 52.1,
+        lon_deg: float = 5.18,
+        lsm: float = 1.0,
+        lake_mask: float = 0.0,
+        soil_type: float = 9.0,
+        bathy_depth_m: float = 4.5,
+        z0m_base: float = 0.05,
+        albedo_base: float = 0.20,
+        veg_frac: float = 0.60,
+    ) -> Dict[str, np.ndarray]:
+        """Allocate default float32 2D surface static fields `(ny, nx)`."""
+        shape = (self.ny, self.nx)
+        return {
+            "lat_deg": np.full(shape, lat_deg, dtype=np.float32),
+            "lon_deg": np.full(shape, lon_deg, dtype=np.float32),
+            "lsm": np.full(shape, lsm, dtype=np.float32),
+            "lake_mask": np.full(shape, lake_mask, dtype=np.float32),
+            "soil_type": np.full(shape, soil_type, dtype=np.float32),
+            "bathy_depth_m": np.full(shape, bathy_depth_m, dtype=np.float32),
+            "z0m_base": np.full(shape, z0m_base, dtype=np.float32),
+            "albedo_base": np.full(shape, albedo_base, dtype=np.float32),
+            "veg_frac": np.full(shape, veg_frac, dtype=np.float32),
+        }
 
+    def empty_surface_state(self) -> Dict[str, np.ndarray]:
+        """Allocate physical float32 default 2D + 4-layer soil surface state dict."""
+        s2 = (self.ny, self.nx)
+        s4 = (4, self.ny, self.nx)
+        out: Dict[str, np.ndarray] = {k: np.zeros(s2, dtype=np.float32) for k in self.SURFACE_2D_FIELDS}
+        out["soil_t"] = np.full(s4, 285.0, dtype=np.float32)
+        out["soil_m"] = np.full(s4, 0.28, dtype=np.float32)
+        out["t_skin"].fill(286.0)
+        out["sst_bulk"].fill(284.0)
+        out["lake_tbot"].fill(281.0)
+        out["lake_hmld"].fill(2.5)
+        out["lake_ctheta"].fill(0.65)
+        return out
+
+    def _slice_tile_surface(self, src: Dict[str, np.ndarray], tile: _TileBox) -> Dict[str, np.ndarray]:
+        out: Dict[str, np.ndarray] = {}
+        for k, v in src.items():
+            if v.ndim == 3:
+                out[k] = np.ascontiguousarray(v[:, tile.pj0 : tile.pj1, tile.pi0 : tile.pi1], dtype=np.float32)
+            else:
+                out[k] = np.ascontiguousarray(v[tile.pj0 : tile.pj1, tile.pi0 : tile.pi1], dtype=np.float32)
+        return out
+
+    def _write_tile_surface_interior(self, dst: Dict[str, np.ndarray], src: Dict[str, np.ndarray], tile: _TileBox) -> None:
+        lj0, lj1 = tile.j0 - tile.pj0, tile.j1 - tile.pj0
+        li0, li1 = tile.i0 - tile.pi0, tile.i1 - tile.pi0
+        for k, v in src.items():
+            if v.ndim == 3:
+                dst[k][:, tile.j0 : tile.j1, tile.i0 : tile.i1] = v[:, lj0:lj1, li0:li1]
+            else:
+                dst[k][tile.j0 : tile.j1, tile.i0 : tile.i1] = v[lj0:lj1, li0:li1]
+
+    def set_physics_config(
+        self,
+        config: Optional[NhPhysicsConfigC] = None,
+        *,
+        enable_microphysics: int = 1,
+        enable_pbl: int = 1,
+        enable_radiation: int = 1,
+        enable_surface: int = 1,
+        rad_interval_s: float = 900.0,
+        cloud_num_land: float = 200.0e6,
+        cloud_num_sea: float = 80.0e6,
+        julian_day: float = 172.0,
+        utc_seconds: float = 43200.0,
+        co2_ppm: float = 425.0,
+    ) -> None:
+        if config is None:
+            config = NhPhysicsConfigC(
+                enable_microphysics=int(enable_microphysics),
+                enable_pbl=int(enable_pbl),
+                enable_radiation=int(enable_radiation),
+                enable_surface=int(enable_surface),
+                rad_interval_s=float(rad_interval_s),
+                cloud_num_land=float(cloud_num_land),
+                cloud_num_sea=float(cloud_num_sea),
+                julian_day=float(julian_day),
+                utc_seconds=float(utc_seconds),
+                co2_ppm=float(co2_ppm),
+            )
+        self._pcfg = config
+        if len(self._tiles) == 1:
+            self._raise_if_err(
+                self.lib.nh_cuda_set_physics_config(self._handle, ctypes.byref(self._pcfg)),
+                "set_physics_config",
+            )
+
+    def set_surface_static(self, sstatic: Dict[str, np.ndarray]) -> None:
+        if len(self._tiles) == 1:
+            ptrs, kept = _pack_struct_ptrs(NhSurfaceStaticPtrsC, sstatic, self.SURFACE_STATIC_FIELDS)
+            self._raise_if_err(self.lib.nh_cuda_set_surface_static(self._handle, ctypes.byref(ptrs)), "set_surface_static")
+            del kept
+        else:
+            self._surface_static_host = {
+                k: np.ascontiguousarray(v, dtype=np.float32).copy() for k, v in sstatic.items() if k in self.SURFACE_STATIC_FIELDS
+            }
+
+    def upload_surface(self, surf: Dict[str, np.ndarray]) -> None:
+        if len(self._tiles) == 1:
+            ptrs, kept = _pack_struct_ptrs(NhSurfaceStatePtrsC, surf, self.SURFACE_STATE_STRUCT_ORDER)
+            self._raise_if_err(self.lib.nh_cuda_upload_surface(self._handle, ctypes.byref(ptrs)), "upload_surface")
+            del kept
+        else:
+            if self._surface_state_host is None:
+                self._surface_state_host = self.empty_surface_state()
+            for k, v in surf.items():
+                if k in self.SURFACE_STATE_STRUCT_ORDER:
+                    self._surface_state_host[k] = np.ascontiguousarray(v, dtype=np.float32).copy()
+
+    def download_surface(self) -> Dict[str, np.ndarray]:
+        if len(self._tiles) == 1:
+            out = self.empty_surface_state()
+            ptrs, kept = _pack_struct_ptrs(NhSurfaceStatePtrsC, out, self.SURFACE_STATE_STRUCT_ORDER)
+            self._raise_if_err(self.lib.nh_cuda_download_surface(self._handle, ctypes.byref(ptrs)), "download_surface")
+            del kept
+            return out
+        if self._surface_state_host is None:
+            return self.empty_surface_state()
+        return {k: v.copy() for k, v in self._surface_state_host.items()}
+
+    def _advance_host_clock(self, dt_s: float) -> None:
+        if self._pcfg is None:
+            return
+        self._pcfg.utc_seconds += float(dt_s)
+        while self._pcfg.utc_seconds >= 86400.0:
+            self._pcfg.utc_seconds -= 86400.0
+            self._pcfg.julian_day += 1.0
+            if self._pcfg.julian_day > 366.0:
+                self._pcfg.julian_day -= 365.0
+
+    def _run_multi_tile(self, dt_s: float, n_steps: int, n_substeps: int, run_dyn: bool, run_phys: bool) -> None:
         if self._state_host is None:
-            raise RuntimeError("upload_state must be called before step_rk3")
+            raise RuntimeError("upload_state must be called before stepping multi-tile solver")
+        if run_phys:
+            if self._pcfg is None:
+                self.set_physics_config()
+            if self._surface_state_host is None:
+                self._surface_state_host = self.empty_surface_state()
 
         for _ in range(n_steps):
-            next_host = {k: np.empty_like(v) for k, v in self._state_host.items()}
+            next_state = {k: np.empty_like(v) for k, v in self._state_host.items()}
+            next_surf = (
+                {k: np.empty_like(v) for k, v in self._surface_state_host.items()}
+                if run_phys and self._surface_state_host is not None
+                else None
+            )
             for tile in self._tiles:
                 h = self._create_tile_handle(tile)
                 try:
@@ -543,29 +860,99 @@ class NonHydrostaticGPUSolver:
                     del kept
 
                     if self._lbc_host is not None and (self.bc_x == 2 or self.bc_y == 2):
-                        lbc_slice = self._slice_tile_state(self._lbc_host, tile)
+                        lbc_slice = self._slice_tile_state(self._lbc_host, tile, moist=False)
                         lbc_ptrs, kept_l = _pack_state_ptrs(lbc_slice, False)
                         self._raise_if_err(self.lib.nh_cuda_set_lbc_target(h, ctypes.byref(lbc_ptrs)), "tile lbc")
                         del kept_l
 
                     if self._iau_host is not None and self.has_iau:
-                        iau_slice = self._slice_tile_state(self._iau_host, tile)
+                        iau_slice = self._slice_tile_state(self._iau_host, tile, moist=False)
                         iau_ptrs, kept_i = _pack_state_ptrs(iau_slice, False)
                         self._raise_if_err(self.lib.nh_cuda_set_iau_forcing(h, ctypes.byref(iau_ptrs)), "tile iau")
                         del kept_i
 
-                    self._raise_if_err(
-                        self.lib.nh_cuda_step_rk3(h, float(dt_s), int(n_substeps)),
-                        "tile step_rk3",
-                    )
+                    if run_phys:
+                        pcfg_copy = NhPhysicsConfigC.from_buffer_copy(self._pcfg)
+                        self._raise_if_err(
+                            self.lib.nh_cuda_set_physics_config(h, ctypes.byref(pcfg_copy)),
+                            "tile set_physics_config",
+                        )
+                        if self._surface_static_host is not None:
+                            ss_slice = self._slice_tile_surface(self._surface_static_host, tile)
+                            ss_ptrs, kept_ss = _pack_struct_ptrs(NhSurfaceStaticPtrsC, ss_slice, self.SURFACE_STATIC_FIELDS)
+                            self._raise_if_err(self.lib.nh_cuda_set_surface_static(h, ctypes.byref(ss_ptrs)), "tile set_surface_static")
+                            del kept_ss
+                        sf_slice = self._slice_tile_surface(self._surface_state_host, tile)
+                        sf_ptrs, kept_sf = _pack_struct_ptrs(NhSurfaceStatePtrsC, sf_slice, self.SURFACE_STATE_STRUCT_ORDER)
+                        self._raise_if_err(self.lib.nh_cuda_upload_surface(h, ctypes.byref(sf_ptrs)), "tile upload_surface")
+                        del kept_sf
+
+                    if run_dyn:
+                        self._raise_if_err(
+                            self.lib.nh_cuda_step_rk3(h, float(dt_s), int(n_substeps)),
+                            "tile step_rk3",
+                        )
+                    if run_phys:
+                        self._raise_if_err(
+                            self.lib.nh_cuda_step_physics(h, float(dt_s)),
+                            "tile step_physics",
+                        )
+                        sf_d_ptrs, kept_sfd = _pack_struct_ptrs(NhSurfaceStatePtrsC, sf_slice, self.SURFACE_STATE_STRUCT_ORDER)
+                        self._raise_if_err(self.lib.nh_cuda_download_surface(h, ctypes.byref(sf_d_ptrs)), "tile download_surface")
+                        del kept_sfd
+                        self._write_tile_surface_interior(next_surf, sf_slice, tile)
 
                     dst_ptrs, kept_d = _pack_state_ptrs(t_state, self.has_moist)
                     self._raise_if_err(self.lib.nh_cuda_download_state(h, ctypes.byref(dst_ptrs)), "tile download")
                     del kept_d
-                    self._write_tile_interior(next_host, t_state, tile)
+                    self._write_tile_interior(next_state, t_state, tile)
                 finally:
                     self.lib.nh_cuda_destroy(h)
-            self._state_host = next_host
+            self._state_host = next_state
+            if run_phys and next_surf is not None:
+                self._surface_state_host = next_surf
+                self._advance_host_clock(dt_s)
+
+    def step_rk3(self, dt_s: float, n_steps: int = 1, n_substeps: int = 0) -> None:
+        if len(self._tiles) == 1:
+            for _ in range(n_steps):
+                self._raise_if_err(
+                    self.lib.nh_cuda_step_rk3(self._handle, float(dt_s), int(n_substeps)),
+                    "step_rk3",
+                )
+            return
+        self._run_multi_tile(dt_s, n_steps, n_substeps, run_dyn=True, run_phys=False)
+
+    def step_physics(self, dt_s: float, n_steps: int = 1) -> None:
+        if self._pcfg is None:
+            self.set_physics_config()
+        if len(self._tiles) == 1:
+            for _ in range(n_steps):
+                self._raise_if_err(
+                    self.lib.nh_cuda_step_physics(self._handle, float(dt_s)),
+                    "step_physics",
+                )
+                self._advance_host_clock(dt_s)
+            return
+        self._run_multi_tile(dt_s, n_steps, 0, run_dyn=False, run_phys=True)
+
+    def step_full(self, dt_s: float, n_steps: int = 1, n_substeps: int = 0) -> None:
+        """Advance coupled dynamics (split-explicit RK3 + FCT) + full GPU physics suite."""
+        if self._pcfg is None:
+            self.set_physics_config()
+        if len(self._tiles) == 1:
+            for _ in range(n_steps):
+                self._raise_if_err(
+                    self.lib.nh_cuda_step_rk3(self._handle, float(dt_s), int(n_substeps)),
+                    "step_rk3",
+                )
+                self._raise_if_err(
+                    self.lib.nh_cuda_step_physics(self._handle, float(dt_s)),
+                    "step_physics",
+                )
+                self._advance_host_clock(dt_s)
+            return
+        self._run_multi_tile(dt_s, n_steps, n_substeps, run_dyn=True, run_phys=True)
 
     def download_state(self) -> Dict[str, np.ndarray]:
         if len(self._tiles) == 1:

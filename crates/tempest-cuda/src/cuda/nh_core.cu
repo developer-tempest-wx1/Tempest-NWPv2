@@ -1,4 +1,4 @@
-#include "nh_core.h"
+#include "nh_internal.cuh"
 
 #include <cuda_runtime.h>
 #include <math.h>
@@ -7,18 +7,9 @@
 #include <stdlib.h>
 #include <string.h>
 
-namespace {
+using namespace tempest_cuda_internal;
 
-// Strict SI thermodynamic & planetary constants matching tempest-core/projection.py
-constexpr double R_D = 287.058;
-constexpr double R_V = 461.5;
-constexpr double CP_D = 1004.5;
-constexpr double CV_D = CP_D - R_D;
-constexpr double KAPPA = R_D / CP_D;
-constexpr double GAMMA_GAS = CP_D / CV_D;
-constexpr double GRAVITY = 9.80665;
-constexpr double P0_PA = 100000.0;
-constexpr double EPS_V = (R_V / R_D) - 1.0;
+namespace {
 
 thread_local char g_last_error[512] = "";
 
@@ -48,120 +39,6 @@ inline void set_error(const char* msg) {
             return nullptr;                                                     \
         }                                                                       \
     } while (0)
-
-struct DeviceStaticGrid {
-    const double* zeta_w;
-    const double* zeta_s;
-    const double* dzeta;
-    const double* b_w;
-    const double* b_s;
-    const double* db_w;
-    const double* db_s;
-    const double* hs;
-    const double* msf;
-    const double* fcor;
-};
-
-__device__ __host__ inline void eval_ref_state(
-    double z,
-    double theta_sfc,
-    double p_sfc,
-    double n_ref,
-    double& theta_bar,
-    double& pi_bar,
-    double& dtheta_dz,
-    double& rho_bar,
-    double& cs2_bar
-) {
-    const double pi_sfc = pow(p_sfc / P0_PA, KAPPA);
-    const double n2 = n_ref * n_ref;
-    if (n2 > 1e-12) {
-        const double exp_arg = (n2 * z) / GRAVITY;
-        const double e_pos = exp(exp_arg);
-        const double e_neg = exp(-exp_arg);
-        theta_bar = theta_sfc * e_pos;
-        pi_bar = pi_sfc - (GRAVITY * GRAVITY) / (CP_D * theta_sfc * n2) * (1.0 - e_neg);
-        dtheta_dz = theta_bar * (n2 / GRAVITY);
-    } else {
-        theta_bar = theta_sfc;
-        pi_bar = pi_sfc - (GRAVITY * z) / (CP_D * theta_sfc);
-        dtheta_dz = 0.0;
-    }
-    if (pi_bar < 1e-4) pi_bar = 1e-4;
-    const double p_bar = P0_PA * pow(pi_bar, 1.0 / KAPPA);
-    const double t_bar = theta_bar * pi_bar;
-    rho_bar = p_bar / (R_D * t_bar);
-    cs2_bar = GAMMA_GAS * R_D * t_bar;
-}
-
-__device__ inline int32_t wrap_idx(int32_t i, int32_t n) {
-    int32_t m = i % n;
-    return (m < 0) ? (m + n) : m;
-}
-
-__device__ inline int32_t idx_h(int32_t j, int32_t i, int32_t ny, int32_t nx, int32_t bc_x, int32_t bc_y) {
-    const int32_t jj = (bc_y == 1) ? wrap_idx(j, ny) : ((j < 0) ? 0 : ((j >= ny) ? ny - 1 : j));
-    const int32_t ii = (bc_x == 1) ? wrap_idx(i, nx) : ((i < 0) ? 0 : ((i >= nx) ? nx - 1 : i));
-    return jj * nx + ii;
-}
-
-__device__ inline double read_2d(
-    const double* arr, int32_t j, int32_t i,
-    int32_t ny, int32_t nx, int32_t bc_x, int32_t bc_y
-) {
-    return arr[idx_h(j, i, ny, nx, bc_x, bc_y)];
-}
-
-__device__ inline double read_s(
-    const float* arr, int32_t k, int32_t j, int32_t i,
-    int32_t nz, int32_t ny, int32_t nx, int32_t bc_x, int32_t bc_y
-) {
-    const int32_t kk = (k < 0) ? 0 : ((k >= nz) ? nz - 1 : k);
-    return static_cast<double>(arr[static_cast<size_t>(kk) * ny * nx + idx_h(j, i, ny, nx, bc_x, bc_y)]);
-}
-
-__device__ inline double read_u(
-    const float* u, int32_t k, int32_t j, int32_t i,
-    int32_t nz, int32_t ny, int32_t nx, int32_t bc_x, int32_t bc_y
-) {
-    const int32_t kk = (k < 0) ? 0 : ((k >= nz) ? nz - 1 : k);
-    const int32_t jj = (bc_y == 1) ? wrap_idx(j, ny) : ((j < 0) ? 0 : ((j >= ny) ? ny - 1 : j));
-    int32_t ii = i;
-    if (bc_x == 1) {
-        ii = wrap_idx(i, nx);
-    } else {
-        if (bc_x == 0 && (i <= 0 || i >= nx)) return 0.0;
-        if (ii < 0) ii = 0;
-        if (ii > nx) ii = nx;
-    }
-    return static_cast<double>(u[static_cast<size_t>(kk) * ny * (nx + 1) + jj * (nx + 1) + ii]);
-}
-
-__device__ inline double read_v(
-    const float* v, int32_t k, int32_t j, int32_t i,
-    int32_t nz, int32_t ny, int32_t nx, int32_t bc_x, int32_t bc_y
-) {
-    const int32_t kk = (k < 0) ? 0 : ((k >= nz) ? nz - 1 : k);
-    const int32_t ii = (bc_x == 1) ? wrap_idx(i, nx) : ((i < 0) ? 0 : ((i >= nx) ? nx - 1 : i));
-    int32_t jj = j;
-    if (bc_y == 1) {
-        jj = wrap_idx(j, ny);
-    } else {
-        if (bc_y == 0 && (j <= 0 || j >= ny)) return 0.0;
-        if (jj < 0) jj = 0;
-        if (jj > ny) jj = ny;
-    }
-    return static_cast<double>(v[static_cast<size_t>(kk) * (ny + 1) * nx + jj * nx + ii]);
-}
-
-__device__ inline double read_w(
-    const float* w, int32_t k, int32_t j, int32_t i,
-    int32_t nz, int32_t ny, int32_t nx, int32_t bc_x, int32_t bc_y
-) {
-    if (k <= 0) return static_cast<double>(w[idx_h(j, i, ny, nx, bc_x, bc_y)]);
-    if (k >= nz) return 0.0;
-    return static_cast<double>(w[static_cast<size_t>(k) * ny * nx + idx_h(j, i, ny, nx, bc_x, bc_y)]);
-}
 
 __device__ inline double weno5_left(double qm2, double qm1, double q0, double qp1, double qp2) {
     constexpr double eps = 1e-18;
@@ -1668,32 +1545,6 @@ inline int32_t advect_one_tracer(
 
 } // namespace
 
-struct NhCudaHandle {
-    NhGridConfig cfg;
-    size_t n_s;
-    size_t n_u;
-    size_t n_v;
-    size_t n_w;
-
-    double *d_zeta_w = nullptr, *d_zeta_s = nullptr, *d_dzeta = nullptr;
-    double *d_b_w = nullptr, *d_b_s = nullptr, *d_db_w = nullptr, *d_db_s = nullptr;
-    double *d_hs = nullptr, *d_msf = nullptr, *d_fcor = nullptr;
-
-    float *d_u = nullptr, *d_v = nullptr, *d_w = nullptr, *d_thp = nullptr, *d_pip = nullptr;
-    float *d_qv = nullptr, *d_qc = nullptr, *d_qr = nullptr, *d_qi = nullptr, *d_qs = nullptr, *d_qg = nullptr;
-
-    float *d_u_n = nullptr, *d_v_n = nullptr, *d_w_n = nullptr, *d_thp_n = nullptr, *d_pip_n = nullptr;
-    float *d_ru = nullptr, *d_rv = nullptr, *d_rw = nullptr, *d_rth = nullptr, *d_rpi = nullptr;
-
-    float *d_div = nullptr, *d_q_tmp = nullptr;
-    double *d_tri_c = nullptr, *d_tri_d = nullptr;
-    uint32_t *d_max_u32 = nullptr;
-
-    // Optional LBC & IAU buffers
-    float *d_lbc_u = nullptr, *d_lbc_v = nullptr, *d_lbc_thp = nullptr, *d_lbc_pip = nullptr;
-    float *d_iau_u = nullptr, *d_iau_v = nullptr, *d_iau_thp = nullptr, *d_iau_pip = nullptr;
-};
-
 namespace {
 
 inline DeviceStaticGrid static_view(const NhCudaHandle* h) {
@@ -1758,6 +1609,15 @@ inline int32_t reset_state_from_n(NhCudaHandle* h) {
 
 } // namespace
 
+void nh_internal_set_error(const char* msg) {
+    set_error(msg);
+}
+
+void nh_internal_set_cuda_error(const char* file, int line, cudaError_t err) {
+    snprintf(g_last_error, sizeof(g_last_error),
+             "CUDA error (%s:%d): %s", file, line, cudaGetErrorString(err));
+}
+
 extern "C" {
 
 const char* nh_cuda_last_error(void) {
@@ -1772,9 +1632,9 @@ int32_t nh_cuda_vram_info(uint64_t* free_bytes, uint64_t* total_bytes) {
     return 0;
 }
 
-uint64_t nh_cuda_estimate_vram_bytes(
+uint64_t nh_cuda_estimate_vram_bytes_ex(
     int32_t nz, int32_t ny, int32_t nx,
-    int32_t has_moist, int32_t has_lbc, int32_t has_iau
+    int32_t has_moist, int32_t has_lbc, int32_t has_iau, int32_t has_physics
 ) {
     const uint64_t cells = static_cast<uint64_t>(nz) * static_cast<uint64_t>(ny) * static_cast<uint64_t>(nx);
     // Dry core: 5 state + 5 backup + 5 rhs + 2 scratch (div, q_tmp) = 17 float32 + 2 float64 tridiag (4 float eq) = 21 float32 eq
@@ -1782,10 +1642,22 @@ uint64_t nh_cuda_estimate_vram_bytes(
     if (has_moist) float32_arrays += 6;
     if (has_lbc) float32_arrays += 4;
     if (has_iau) float32_arrays += 4;
+    if (has_physics) float32_arrays += 1; // d_rad_dth_dt
     const uint64_t field_bytes = cells * float32_arrays * 4ULL;
-    const uint64_t static_2d = static_cast<uint64_t>(ny) * static_cast<uint64_t>(nx) * 24ULL;
+    uint64_t static_2d = static_cast<uint64_t>(ny) * static_cast<uint64_t>(nx) * 24ULL;
+    if (has_physics) {
+        // 9 static + 22 surface 2D + 8 soil (4*2) + 3 intra-step scratch = 42 float32 arrays per column
+        static_2d += static_cast<uint64_t>(ny) * static_cast<uint64_t>(nx) * 42ULL * 4ULL;
+    }
     const uint64_t overhead = 128ULL * 1024ULL * 1024ULL; // CUDA runtime context + margin
     return field_bytes + static_2d + overhead;
+}
+
+uint64_t nh_cuda_estimate_vram_bytes(
+    int32_t nz, int32_t ny, int32_t nx,
+    int32_t has_moist, int32_t has_lbc, int32_t has_iau
+) {
+    return nh_cuda_estimate_vram_bytes_ex(nz, ny, nx, has_moist, has_lbc, has_iau, 0);
 }
 
 NhCudaHandle* nh_cuda_create(
@@ -1912,6 +1784,7 @@ void nh_cuda_destroy(NhCudaHandle* h) {
     cf(h->d_div); cf(h->d_q_tmp); cf(h->d_tri_c); cf(h->d_tri_d); cf(h->d_max_u32);
     cf(h->d_lbc_u); cf(h->d_lbc_v); cf(h->d_lbc_thp); cf(h->d_lbc_pip);
     cf(h->d_iau_u); cf(h->d_iau_v); cf(h->d_iau_thp); cf(h->d_iau_pip);
+    nh_physics_free_buffers(h);
     delete h;
 }
 

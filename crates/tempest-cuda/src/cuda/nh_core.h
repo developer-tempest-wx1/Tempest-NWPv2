@@ -86,6 +86,97 @@ typedef struct NhConstStatePtrs {
     const float* qg;
 } NhConstStatePtrs;
 
+/**
+ * Toggle flags and astronomical/microphysical parameters for Phase B2 GPU physics.
+ */
+typedef struct NhPhysicsConfig {
+    int32_t enable_microphysics; /* 0 = off, 1 = 6-class WSM6/ICON/ICE-T + fallout */
+    int32_t enable_pbl;          /* 0 = off, 1 = YSU nonlocal PBL + shallow EDMF + VDiff */
+    int32_t enable_radiation;    /* 0 = off, 1 = ecRad delta-Eddington two-stream SW/LW */
+    int32_t enable_surface;      /* 0 = off, 1 = sfclayrev + Noah/ecLand + COARE3.6/VOSKIN + FLake */
+
+    double rad_interval_s;       /* Radiation refresh interval [s] (<= 0 updates every call) */
+    double cloud_num_land;       /* Continental cloud droplet conc. [m^-3], e.g. 200e6 */
+    double cloud_num_sea;        /* Maritime cloud droplet conc. [m^-3], e.g. 80e6 */
+    double julian_day;           /* Day-of-year in [1, 366] */
+    double utc_seconds;          /* UTC seconds since 00:00Z [s] */
+    double co2_ppm;              /* CO2 volume mixing ratio [ppm], e.g. 425.0 */
+} NhPhysicsConfig;
+
+/**
+ * Const 2D surface static arrays [ny, nx] in float32.
+ */
+typedef struct NhSurfaceStaticPtrs {
+    const float* lat_deg;       /* Latitude [deg] */
+    const float* lon_deg;       /* Longitude [deg] */
+    const float* lsm;           /* Land-sea mask in [0, 1] (>= 0.5 land) */
+    const float* lake_mask;     /* Freshwater lake mask in [0, 1] (>= 0.5 lake) */
+    const float* soil_type;     /* USDA class in [0..13] as float */
+    const float* bathy_depth_m; /* Positive water depth [m] (ocean/lake) */
+    const float* z0m_base;      /* Base aerodynamic roughness length [m] */
+    const float* albedo_base;   /* Snow-free land/water shortwave albedo [-] */
+    const float* veg_frac;      /* Vegetation greenness fraction [0, 1] */
+} NhSurfaceStaticPtrs;
+
+/**
+ * Mutable 2D/soil prognostic & diagnostic surface state pointers.
+ *   2D fields  : [ny, nx]
+ *   soil_t/m   : [4, ny, nx] (ECMWF 4-layer depths 0.07, 0.21, 0.72, 1.89 m)
+ */
+typedef struct NhSurfaceStatePtrs {
+    float* t_skin;
+    float* soil_t;
+    float* soil_m;
+    float* snow_swe;
+    float* sst_bulk;
+    float* dt_cool;
+    float* dt_warm;
+    float* lake_tbot;
+    float* lake_hmld;
+    float* lake_ctheta;
+    float* lake_hice;
+    float* rain_acc;
+    float* snow_acc;
+    float* graupel_acc;
+    float* sw_down;
+    float* lw_down;
+    float* shf;
+    float* lhf;
+    float* ustar;
+    float* pblh;
+    float* t2m;
+    float* q2m;
+    float* u10m;
+    float* v10m;
+} NhSurfaceStatePtrs;
+
+typedef struct NhConstSurfaceStatePtrs {
+    const float* t_skin;
+    const float* soil_t;
+    const float* soil_m;
+    const float* snow_swe;
+    const float* sst_bulk;
+    const float* dt_cool;
+    const float* dt_warm;
+    const float* lake_tbot;
+    const float* lake_hmld;
+    const float* lake_ctheta;
+    const float* lake_hice;
+    const float* rain_acc;
+    const float* snow_acc;
+    const float* graupel_acc;
+    const float* sw_down;
+    const float* lw_down;
+    const float* shf;
+    const float* lhf;
+    const float* ustar;
+    const float* pblh;
+    const float* t2m;
+    const float* q2m;
+    const float* u10m;
+    const float* v10m;
+} NhConstSurfaceStatePtrs;
+
 typedef struct NhCudaHandle NhCudaHandle;
 
 /**
@@ -103,6 +194,19 @@ uint64_t nh_cuda_estimate_vram_bytes(
     int32_t has_moist,
     int32_t has_lbc,
     int32_t has_iau
+);
+
+/**
+ * Extended VRAM estimator accounting for Phase B2 physics allocations.
+ */
+uint64_t nh_cuda_estimate_vram_bytes_ex(
+    int32_t nz,
+    int32_t ny,
+    int32_t nx,
+    int32_t has_moist,
+    int32_t has_lbc,
+    int32_t has_iau,
+    int32_t has_physics
 );
 
 /**
@@ -136,6 +240,15 @@ int32_t nh_cuda_download_state(NhCudaHandle* handle, const NhStatePtrs* dst);
 
 int32_t nh_cuda_set_lbc_target(NhCudaHandle* handle, const NhConstStatePtrs* target);
 int32_t nh_cuda_set_iau_forcing(NhCudaHandle* handle, const NhConstStatePtrs* ddt_state);
+
+/**
+ * Configure, initialize, transfer, and execute Phase B2 GPU physics suite.
+ */
+int32_t nh_cuda_set_physics_config(NhCudaHandle* handle, const NhPhysicsConfig* pcfg);
+int32_t nh_cuda_set_surface_static(NhCudaHandle* handle, const NhSurfaceStaticPtrs* sstatic);
+int32_t nh_cuda_upload_surface(NhCudaHandle* handle, const NhConstSurfaceStatePtrs* src);
+int32_t nh_cuda_download_surface(NhCudaHandle* handle, const NhSurfaceStatePtrs* dst);
+int32_t nh_cuda_step_physics(NhCudaHandle* handle, double dt_s);
 
 /**
  * Advance prognostic state by dt_s using split-explicit Wicker-Skamarock RK3.

@@ -26,29 +26,11 @@ fn find_cuda_lib_dir() -> String {
     "/usr/local/cuda/lib64".to_string()
 }
 
-fn main() {
-    println!("cargo:rerun-if-changed=src/cuda/nh_core.cu");
-    println!("cargo:rerun-if-changed=src/cuda/nh_core.h");
-    println!("cargo:rerun-if-env-changed=CUDA_HOME");
-    println!("cargo:rerun-if-env-changed=TEMPEST_CUDA_ARCH");
-
-    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
-    let cu_path = manifest_dir.join("src/cuda/nh_core.cu");
-    let obj_path = out_dir.join("nh_core.o");
-    let static_lib_path = out_dir.join("libtempest_nh_cuda.a");
-    let shared_lib_path = manifest_dir.join("libtempest_cuda.so");
-
-    let nvcc = find_nvcc();
-    let cuda_lib_dir = find_cuda_lib_dir();
-    let arch = env::var("TEMPEST_CUDA_ARCH").unwrap_or_else(|_| "sm_86".to_string());
-    let arch_flag = format!("-arch={arch}");
-
-    // 1. Compile object file for static linking into Rust crate & cargo test.
-    let status = Command::new(&nvcc)
+fn compile_cu_obj(nvcc: &str, arch_flag: &str, cu_path: &Path, obj_path: &Path) {
+    let status = Command::new(nvcc)
         .args([
             "-O3",
-            &arch_flag,
+            arch_flag,
             "-std=c++17",
             "--compiler-options",
             "-fPIC",
@@ -58,18 +40,47 @@ fn main() {
             obj_path.to_str().unwrap(),
         ])
         .status()
-        .expect("Failed to execute nvcc for static object build");
+        .expect("Failed to execute nvcc for CUDA object build");
     assert!(
         status.success(),
-        "nvcc failed compiling nh_core.cu to object file (status={status})"
+        "nvcc failed compiling {} (status={status})",
+        cu_path.display()
     );
+}
 
-    // 2. Archive into libtempest_nh_cuda.a.
+fn main() {
+    println!("cargo:rerun-if-changed=src/cuda/nh_core.cu");
+    println!("cargo:rerun-if-changed=src/cuda/nh_physics.cu");
+    println!("cargo:rerun-if-changed=src/cuda/nh_internal.cuh");
+    println!("cargo:rerun-if-changed=src/cuda/nh_core.h");
+    println!("cargo:rerun-if-env-changed=CUDA_HOME");
+    println!("cargo:rerun-if-env-changed=TEMPEST_CUDA_ARCH");
+
+    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
+    let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
+    let core_cu = manifest_dir.join("src/cuda/nh_core.cu");
+    let phys_cu = manifest_dir.join("src/cuda/nh_physics.cu");
+    let core_obj = out_dir.join("nh_core.o");
+    let phys_obj = out_dir.join("nh_physics.o");
+    let static_lib_path = out_dir.join("libtempest_nh_cuda.a");
+    let shared_lib_path = manifest_dir.join("libtempest_cuda.so");
+
+    let nvcc = find_nvcc();
+    let cuda_lib_dir = find_cuda_lib_dir();
+    let arch = env::var("TEMPEST_CUDA_ARCH").unwrap_or_else(|_| "sm_86".to_string());
+    let arch_flag = format!("-arch={arch}");
+
+    // 1. Compile both CUDA translation units cleanly.
+    compile_cu_obj(&nvcc, &arch_flag, &core_cu, &core_obj);
+    compile_cu_obj(&nvcc, &arch_flag, &phys_cu, &phys_obj);
+
+    // 2. Archive both objects into libtempest_nh_cuda.a.
     let ar_status = Command::new("ar")
         .args([
             "rcs",
             static_lib_path.to_str().unwrap(),
-            obj_path.to_str().unwrap(),
+            core_obj.to_str().unwrap(),
+            phys_obj.to_str().unwrap(),
         ])
         .status()
         .expect("Failed to execute ar for libtempest_nh_cuda.a");
@@ -87,7 +98,8 @@ fn main() {
             "--shared",
             "--compiler-options",
             "-fPIC",
-            cu_path.to_str().unwrap(),
+            core_cu.to_str().unwrap(),
+            phys_cu.to_str().unwrap(),
             "-o",
             shared_lib_path.to_str().unwrap(),
             &format!("-L{cuda_lib_dir}"),
