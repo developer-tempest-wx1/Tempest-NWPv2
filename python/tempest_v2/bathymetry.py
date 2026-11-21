@@ -246,3 +246,62 @@ def load_bathymetry(path: str | Path, expected_shape: tuple[int, int] | None = N
     if not np.isfinite(depth).all() or np.any(depth < 0):
         raise ValueError("Bathymetry contains non-finite or negative depths")
     return depth, wet.astype(bool), getattr(ds, "attrs", {})
+
+
+def prepare_bathymetry_on_2d_grid(
+    source_path: str | Path,
+    domain_name: str,
+    lat2d: np.ndarray,
+    lon2d: np.ndarray,
+    *,
+    vertical_datum: str = "msl",
+    output_path: str | Path | None = None,
+) -> Path:
+    """Regrid GEBCO NetCDF (elevation positive-up, MSL) onto a 2D (lat, lon) grid and store in WX-1."""
+    import xarray as xr
+    from scipy.interpolate import RegularGridInterpolator
+
+    datum = vertical_datum.lower()
+    if datum != "msl":
+        raise ValueError(f"prepare_bathymetry_on_2d_grid requires MSL datum, got {vertical_datum!r}")
+    src_p = Path(source_path).expanduser().resolve()
+    if not src_p.is_file():
+        raise FileNotFoundError(src_p)
+    if src_p.suffix.lower() != ".nc":
+        raise ValueError("2D curvilinear bathymetry helper currently expects GEBCO NetCDF (.nc); use prepare_bathymetry for GeoTIFFs")
+
+    lat_arr = np.asarray(lat2d, dtype=np.float64)
+    lon_arr = ((np.asarray(lon2d, dtype=np.float64) + 180.0) % 360.0) - 180.0
+    lat_min, lat_max = float(lat_arr.min()) - 0.1, float(lat_arr.max()) + 0.1
+    lon_min, lon_max = float(lon_arr.min()) - 0.1, float(lon_arr.max()) + 0.1
+
+    with xr.open_dataset(src_p) as ds:
+        sub = ds["elevation"].sel(lat=slice(lat_min, lat_max), lon=slice(lon_min, lon_max))
+        sub_lats = np.asarray(sub.coords["lat"].values, dtype=np.float64)
+        sub_lons = np.asarray(sub.coords["lon"].values, dtype=np.float64)
+        elev = np.asarray(sub.values, dtype=np.float64)
+
+    interp = RegularGridInterpolator((sub_lats, sub_lons), elev, method="linear", bounds_error=False, fill_value=0.0)
+    sampled_elev = interp(np.column_stack([lat_arr.ravel(), lon_arr.ravel()])).reshape(lat_arr.shape)
+    depth = np.maximum(-sampled_elev, 0.0).astype(np.float32)
+    wet = (depth > 0.0).astype(np.uint8)
+
+    out_path = Path(output_path) if output_path is not None else (BATHY_ROOT / domain_name / "bathymetry_depth.wx1")
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_ds = xr.Dataset(
+        data_vars={
+            "bathymetry_depth": (("y", "x"), depth, {"units": "m", "positive": "down"}),
+            "wet_mask": (("y", "x"), wet, {"units": "1"}),
+        },
+        coords={
+            "lat2d": (("y", "x"), lat_arr, {"units": "degrees_north"}),
+            "lon2d": (("y", "x"), lon_arr, {"units": "degrees_east"}),
+        },
+        attrs={
+            "domain": domain_name,
+            "source": str(src_p.name),
+            "vertical_datum": datum,
+        },
+    )
+    wx1.write_dataset(out_path, out_ds, dataset_id=f"bathymetry_{domain_name}", codec="zstd_shuffle", workers=4)
+    return out_path

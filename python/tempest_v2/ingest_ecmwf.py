@@ -192,6 +192,35 @@ def download_ecmwf_data(
     return sfc_path, pl_path
 
 
+def download_ecmwf_cold_start(
+    step: int = 0,
+    output_dir: str | Path = "data/raw_ecmwf",
+    prefer_0p1: bool = True,
+    source: str = "azure",
+    run_date: str | None = None,
+    run_time: int | str | None = None,
+) -> tuple[Path, Path, str]:
+    """Download ECMWF IFS cold-start field, preferring 0.1 deg (~9 km) with clean fallback to 0.25 deg."""
+    resol_order = ("0p1", "0p25") if prefer_0p1 else ("0p25",)
+    last_exc: Exception | None = None
+    for resol in resol_order:
+        try:
+            sfc_p, pl_p = download_ecmwf_data(
+                step=step,
+                resol=resol,
+                output_dir=output_dir,
+                include_soil=True,
+                source=source,
+                run_date=run_date,
+                run_time=run_time,
+            )
+            return sfc_p, pl_p, resol
+        except Exception as exc:
+            logger.warning("ECMWF %s download failed (%s); trying next resolution fallback.", resol, exc)
+            last_exc = exc
+    raise RuntimeError(f"All ECMWF Open Data resolutions failed for step={step}: {last_exc}")
+
+
 if __name__ == "__main__":
     import argparse
 

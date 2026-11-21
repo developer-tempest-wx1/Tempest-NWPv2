@@ -83,17 +83,24 @@ def _find_one(root: Path, suffix: str) -> Path:
 
 
 def _extract_archives(force: bool = False) -> tuple[Path, Path]:
+    EXTRACT_ROOT.mkdir(parents=True, exist_ok=True)
+    db_root, raster_root = EXTRACT_ROOT / "db", EXTRACT_ROOT / "raster"
+    db_file = db_root / "HWSD2.2.mdb"
+    bil_file = raster_root / "HWSD2.bil"
+    if not force and db_file.is_file() and bil_file.is_file():
+        return db_file, bil_file
+
     db_zip = DOWNLOAD_ROOT / "hwsd2.2_db.zip"
+    if not db_zip.is_file():
+        db_zip = SOURCE_ROOT / "hwsd2.2_db.zip"
     raster_zip = DOWNLOAD_ROOT / "hwsd2.2_raster.zip"
+    if not raster_zip.is_file():
+        raster_zip = SOURCE_ROOT / "hwsd2.2_raster.zip"
     if not db_zip.is_file() or not raster_zip.is_file():
         raise FileNotFoundError(
             f"HWSD v2.2 archives missing. Expected {db_zip} and {raster_zip}; "
             "the v2.2 source archives are not interchangeable with HWSD v1.x."
         )
-    EXTRACT_ROOT.mkdir(parents=True, exist_ok=True)
-    db_root, raster_root = EXTRACT_ROOT / "db", EXTRACT_ROOT / "raster"
-    db_file = db_root / "HWSD2.2.mdb"
-    bil_file = raster_root / "HWSD2.bil"
     if force or not db_file.exists():
         db_root.mkdir(parents=True, exist_ok=True)
         with zipfile.ZipFile(db_zip) as zf:
@@ -220,10 +227,35 @@ def _sample_raster_ids(bil_path: Path, lats: np.ndarray, lons: np.ndarray) -> np
     if actual != expected:
         raise RuntimeError(f"HWSD2.bil byte length mismatch: expected {expected:,}, got {actual:,}")
     raster = np.memmap(bil_path, dtype=RASTER_DTYPE, mode="r", shape=RASTER_SHAPE)
-    row = np.clip(np.rint((RASTER_UL_LAT - np.asarray(lats, dtype=np.float64)) / RASTER_STEP).astype(np.int64), 0, RASTER_SHAPE[0] - 1)
-    lon = ((np.asarray(lons, dtype=np.float64) + 180.0) % 360.0) - 180.0
-    col = np.clip(np.rint((lon - RASTER_UL_LON) / RASTER_STEP).astype(np.int64), 0, RASTER_SHAPE[1] - 1)
+    lat_arr = np.asarray(lats, dtype=np.float64)
+    lon_arr = ((np.asarray(lons, dtype=np.float64) + 180.0) % 360.0) - 180.0
+    row = np.clip(np.rint((RASTER_UL_LAT - lat_arr) / RASTER_STEP).astype(np.int64), 0, RASTER_SHAPE[0] - 1)
+    col = np.clip(np.rint((lon_arr - RASTER_UL_LON) / RASTER_STEP).astype(np.int64), 0, RASTER_SHAPE[1] - 1)
+    if lat_arr.ndim == 2 and lon_arr.ndim == 2:
+        return np.asarray(raster[row, col], dtype=np.uint16)
     return np.asarray(raster[np.ix_(row, col)], dtype=np.uint16)
+
+
+def sample_hwsd22_on_grid(
+    lat2d: np.ndarray,
+    lon2d: np.ndarray,
+    domain_name: str,
+    output_path: Optional[Path | str] = None,
+) -> Path:
+    """Sample real HWSD v2.2 USDA soil class and 4-layer soil properties onto an arbitrary 2D (lat, lon) grid."""
+    db_path, bil_path = _extract_archives(force=False)
+    table_names = [x.strip() for x in _run(["mdb-tables", "-1", str(db_path)]).splitlines() if x.strip()]
+    table_lookup = {x.upper(): x for x in table_names}
+    table_name = table_lookup.get("HWSD2_LAYERS")
+    if not table_name:
+        raise RuntimeError(f"HWSD2_LAYERS not found in v2.2 database; tables include {table_names[:40]}")
+    rows = _read_table(db_path, table_name)
+    smu_ids, profiles, _db_meta = _make_smu_profiles(rows)
+    ids_map = _sample_raster_ids(bil_path, lat2d, lon2d)
+    out = Path(output_path) if output_path is not None else (STATIC_ROOT / f"soil_type_{domain_name}_hwsd22.wx1")
+    out.parent.mkdir(parents=True, exist_ok=True)
+    _write_domain(out, ids_map, smu_ids, profiles, domain_name, (1, ids_map.shape[0], ids_map.shape[1]))
+    return out
 
 
 def _write_domain(out_path: Path, ids_map: np.ndarray, smu_ids: np.ndarray,
