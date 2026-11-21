@@ -1,0 +1,31 @@
+# Build & Rust artifacts
+target/
+*.so
+*.o
+*.a
+Cargo.lock
+
+# Python caches & editable egg-info
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+build/
+dist/
+
+# Scientific datasets, raw archives & binaries (never commit large data files)
+data/
+*.wx1
+*.grib2
+*.grib
+*.nc
+*.tif
+*.tiff
+*.bil
+*.hdr
+*.mdb
+*.zip
+*.tar
+*.tar.gz
+*.rar
+*.log

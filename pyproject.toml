@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "tempest-nwp-v2"
+version = "0.2.0"
+description = "Tempest-NWP v2: Classical Non-Hydrostatic Split-Explicit GPU LAM (0% AI / 0% ML)"
+readme = "AGENTS.md"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.26.0",
+    "scipy>=1.11.0",
+    "xarray>=2024.1.0",
+    "tempest-wx1>=0.1.8",
+]
+
+[tool.setuptools.packages.find]
+where = ["python"]
