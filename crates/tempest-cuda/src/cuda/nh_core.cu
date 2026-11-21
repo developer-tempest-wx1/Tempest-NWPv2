@@ -1,11 +1,13 @@
 #include "nh_internal.cuh"
 
 #include <cuda_runtime.h>
+#include <cufft.h>
 #include <math.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <vector>
 
 using namespace tempest_cuda_internal;
 
@@ -339,7 +341,8 @@ __device__ inline void compute_contravariant_at_scalar_col_f(
     const float v_w = (1.0f - wt) * v_lo + wt * v_hi;
     const float w_val = read_w_f(w, k_iface, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y);
     const float bw = static_cast<float>(g.b_w[k_iface]);
-    gdotzeta_out = w_val - msf * bw * (u_w * dh_dx + v_w * dh_dy);
+    const float my = cfg.is_spherical ? 1.0f : msf;
+    gdotzeta_out = w_val - bw * (msf * u_w * dh_dx + my * v_w * dh_dy);
 }
 
 // ---------------------------------------------------------------------------
@@ -373,6 +376,7 @@ __global__ void nh_slow_scalar_kernel(
     const float dy_f = static_cast<float>(cfg.dy_m);
     const float dz_k = static_cast<float>(g.dzeta[k]);
     const float msf = static_cast<float>(g.msf[j * nx + i]);
+    const float my = cfg.is_spherical ? 1.0f : msf;
     const float hs = static_cast<float>(g.hs[j * nx + i]);
     const float g_s = 1.0f + static_cast<float>(g.db_s[k]) * hs;
 
@@ -393,7 +397,7 @@ __global__ void nh_slow_scalar_kernel(
     const float th_zp = vert_tvd_face_val_f(thp, k + 1, j, i, zeta_dot, g.dzeta, nz, ny, nx, cfg.bc_x, cfg.bc_y);
     const float th_zm = vert_tvd_face_val_f(thp, k,     j, i, zeta_dot, g.dzeta, nz, ny, nx, cfg.bc_x, cfg.bc_y);
 
-    float tend_th = -msf * (uc * (th_xp - th_xm) / dx_f + vc * (th_yp - th_ym) / dy_f)
+    float tend_th = -(msf * uc * (th_xp - th_xm) / dx_f + my * vc * (th_yp - th_ym) / dy_f)
                     - zeta_dot * (th_zp - th_zm) / dz_k;
 
     // Advect pi'
@@ -404,7 +408,7 @@ __global__ void nh_slow_scalar_kernel(
     const float pi_zp = vert_tvd_face_val_f(pip, k + 1, j, i, zeta_dot, g.dzeta, nz, ny, nx, cfg.bc_x, cfg.bc_y);
     const float pi_zm = vert_tvd_face_val_f(pip, k,     j, i, zeta_dot, g.dzeta, nz, ny, nx, cfg.bc_x, cfg.bc_y);
 
-    float tend_pi = -msf * (uc * (pi_xp - pi_xm) / dx_f + vc * (pi_yp - pi_ym) / dy_f)
+    float tend_pi = -(msf * uc * (pi_xp - pi_xm) / dx_f + my * vc * (pi_yp - pi_ym) / dy_f)
                     - zeta_dot * (pi_zp - pi_zm) / dz_k;
 
     // Explicit 3D Laplacian diffusion (used cleanly for Straka K=75 m^2/s)
@@ -415,10 +419,8 @@ __global__ void nh_slow_scalar_kernel(
         const float th_w = read_s_f(thp, k, j, i - 1, nz, ny, nx, cfg.bc_x, cfg.bc_y);
         const float th_n = read_s_f(thp, k, j + 1, i, nz, ny, nx, cfg.bc_x, cfg.bc_y);
         const float th_s = read_s_f(thp, k, j - 1, i, nz, ny, nx, cfg.bc_x, cfg.bc_y);
-        const float lap_h = msf * msf * (
-            (th_e - 2.0f * th0 + th_w) / (dx_f * dx_f) +
-            (th_n - 2.0f * th0 + th_s) / (dy_f * dy_f)
-        );
+        const float lap_h = (msf * msf) * (th_e - 2.0f * th0 + th_w) / (dx_f * dx_f)
+                          + (my  * my ) * (th_n - 2.0f * th0 + th_s) / (dy_f * dy_f);
         const float dz_c = g_s * dz_k;
         float lap_v = 0.0f;
         if (k < nz - 1) {
@@ -489,6 +491,7 @@ __global__ void nh_slow_u_kernel(
     const float msf_l0 = static_cast<float>(g.msf[j * nx + il]);
     const float msf_r0 = static_cast<float>(g.msf[j * nx + ir]);
     const float msf = 0.5f * (msf_l0 + msf_r0);
+    const float my = cfg.is_spherical ? 1.0f : msf;
     const float hs_u = 0.5f * (static_cast<float>(g.hs[j * nx + il]) + static_cast<float>(g.hs[j * nx + ir]));
     const float g_u = 1.0f + static_cast<float>(g.db_s[k]) * hs_u;
 
@@ -534,23 +537,26 @@ __global__ void nh_slow_u_kernel(
         dudz = (u_get(k + 1, j, i) - uc) / (0.5f * (static_cast<float>(g.dzeta[k + 1]) + dz_k));
     }
 
-    float tend = -msf * (uc * dudx + vc * dudy) - zeta_dot * dudz;
+    float tend = -(msf * uc * dudx + my * vc * dudy) - zeta_dot * dudz;
 
     if (cfg.use_coriolis) {
         const float f_u = 0.5f * (static_cast<float>(g.fcor[j * nx + il]) + static_cast<float>(g.fcor[j * nx + ir]));
-        const float dm_dy = (read_2d_f(g.msf, j + 1, il, ny, nx, cfg.bc_x, cfg.bc_y) -
-                             read_2d_f(g.msf, j - 1, il, ny, nx, cfg.bc_x, cfg.bc_y) +
-                             read_2d_f(g.msf, j + 1, ir, ny, nx, cfg.bc_x, cfg.bc_y) -
-                             read_2d_f(g.msf, j - 1, ir, ny, nx, cfg.bc_x, cfg.bc_y)) / (4.0f * dy_f);
-        const float dm_dx = (msf_r0 - msf_l0) / dx_f;
-        tend += (f_u + uc * dm_dy - vc * dm_dx) * vc;
+        if (cfg.is_spherical) {
+            const float tan_phi = fminf(20.0f, fmaxf(-20.0f, (f_u * msf) / (2.0f * OMEGA_F)));
+            tend += (f_u + (uc * tan_phi) / EARTH_RADIUS_F) * vc;
+        } else {
+            const float dm_dy = (read_2d_f(g.msf, j + 1, il, ny, nx, cfg.bc_x, cfg.bc_y) -
+                                 read_2d_f(g.msf, j - 1, il, ny, nx, cfg.bc_x, cfg.bc_y) +
+                                 read_2d_f(g.msf, j + 1, ir, ny, nx, cfg.bc_x, cfg.bc_y) -
+                                 read_2d_f(g.msf, j - 1, ir, ny, nx, cfg.bc_x, cfg.bc_y)) / (4.0f * dy_f);
+            const float dm_dx = (msf_r0 - msf_l0) / dx_f;
+            tend += (f_u + uc * dm_dy - vc * dm_dx) * vc;
+        }
     }
 
     if (cfg.km_const > 0.0) {
-        const float lap_h = msf * msf * (
-            (u_get(k, j, i + 1) - 2.0f * uc + u_get(k, j, i - 1)) / (dx_f * dx_f) +
-            (u_get(k, j + 1, i) - 2.0f * uc + u_get(k, j - 1, i)) / (dy_f * dy_f)
-        );
+        const float lap_h = (msf * msf) * (u_get(k, j, i + 1) - 2.0f * uc + u_get(k, j, i - 1)) / (dx_f * dx_f)
+                          + (my  * my ) * (u_get(k, j + 1, i) - 2.0f * uc + u_get(k, j - 1, i)) / (dy_f * dy_f);
         const float dz_c = g_u * dz_k;
         float lap_v = 0.0f;
         if (k < nz - 1) {
@@ -614,6 +620,7 @@ __global__ void nh_slow_v_kernel(
     const float msf_l0 = static_cast<float>(g.msf[jl * nx + i]);
     const float msf_r0 = static_cast<float>(g.msf[jr * nx + i]);
     const float msf = 0.5f * (msf_l0 + msf_r0);
+    const float my = cfg.is_spherical ? 1.0f : msf;
     const float hs_v = 0.5f * (static_cast<float>(g.hs[jl * nx + i]) + static_cast<float>(g.hs[jr * nx + i]));
     const float g_v = 1.0f + static_cast<float>(g.db_s[k]) * hs_v;
 
@@ -658,23 +665,26 @@ __global__ void nh_slow_v_kernel(
         dvdz = (v_get(k + 1, j, i) - vc) / (0.5f * (static_cast<float>(g.dzeta[k + 1]) + dz_k));
     }
 
-    float tend = -msf * (uc * dvdx + vc * dvdy) - zeta_dot * dvdz;
+    float tend = -(msf * uc * dvdx + my * vc * dvdy) - zeta_dot * dvdz;
 
     if (cfg.use_coriolis) {
         const float f_v = 0.5f * (static_cast<float>(g.fcor[jl * nx + i]) + static_cast<float>(g.fcor[jr * nx + i]));
-        const float dm_dx = (read_2d_f(g.msf, jl, i + 1, ny, nx, cfg.bc_x, cfg.bc_y) -
-                             read_2d_f(g.msf, jl, i - 1, ny, nx, cfg.bc_x, cfg.bc_y) +
-                             read_2d_f(g.msf, jr, i + 1, ny, nx, cfg.bc_x, cfg.bc_y) -
-                             read_2d_f(g.msf, jr, i - 1, ny, nx, cfg.bc_x, cfg.bc_y)) / (4.0f * dx_f);
-        const float dm_dy = (msf_r0 - msf_l0) / dy_f;
-        tend -= (f_v + uc * dm_dy - vc * dm_dx) * uc;
+        if (cfg.is_spherical) {
+            const float tan_phi = fminf(20.0f, fmaxf(-20.0f, (f_v * msf) / (2.0f * OMEGA_F)));
+            tend -= (f_v + (uc * tan_phi) / EARTH_RADIUS_F) * uc;
+        } else {
+            const float dm_dx = (read_2d_f(g.msf, jl, i + 1, ny, nx, cfg.bc_x, cfg.bc_y) -
+                                 read_2d_f(g.msf, jl, i - 1, ny, nx, cfg.bc_x, cfg.bc_y) +
+                                 read_2d_f(g.msf, jr, i + 1, ny, nx, cfg.bc_x, cfg.bc_y) -
+                                 read_2d_f(g.msf, jr, i - 1, ny, nx, cfg.bc_x, cfg.bc_y)) / (4.0f * dx_f);
+            const float dm_dy = (msf_r0 - msf_l0) / dy_f;
+            tend -= (f_v + uc * dm_dy - vc * dm_dx) * uc;
+        }
     }
 
     if (cfg.km_const > 0.0) {
-        const float lap_h = msf * msf * (
-            (v_get(k, j, i + 1) - 2.0f * vc + v_get(k, j, i - 1)) / (dx_f * dx_f) +
-            (v_get(k, j + 1, i) - 2.0f * vc + v_get(k, j - 1, i)) / (dy_f * dy_f)
-        );
+        const float lap_h = (msf * msf) * (v_get(k, j, i + 1) - 2.0f * vc + v_get(k, j, i - 1)) / (dx_f * dx_f)
+                          + (my  * my ) * (v_get(k, j + 1, i) - 2.0f * vc + v_get(k, j - 1, i)) / (dy_f * dy_f);
         const float dz_c = g_v * dz_k;
         float lap_v = 0.0f;
         if (k < nz - 1) {
@@ -731,6 +741,7 @@ __global__ void nh_slow_w_kernel(
     const float dx_f = static_cast<float>(cfg.dx_m);
     const float dy_f = static_cast<float>(cfg.dy_m);
     const float msf = static_cast<float>(g.msf[j * nx + i]);
+    const float my = cfg.is_spherical ? 1.0f : msf;
     const float hs = static_cast<float>(g.hs[j * nx + i]);
     const float ds_k = static_cast<float>(g.dzeta[k]);
     const float ds_km = static_cast<float>(g.dzeta[k - 1]);
@@ -776,13 +787,11 @@ __global__ void nh_slow_w_kernel(
         dwdz = (w_get(k + 1, j, i) - wc) / ds_k;
     }
 
-    float tend = -msf * (u_w * dwdx + v_w * dwdy) - zeta_dot * dwdz;
+    float tend = -(msf * u_w * dwdx + my * v_w * dwdy) - zeta_dot * dwdz;
 
     if (cfg.km_const > 0.0) {
-        const float lap_h = msf * msf * (
-            (w_get(k, j, i + 1) - 2.0f * wc + w_get(k, j, i - 1)) / (dx_f * dx_f) +
-            (w_get(k, j + 1, i) - 2.0f * wc + w_get(k, j - 1, i)) / (dy_f * dy_f)
-        );
+        const float lap_h = (msf * msf) * (w_get(k, j, i + 1) - 2.0f * wc + w_get(k, j, i - 1)) / (dx_f * dx_f)
+                          + (my  * my ) * (w_get(k, j + 1, i) - 2.0f * wc + w_get(k, j - 1, i)) / (dy_f * dy_f);
         const float dz_w = g_w * 0.5f * (ds_k + ds_km);
         const float dz_p = (1.0f + static_cast<float>(g.db_s[k]) * hs) * ds_k;
         const float dz_m = (1.0f + static_cast<float>(g.db_s[k - 1]) * hs) * ds_km;
@@ -857,10 +866,15 @@ __global__ void nh_compute_div_kernel(
     const float mv_n = 0.5f * (msf + msf_n);
     const float mv_s = 0.5f * (msf + msf_s);
 
-    const float hdiv = msf * msf * (
-        (gu_r * u_r / mu_r - gu_l * u_l / mu_l) / dx_f +
-        (gv_n * v_n / mv_n - gv_s * v_s / mv_s) / dy_f
-    );
+    const float hdiv = cfg.is_spherical
+        ? msf * (
+            (gu_r * u_r - gu_l * u_l) / dx_f +
+            (gv_n * v_n / mv_n - gv_s * v_s / mv_s) / dy_f
+        )
+        : msf * msf * (
+            (gu_r * u_r / mu_r - gu_l * u_l / mu_l) / dx_f +
+            (gv_n * v_n / mv_n - gv_s * v_s / mv_s) / dy_f
+        );
 
     float gz_lo = 0.0f, gz_hi = 0.0f;
     compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, k,     j, i, gz_lo);
@@ -930,7 +944,8 @@ __global__ void nh_acoustic_u_kernel(
 
     double ddiv_dx = 0.0;
     if (cfg.div_damp_coeff > 0.0 && div3d != nullptr && (cfg.bc_x == 1 || (i > 0 && i < nx))) {
-        const double dmin = fmin(cfg.dx_m, cfg.dy_m);
+        const double dx_loc = cfg.is_spherical ? (cfg.dx_m / fmax(msf_u, 1e-6)) : cfg.dx_m;
+        const double dmin = fmin(dx_loc, cfg.dy_m);
         const double nu_div = cfg.div_damp_coeff * (dmin * dmin) / fmax(dts, 1e-6);
         ddiv_dx = nu_div * msf_u * (static_cast<double>(div3d[idxr]) - static_cast<double>(div3d[idxl])) / cfg.dx_m;
     }
@@ -973,6 +988,7 @@ __global__ void nh_acoustic_v_kernel(
     const double hs_l = g.hs[jl * nx + i];
     const double hs_r = g.hs[jr * nx + i];
     const double msf_v = 0.5 * (g.msf[jl * nx + i] + g.msf[jr * nx + i]);
+    const double my_v = cfg.is_spherical ? 1.0 : msf_v;
 
     double dpidy_z = 0.0;
     if (cfg.bc_y == 1 || (j > 0 && j < ny)) {
@@ -1000,13 +1016,14 @@ __global__ void nh_acoustic_v_kernel(
 
     double ddiv_dy = 0.0;
     if (cfg.div_damp_coeff > 0.0 && div3d != nullptr && (cfg.bc_y == 1 || (j > 0 && j < ny))) {
-        const double dmin = fmin(cfg.dx_m, cfg.dy_m);
+        const double dx_loc = cfg.is_spherical ? (cfg.dx_m / fmax(msf_v, 1e-6)) : cfg.dx_m;
+        const double dmin = fmin(dx_loc, cfg.dy_m);
         const double nu_div = cfg.div_damp_coeff * (dmin * dmin) / fmax(dts, 1e-6);
-        ddiv_dy = nu_div * msf_v * (static_cast<double>(div3d[idxr]) - static_cast<double>(div3d[idxl])) / cfg.dy_m;
+        ddiv_dy = nu_div * my_v * (static_cast<double>(div3d[idxr]) - static_cast<double>(div3d[idxl])) / cfg.dy_m;
     }
 
     const double v_next = static_cast<double>(v[idx])
-                        + dts * (static_cast<double>(rv[idx]) - CP_D * thv_v * msf_v * dpidy_z + ddiv_dy);
+                        + dts * (static_cast<double>(rv[idx]) - CP_D * thv_v * my_v * dpidy_z + ddiv_dy);
     v[idx] = static_cast<float>(v_next);
 }
 
@@ -1046,7 +1063,7 @@ __global__ void nh_acoustic_vert_implicit_kernel(
     const double dh_dy = (read_2d(g.hs, j + 1, i, ny, nx, cfg.bc_x, cfg.bc_y) -
                           read_2d(g.hs, j - 1, i, ny, nx, cfg.bc_x, cfg.bc_y)) / (2.0 * cfg.dy_m);
     const double slope_h = msf * dh_dx;
-    const double slope_y = msf * dh_dy;
+    const double slope_y = (cfg.is_spherical ? 1.0 : msf) * dh_dy;
 
     const double msf_r = read_2d(g.msf, j, i + 1, ny, nx, cfg.bc_x, cfg.bc_y);
     const double msf_l = read_2d(g.msf, j, i - 1, ny, nx, cfg.bc_x, cfg.bc_y);
@@ -1135,12 +1152,16 @@ __global__ void nh_acoustic_vert_implicit_kernel(
         const double v_n = read_v(v, k, j + 1, i, nz, ny, nx, cfg.bc_x, cfg.bc_y);
         const double v_s = read_v(v, k, j,     i, nz, ny, nx, cfg.bc_x, cfg.bc_y);
 
-        const double d_h = (
-            msf * msf * (
+        const double hdiv_v = cfg.is_spherical
+            ? msf * (
+                (gu_r * u_r - gu_l * u_l) / cfg.dx_m +
+                (gv_n * v_n / mv_n - gv_s * v_s / mv_s) / cfg.dy_m
+            )
+            : msf * msf * (
                 (gu_r * u_r / mu_r - gu_l * u_l / mu_l) / cfg.dx_m +
                 (gv_n * v_n / mv_n - gv_s * v_s / mv_s) / cfg.dy_m
-            ) + (om_hi - om_lo) / g.dzeta[k]
-        ) / fmax(g_s, 1e-4);
+            );
+        const double d_h = (hdiv_v + (om_hi - om_lo) / g.dzeta[k]) / fmax(g_s, 1e-4);
         om_lo = om_hi;
 
         const double ap = c_ac / dz_s - GRAVITY / (2.0 * CP_D * thb);
@@ -1261,7 +1282,8 @@ __device__ inline float cell_mass_vol_f(
     const float rhob = eval_rho_bar_f32(
         z_s, static_cast<float>(cfg.theta_sfc_k), pi_sfc_f, static_cast<float>(cfg.n_ref_s)
     );
-    return rhob * g_s * static_cast<float>(g.dzeta[k]) / (msf * msf);
+    const float area_inv = cfg.is_spherical ? msf : (msf * msf);
+    return rhob * g_s * static_cast<float>(g.dzeta[k]) / area_inv;
 }
 
 __device__ inline float face_flux_x_f(
@@ -1279,7 +1301,9 @@ __device__ inline float face_flux_x_f(
         z_u, static_cast<float>(cfg.theta_sfc_k), pi_sfc_f, static_cast<float>(cfg.n_ref_s)
     );
     const float uval = read_u_f(u, k, j, i_face, cfg.nz, cfg.ny, cfg.nx, cfg.bc_x, cfg.bc_y);
-    return rhob * g_u * static_cast<float>(g.dzeta[k]) * uval / msf_u;
+    return cfg.is_spherical
+        ? (rhob * g_u * static_cast<float>(g.dzeta[k]) * uval)
+        : (rhob * g_u * static_cast<float>(g.dzeta[k]) * uval / msf_u);
 }
 
 __device__ inline float face_flux_y_f(
@@ -1313,7 +1337,8 @@ __device__ inline float face_flux_z_f(
     );
     float gz = 0.0f;
     compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, k_face, j, i, gz);
-    return rhob * gz / (msf * msf);
+    const float area_inv = cfg.is_spherical ? msf : (msf * msf);
+    return rhob * gz / area_inv;
 }
 
 __device__ inline void compute_fluxes_for_cell_f(
@@ -1582,7 +1607,12 @@ __global__ void nh_estimate_cs_max_kernel(
         );
         const float t_tot = fmaxf(50.0f, (thb + thp[idx]) * fmaxf(1e-4f, pib + pip[idx]));
         const float cs = sqrtf(GAMMA_GAS_F * R_D_F * t_tot);
-        cs_msf = cs * static_cast<float>(g.msf[j * cfg.nx + i]);
+        float msf_eff = static_cast<float>(g.msf[j * cfg.nx + i]);
+        if (cfg.is_spherical && cfg.polar_filter_lat_deg > 0.0 && cfg.polar_filter_lat_deg < 89.9) {
+            const float cos_crit = cosf(static_cast<float>(cfg.polar_filter_lat_deg) * (PI_CONST_F / 180.0f));
+            msf_eff = fminf(msf_eff, 1.0f / fmaxf(cos_crit, 1e-3f));
+        }
+        cs_msf = cs * msf_eff;
     }
     const unsigned int lane = threadIdx.x & 31;
     for (int offset = 16; offset > 0; offset >>= 1) {
@@ -1655,6 +1685,266 @@ inline int32_t reset_state_from_n(NhCudaHandle* h) {
     CUDA_CHECK(cudaMemcpy(h->d_w, h->d_w_n, h->n_w * sizeof(float), cudaMemcpyDeviceToDevice));
     CUDA_CHECK(cudaMemcpy(h->d_thp, h->d_thp_n, h->n_s * sizeof(float), cudaMemcpyDeviceToDevice));
     CUDA_CHECK(cudaMemcpy(h->d_pip, h->d_pip_n, h->n_s * sizeof(float), cudaMemcpyDeviceToDevice));
+    return 0;
+}
+
+__global__ void nh_polar_pack_kernel(
+    const float* src,
+    float* dst,
+    const int32_t* rows,
+    int32_t n_rows,
+    int32_t nz,
+    int32_t ny,
+    int32_t nx,
+    int32_t stride_x
+) {
+    const int32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int32_t r = blockIdx.y * blockDim.y + threadIdx.y;
+    const int32_t k = blockIdx.z;
+    if (k >= nz || r >= n_rows || i >= nx) return;
+    const int32_t j = rows[r];
+    dst[(static_cast<size_t>(k) * n_rows + r) * nx + i] =
+        src[(static_cast<size_t>(k) * ny + j) * stride_x + i];
+}
+
+__global__ void nh_polar_diff_kernel(
+    const float* src_after,
+    const float* saved_before,
+    float* dst_inc,
+    const int32_t* rows,
+    int32_t n_rows,
+    int32_t nz,
+    int32_t ny,
+    int32_t nx,
+    int32_t stride_x
+) {
+    const int32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int32_t r = blockIdx.y * blockDim.y + threadIdx.y;
+    const int32_t k = blockIdx.z;
+    if (k >= nz || r >= n_rows || i >= nx) return;
+    const int32_t j = rows[r];
+    const size_t pidx = (static_cast<size_t>(k) * n_rows + r) * nx + i;
+    dst_inc[pidx] = src_after[(static_cast<size_t>(k) * ny + j) * stride_x + i] - saved_before[pidx];
+}
+
+__global__ void nh_polar_spec_filter_kernel(
+    cufftComplex* spec,
+    const float* row_cos,
+    int32_t n_rows,
+    int32_t nz,
+    int32_t nx,
+    int32_t n_freq,
+    float cos_crit
+) {
+    const int32_t m = blockIdx.x * blockDim.x + threadIdx.x;
+    const int32_t r = blockIdx.y * blockDim.y + threadIdx.y;
+    const int32_t k = blockIdx.z;
+    if (k >= nz || r >= n_rows || m >= n_freq) return;
+
+    float scale = 1.0f / static_cast<float>(nx);
+    if (m >= 1) {
+        const float c_row = fmaxf(row_cos[r], 0.002f);
+        const float s_arg = sinf((PI_CONST_F * static_cast<float>(m)) / static_cast<float>(nx));
+        float damp = fminf(1.0f, (c_row / fmaxf(cos_crit, 1e-3f)) / fmaxf(s_arg, 1e-6f));
+        if (c_row < 0.03f) damp *= damp;
+        scale *= damp;
+    }
+    const size_t cidx = (static_cast<size_t>(k) * n_rows + r) * n_freq + m;
+    spec[cidx].x *= scale;
+    spec[cidx].y *= scale;
+}
+
+__global__ void nh_polar_unpack_kernel(
+    const float* filtered,
+    const float* saved_before,
+    float* dst,
+    const int32_t* rows,
+    int32_t n_rows,
+    int32_t nz,
+    int32_t ny,
+    int32_t nx,
+    int32_t stride_x,
+    int32_t sync_periodic_u
+) {
+    const int32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int32_t r = blockIdx.y * blockDim.y + threadIdx.y;
+    const int32_t k = blockIdx.z;
+    if (k >= nz || r >= n_rows || i >= nx) return;
+    const int32_t j = rows[r];
+    const size_t pidx = (static_cast<size_t>(k) * n_rows + r) * nx + i;
+    const float val = filtered[pidx] + (saved_before ? saved_before[pidx] : 0.0f);
+    const size_t base = (static_cast<size_t>(k) * ny + j) * stride_x;
+    dst[base + i] = val;
+    if (sync_periodic_u && i == 0) {
+        dst[base + nx] = val;
+    }
+}
+
+static void free_polar_fft(NhCudaHandle* h) {
+    if (!h) return;
+    if (h->fft_r2c_s) { cufftDestroy(h->fft_r2c_s); h->fft_r2c_s = 0; }
+    if (h->fft_c2r_s) { cufftDestroy(h->fft_c2r_s); h->fft_c2r_s = 0; }
+    if (h->fft_r2c_v) { cufftDestroy(h->fft_r2c_v); h->fft_r2c_v = 0; }
+    if (h->fft_c2r_v) { cufftDestroy(h->fft_c2r_v); h->fft_c2r_v = 0; }
+    auto cf = [](void* p) { if (p) cudaFree(p); };
+    cf(h->d_polar_rows_s); h->d_polar_rows_s = nullptr;
+    cf(h->d_polar_rows_v); h->d_polar_rows_v = nullptr;
+    cf(h->d_polar_cos_s);  h->d_polar_cos_s = nullptr;
+    cf(h->d_polar_cos_v);  h->d_polar_cos_v = nullptr;
+    cf(h->d_fft_real);     h->d_fft_real = nullptr;
+    cf(h->d_polar_save);   h->d_polar_save = nullptr;
+    cf(h->d_fft_cplx);     h->d_fft_cplx = nullptr;
+    h->fft_ready = 0;
+    h->fft_n_rows_s = 0;
+    h->fft_n_rows_v = 0;
+}
+
+static int32_t refresh_polar_fft(NhCudaHandle* h, const double* host_msf) {
+    free_polar_fft(h);
+    if (!h || !h->cfg.is_spherical || h->cfg.bc_x != 1 ||
+        h->cfg.polar_filter_lat_deg <= 0.0 || h->cfg.polar_filter_lat_deg >= 89.9 ||
+        h->cfg.nx < 8 || !host_msf) {
+        return 0;
+    }
+
+    const double cos_crit = cos(h->cfg.polar_filter_lat_deg * (PI_CONST / 180.0));
+    const int32_t nz = h->cfg.nz, ny = h->cfg.ny, nx = h->cfg.nx;
+    std::vector<int32_t> rows_s, rows_v;
+    std::vector<float> cos_s, cos_v;
+
+    for (int32_t j = 0; j < ny; ++j) {
+        const double c = 1.0 / fmax(host_msf[static_cast<size_t>(j) * nx], 1.0);
+        if (c < cos_crit) {
+            rows_s.push_back(j);
+            cos_s.push_back(static_cast<float>(c));
+        }
+    }
+    for (int32_t j = 1; j < ny; ++j) {
+        const double cm = 1.0 / fmax(host_msf[static_cast<size_t>(j - 1) * nx], 1.0);
+        const double cp = 1.0 / fmax(host_msf[static_cast<size_t>(j) * nx], 1.0);
+        const double c = 0.5 * (cm + cp);
+        if (c < cos_crit) {
+            rows_v.push_back(j);
+            cos_v.push_back(static_cast<float>(c));
+        }
+    }
+
+    h->fft_n_rows_s = static_cast<int32_t>(rows_s.size());
+    h->fft_n_rows_v = static_cast<int32_t>(rows_v.size());
+    const int32_t max_rows = (h->fft_n_rows_s > h->fft_n_rows_v) ? h->fft_n_rows_s : h->fft_n_rows_v;
+    if (max_rows <= 0) {
+        h->fft_ready = 1;
+        return 0;
+    }
+
+    const int32_t n_freq = nx / 2 + 1;
+    const size_t real_elems = static_cast<size_t>(nz) * static_cast<size_t>(max_rows) * static_cast<size_t>(nx);
+    const size_t cplx_elems = static_cast<size_t>(nz) * static_cast<size_t>(max_rows) * static_cast<size_t>(n_freq);
+    CUDA_CHECK(cudaMalloc(&h->d_fft_real, real_elems * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&h->d_polar_save, 3ULL * real_elems * sizeof(float)));
+    CUDA_CHECK(cudaMalloc(&h->d_fft_cplx, cplx_elems * sizeof(cufftComplex)));
+
+    if (h->fft_n_rows_s > 0) {
+        CUDA_CHECK(cudaMalloc(&h->d_polar_rows_s, h->fft_n_rows_s * sizeof(int32_t)));
+        CUDA_CHECK(cudaMalloc(&h->d_polar_cos_s, h->fft_n_rows_s * sizeof(float)));
+        CUDA_CHECK(cudaMemcpy(h->d_polar_rows_s, rows_s.data(), h->fft_n_rows_s * sizeof(int32_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(h->d_polar_cos_s, cos_s.data(), h->fft_n_rows_s * sizeof(float), cudaMemcpyHostToDevice));
+        if (cufftPlan1d(&h->fft_r2c_s, nx, CUFFT_R2C, nz * h->fft_n_rows_s) != CUFFT_SUCCESS ||
+            cufftPlan1d(&h->fft_c2r_s, nx, CUFFT_C2R, nz * h->fft_n_rows_s) != CUFFT_SUCCESS) {
+            set_error("cufftPlan1d failed for scalar polar filter");
+            free_polar_fft(h);
+            return -1;
+        }
+    }
+    if (h->fft_n_rows_v > 0) {
+        CUDA_CHECK(cudaMalloc(&h->d_polar_rows_v, h->fft_n_rows_v * sizeof(int32_t)));
+        CUDA_CHECK(cudaMalloc(&h->d_polar_cos_v, h->fft_n_rows_v * sizeof(float)));
+        CUDA_CHECK(cudaMemcpy(h->d_polar_rows_v, rows_v.data(), h->fft_n_rows_v * sizeof(int32_t), cudaMemcpyHostToDevice));
+        CUDA_CHECK(cudaMemcpy(h->d_polar_cos_v, cos_v.data(), h->fft_n_rows_v * sizeof(float), cudaMemcpyHostToDevice));
+        if (cufftPlan1d(&h->fft_r2c_v, nx, CUFFT_R2C, nz * h->fft_n_rows_v) != CUFFT_SUCCESS ||
+            cufftPlan1d(&h->fft_c2r_v, nx, CUFFT_C2R, nz * h->fft_n_rows_v) != CUFFT_SUCCESS) {
+            set_error("cufftPlan1d failed for meridional polar filter");
+            free_polar_fft(h);
+            return -1;
+        }
+    }
+
+    h->fft_ready = 1;
+    return 0;
+}
+
+static int32_t save_polar_snapshot(
+    NhCudaHandle* h,
+    const float* field,
+    int32_t ny_field,
+    int32_t stride_x,
+    int32_t is_v,
+    int32_t slot
+) {
+    if (!h || !h->fft_ready) return 0;
+    const int32_t n_rows = is_v ? h->fft_n_rows_v : h->fft_n_rows_s;
+    const int32_t* rows = is_v ? h->d_polar_rows_v : h->d_polar_rows_s;
+    if (n_rows <= 0) return 0;
+
+    const int32_t nz = h->cfg.nz, nx = h->cfg.nx;
+    const int32_t max_rows = (h->fft_n_rows_s > h->fft_n_rows_v) ? h->fft_n_rows_s : h->fft_n_rows_v;
+    const size_t slot_elems = static_cast<size_t>(nz) * max_rows * nx;
+    float* dst = h->d_polar_save + static_cast<size_t>(slot) * slot_elems;
+    dim3 b(32, 4, 1);
+    dim3 g((nx + 31) / 32, (n_rows + 3) / 4, nz);
+    nh_polar_pack_kernel<<<g, b>>>(field, dst, rows, n_rows, nz, ny_field, nx, stride_x);
+    CUDA_CHECK(cudaGetLastError());
+    return 0;
+}
+
+static int32_t filter_polar_field(
+    NhCudaHandle* h,
+    float* field,
+    int32_t ny_field,
+    int32_t stride_x,
+    int32_t is_v,
+    int32_t is_u,
+    int32_t from_snapshot_slot
+) {
+    if (!h || !h->fft_ready) return 0;
+    const int32_t n_rows = is_v ? h->fft_n_rows_v : h->fft_n_rows_s;
+    const int32_t* rows = is_v ? h->d_polar_rows_v : h->d_polar_rows_s;
+    const float* row_cos = is_v ? h->d_polar_cos_v : h->d_polar_cos_s;
+    cufftHandle r2c = is_v ? h->fft_r2c_v : h->fft_r2c_s;
+    cufftHandle c2r = is_v ? h->fft_c2r_v : h->fft_c2r_s;
+    if (n_rows <= 0) return 0;
+
+    const int32_t nz = h->cfg.nz, nx = h->cfg.nx, n_freq = nx / 2 + 1;
+    const float cos_crit = cosf(static_cast<float>(h->cfg.polar_filter_lat_deg) * (PI_CONST_F / 180.0f));
+    const int32_t max_rows = (h->fft_n_rows_s > h->fft_n_rows_v) ? h->fft_n_rows_s : h->fft_n_rows_v;
+    const size_t slot_elems = static_cast<size_t>(nz) * max_rows * nx;
+    const float* saved_ptr = (from_snapshot_slot >= 0) ? (h->d_polar_save + static_cast<size_t>(from_snapshot_slot) * slot_elems) : nullptr;
+
+    dim3 b(32, 4, 1);
+    dim3 gp((nx + 31) / 32, (n_rows + 3) / 4, nz);
+    if (saved_ptr) {
+        nh_polar_diff_kernel<<<gp, b>>>(field, saved_ptr, h->d_fft_real, rows, n_rows, nz, ny_field, nx, stride_x);
+    } else {
+        nh_polar_pack_kernel<<<gp, b>>>(field, h->d_fft_real, rows, n_rows, nz, ny_field, nx, stride_x);
+    }
+    CUDA_CHECK(cudaGetLastError());
+
+    if (cufftExecR2C(r2c, reinterpret_cast<cufftReal*>(h->d_fft_real), h->d_fft_cplx) != CUFFT_SUCCESS) {
+        set_error("cufftExecR2C failed in polar filter");
+        return -1;
+    }
+
+    dim3 gs((n_freq + 31) / 32, (n_rows + 3) / 4, nz);
+    nh_polar_spec_filter_kernel<<<gs, b>>>(h->d_fft_cplx, row_cos, n_rows, nz, nx, n_freq, cos_crit);
+    CUDA_CHECK(cudaGetLastError());
+
+    if (cufftExecC2R(c2r, h->d_fft_cplx, reinterpret_cast<cufftReal*>(h->d_fft_real)) != CUFFT_SUCCESS) {
+        set_error("cufftExecC2R failed in polar filter");
+        return -1;
+    }
+
+    nh_polar_unpack_kernel<<<gp, b>>>(h->d_fft_real, saved_ptr, field, rows, n_rows, nz, ny_field, nx, stride_x, is_u ? 1 : 0);
+    CUDA_CHECK(cudaGetLastError());
     return 0;
 }
 
@@ -1818,12 +2108,17 @@ NhCudaHandle* nh_cuda_create(
         CUDA_CHECK_PTR(cudaMemset(h->d_iau_thp, 0, h->n_s * sizeof(float)));
         CUDA_CHECK_PTR(cudaMemset(h->d_iau_pip, 0, h->n_s * sizeof(float)));
     }
+    if (refresh_polar_fft(h, msf) != 0) {
+        nh_cuda_destroy(h);
+        return nullptr;
+    }
 
     return h;
 }
 
 void nh_cuda_destroy(NhCudaHandle* h) {
     if (!h) return;
+    free_polar_fft(h);
     auto cf = [](void* p) { if (p) cudaFree(p); };
     cf(h->d_zeta_w); cf(h->d_zeta_s); cf(h->d_dzeta);
     cf(h->d_b_w); cf(h->d_b_s); cf(h->d_db_w); cf(h->d_db_s);
@@ -1931,6 +2226,7 @@ int32_t nh_cuda_rebind_tile_grid(
     CUDA_CHECK(cudaMemcpy(h->d_hs, hs_m, n2 * sizeof(double), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(h->d_msf, msf, n2 * sizeof(double), cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(h->d_fcor, f_cor, n2 * sizeof(double), cudaMemcpyHostToDevice));
+    if (refresh_polar_fft(h, msf) != 0) return -1;
     return 0;
 }
 
@@ -2003,6 +2299,14 @@ int32_t nh_cuda_step_rk3(NhCudaHandle* h, double dt_s, int32_t n_substeps) {
         );
         CUDA_CHECK(cudaGetLastError());
 
+        if (h->fft_ready) {
+            if (filter_polar_field(h, h->d_rth, ny, nx, 0, 0, -1) != 0) return -1;
+            if (filter_polar_field(h, h->d_rpi, ny, nx, 0, 0, -1) != 0) return -1;
+            if (filter_polar_field(h, h->d_ru,  ny, nx + 1, 0, 1, -1) != 0) return -1;
+            if (filter_polar_field(h, h->d_rv,  ny + 1, nx, 1, 0, -1) != 0) return -1;
+            if (filter_polar_field(h, h->d_rw,  ny, nx, 0, 0, -1) != 0) return -1;
+        }
+
         // 2. Always start acoustic integration for stage s from U^n (Wicker & Skamarock 2002).
         if (stage > 0) {
             if (reset_state_from_n(h) != 0) return -1;
@@ -2020,6 +2324,10 @@ int32_t nh_cuda_step_rk3(NhCudaHandle* h, double dt_s, int32_t n_substeps) {
                 nh_compute_div_kernel<<<grid_s, block>>>(h->cfg, g, h->d_u, h->d_v, h->d_w, h->d_div);
                 CUDA_CHECK(cudaGetLastError());
             }
+            if (h->fft_ready) {
+                if (save_polar_snapshot(h, h->d_u, ny, nx + 1, 0, 0) != 0) return -1;
+                if (save_polar_snapshot(h, h->d_v, ny + 1, nx, 1, 1) != 0) return -1;
+            }
             nh_acoustic_u_kernel<<<grid_u, block>>>(
                 h->cfg, g, dts, h->d_ru, h->d_thp, h->d_pip, h->d_div,
                 h->d_qv, h->d_qc, h->d_qr, h->d_qi, h->d_qs, h->d_qg, h->d_u
@@ -2035,12 +2343,26 @@ int32_t nh_cuda_step_rk3(NhCudaHandle* h, double dt_s, int32_t n_substeps) {
                 CUDA_CHECK(cudaGetLastError());
             }
 
+            if (h->fft_ready) {
+                if (filter_polar_field(h, h->d_u, ny, nx + 1, 0, 1, 0) != 0) return -1;
+                if (filter_polar_field(h, h->d_v, ny + 1, nx, 1, 0, 1) != 0) return -1;
+                if (save_polar_snapshot(h, h->d_w,   ny, nx, 0, 0) != 0) return -1;
+                if (save_polar_snapshot(h, h->d_thp, ny, nx, 0, 1) != 0) return -1;
+                if (save_polar_snapshot(h, h->d_pip, ny, nx, 0, 2) != 0) return -1;
+            }
+
             nh_acoustic_vert_implicit_kernel<<<grid_col, block>>>(
                 h->cfg, g, dts, h->d_u, h->d_v, h->d_rw, h->d_rth, h->d_rpi,
                 h->d_qv, h->d_qc, h->d_qr, h->d_qi, h->d_qs, h->d_qg,
                 h->d_w, h->d_thp, h->d_pip, h->d_tri_c, h->d_tri_d
             );
             CUDA_CHECK(cudaGetLastError());
+
+            if (h->fft_ready) {
+                if (filter_polar_field(h, h->d_w,   ny, nx, 0, 0, 0) != 0) return -1;
+                if (filter_polar_field(h, h->d_thp, ny, nx, 0, 0, 1) != 0) return -1;
+                if (filter_polar_field(h, h->d_pip, ny, nx, 0, 0, 2) != 0) return -1;
+            }
         }
     }
 

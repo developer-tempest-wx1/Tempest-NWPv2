@@ -234,6 +234,7 @@ class DomainSpec:
     map_factor: np.ndarray
     coriolis_f: np.ndarray
     vertical: VerticalGrid
+    is_spherical: bool = False
 
     @property
     def nz(self) -> int:
@@ -314,15 +315,15 @@ def get_domain_spec(
             center_lon_deg=8.5,
         )
 
-    if key in ("d1", "d1_global", "d1_global_0p4", "global"):
-        ny, nx = 451, 900
+    if key in ("d1", "d1_global", "d1_global_0p25", "global", "global025"):
+        ny, nx = 721, 1440
         lats = np.linspace(-90.0, 90.0, ny, dtype=np.float64)
-        lons = np.arange(nx, dtype=np.float64) * 0.4
+        lons = np.arange(nx, dtype=np.float64) * 0.25
         lon2d, lat2d = np.meshgrid(lons, lats)
-        dy_m = EARTH_RADIUS_M * math.radians(0.4)
-        cos_lat = np.maximum(np.cos(np.radians(lat2d)), 0.05)
+        dy_m = EARTH_RADIUS_M * math.radians(0.25)
+        cos_lat = np.maximum(np.cos(np.radians(lat2d)), math.cos(math.radians(89.5)))
         return DomainSpec(
-            name="d1_global",
+            name="d1_global_0p25",
             ny=ny,
             nx=nx,
             dx_m=dy_m,
@@ -337,6 +338,33 @@ def get_domain_spec(
             map_factor=1.0 / cos_lat,
             coriolis_f=2.0 * OMEGA_RAD_S * np.sin(np.radians(lat2d)),
             vertical=vgrid,
+            is_spherical=True,
+        )
+
+    if key in ("d1_0p4", "d1_global_0p4"):
+        ny, nx = 451, 900
+        lats = np.linspace(-90.0, 90.0, ny, dtype=np.float64)
+        lons = np.arange(nx, dtype=np.float64) * 0.4
+        lon2d, lat2d = np.meshgrid(lons, lats)
+        dy_m = EARTH_RADIUS_M * math.radians(0.4)
+        cos_lat = np.maximum(np.cos(np.radians(lat2d)), math.cos(math.radians(89.5)))
+        return DomainSpec(
+            name="d1_global_0p4",
+            ny=ny,
+            nx=nx,
+            dx_m=dy_m,
+            dy_m=dy_m,
+            is_projected=False,
+            is_periodic_lon=True,
+            projection=None,
+            x_m=lons,
+            y_m=lats,
+            lat2d=lat2d,
+            lon2d=lon2d,
+            map_factor=1.0 / cos_lat,
+            coriolis_f=2.0 * OMEGA_RAD_S * np.sin(np.radians(lat2d)),
+            vertical=vgrid,
+            is_spherical=True,
         )
 
     raise ValueError(f"Unknown domain spec '{name}'")

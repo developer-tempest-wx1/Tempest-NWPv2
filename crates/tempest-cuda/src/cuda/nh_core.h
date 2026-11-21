@@ -42,6 +42,8 @@ typedef struct NhGridConfig {
     double sponge_depth_m;  /* Upper Klemp-Wilhelmson Rayleigh sponge depth [m] */
     double sponge_tau_max_s;/* Max Rayleigh damping rate at z_top [s^-1] */
     double lbc_tau_max_s;   /* Max Davies relaxation rate at outer rim [s^-1] */
+    int32_t is_spherical;   /* 0 = Cartesian/conformal LCC (mx=my=msf), 1 = spherical lat-lon (mx=msf, my=1) */
+    double polar_filter_lat_deg; /* Critical latitude [deg] for zonal FFT polar filter (0 = off) */
 } NhGridConfig;
 
 /**

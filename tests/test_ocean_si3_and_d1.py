@@ -1,0 +1,241 @@
+"""Phase B5 GPU Test Suite: Global 0.25 deg Spherical D1 + cuFFT Polar Filter + Periodic Strip Tiling (0% AI / 0% ML)."""
+
+from __future__ import annotations
+
+import math
+from typing import Dict
+
+import numpy as np
+
+from tempest_v2.cuda_bridge import NonHydrostaticGPUSolver, cuda_vram_info, estimate_vram_bytes
+from tempest_v2.projection import EARTH_RADIUS_M, OMEGA_RAD_S, DomainSpec, VerticalGrid, get_domain_spec
+
+
+def _make_coarse_spherical_domain(
+    ny: int = 73,
+    nx: int = 96,
+    nz: int = 14,
+    z_top_m: float = 20_000.0,
+) -> DomainSpec:
+    dlat = 180.0 / float(ny - 1)
+    dlon = 360.0 / float(nx)
+    lats = np.linspace(-90.0, 90.0, ny, dtype=np.float64)
+    lons = np.arange(nx, dtype=np.float64) * dlon
+    lon2d, lat2d = np.meshgrid(lons, lats)
+    dx_m = EARTH_RADIUS_M * math.radians(dlon)
+    dy_m = EARTH_RADIUS_M * math.radians(dlat)
+    cos_lat = np.maximum(np.cos(np.radians(lat2d)), math.cos(math.radians(89.5)))
+    return DomainSpec(
+        name="d1_coarse_test",
+        ny=ny,
+        nx=nx,
+        dx_m=dx_m,
+        dy_m=dy_m,
+        is_projected=False,
+        is_periodic_lon=True,
+        projection=None,
+        x_m=lons,
+        y_m=lats,
+        lat2d=lat2d,
+        lon2d=lon2d,
+        map_factor=1.0 / cos_lat,
+        coriolis_f=2.0 * OMEGA_RAD_S * np.sin(np.radians(lat2d)),
+        vertical=VerticalGrid(nz=nz, z_top_m=z_top_m, stretch_power=1.2),
+        is_spherical=True,
+    )
+
+
+def _global_mountain(spec: DomainSpec, amp_m: float = 1800.0) -> np.ndarray:
+    dlat = (spec.lat2d - 32.0) / 15.0
+    dlon = (((spec.lon2d - 85.0 + 180.0) % 360.0) - 180.0) / 22.0
+    return amp_m * np.exp(-(dlat * dlat + dlon * dlon))
+
+
+def test_d1_spherical_resting_atmosphere_zero_drift() -> None:
+    spec = _make_coarse_spherical_domain(ny=49, nx=64, nz=14)
+    hs = _global_mountain(spec, amp_m=1500.0)
+    solver = NonHydrostaticGPUSolver(
+        spec.vertical,
+        spec.dx_m,
+        spec.dy_m,
+        hs,
+        msf=spec.map_factor,
+        f_cor=spec.coriolis_f,
+        has_moist=False,
+        bc_x=1,
+        bc_y=0,
+        use_coriolis=True,
+        is_spherical=True,
+        polar_filter_lat_deg=60.0,
+    )
+    try:
+        st = solver.empty_state()
+        solver.upload_state(st)
+        solver.step_rk3(dt_s=60.0, n_steps=10)
+        out = solver.download_state()
+    finally:
+        solver.close()
+
+    assert float(np.max(np.abs(out["u"]))) < 1e-6
+    assert float(np.max(np.abs(out["v"]))) < 1e-6
+    assert float(np.max(np.abs(out["w"]))) < 1e-6
+
+
+def test_d1_spherical_balanced_jet_polar_filter_and_moisture_conservation() -> None:
+    """Mid-latitude + polar-extending Rossby jet remains stable across +-89.75 deg at dt=60s and conserves spherical mass."""
+    spec = _make_coarse_spherical_domain(ny=73, nx=96, nz=14)
+    hs = _global_mountain(spec, amp_m=1200.0)
+    solver = NonHydrostaticGPUSolver(
+        spec.vertical,
+        spec.dx_m,
+        spec.dy_m,
+        hs,
+        msf=spec.map_factor,
+        f_cor=spec.coriolis_f,
+        has_moist=True,
+        bc_x=1,
+        bc_y=0,
+        use_coriolis=True,
+        is_spherical=True,
+        polar_filter_lat_deg=60.0,
+        sponge_depth_m=4000.0,
+        sponge_tau_max_s=0.01,
+    )
+    try:
+        st = solver.empty_state()
+        lat_rad = np.radians(spec.lat2d)
+        # Smooth zonal jet peaking at mid-latitudes and decaying toward poles without singular shear
+        u_prof = 18.0 * np.cos(lat_rad) * (np.sin(2.0 * lat_rad) ** 2 + 0.15)
+        u_wave = 2.0 * np.cos(lat_rad) * np.sin(np.radians(spec.lon2d) * 2.0)
+        u_cell = np.broadcast_to((u_prof + u_wave)[None, :, :], (spec.nz, spec.ny, spec.nx)).copy()
+        st["u"][:, :, :-1] = u_cell
+        st["u"][:, :, -1] = u_cell[:, :, 0]
+
+        # Moist plume reaching near the Arctic/Antarctic circles and across Greenwich 0E seam
+        st["qv"][:] = 0.004 + 0.004 * np.cos(lat_rad)[None, :, :]
+        st["qv"][:, -10:-2, :] += 0.002 * (1.0 + np.cos(np.radians(spec.lon2d)))[None, -10:-2, :]
+        st["qc"][2:6, 5:15, :12] = 0.0008
+        st["qc"][2:6, -15:-5, -12:] = 0.0008
+
+        m_qv_0 = solver.tracer_mass(st["qv"])
+        m_qc_0 = solver.tracer_mass(st["qc"])
+
+        solver.upload_state(st)
+        solver.step_rk3(dt_s=60.0, n_steps=12)
+        out = solver.download_state()
+
+        m_qv_1 = solver.tracer_mass(out["qv"])
+        m_qc_1 = solver.tracer_mass(out["qc"])
+    finally:
+        solver.close()
+
+    for k in ("u", "v", "w", "theta_p", "pi_p", "qv", "qc"):
+        assert np.all(np.isfinite(out[k])), f"Non-finite values in spherical D1 field {k}"
+    assert np.allclose(out["u"][:, :, 0], out["u"][:, :, -1], atol=1e-6)
+    for sp in solver.SPECIES:
+        assert float(np.min(out[sp])) >= 0.0
+    assert abs(m_qv_1 - m_qv_0) / m_qv_0 < 1e-4
+    assert abs(m_qc_1 - m_qc_0) / m_qc_0 < 1e-4
+    assert float(np.max(np.abs(out["w"]))) < 5.0
+
+
+def test_d1_periodic_latitude_strip_tiling_matches_untiled() -> None:
+    """Periodic-x latitude-strip tiling (nt_x=1, nt_y>=2) must match untiled spherical solve cleanly."""
+    spec = _make_coarse_spherical_domain(ny=161, nx=96, nz=24)
+    hs = _global_mountain(spec, amp_m=800.0)
+    common: Dict[str, object] = dict(
+        msf=spec.map_factor,
+        f_cor=spec.coriolis_f,
+        has_moist=True,
+        bc_x=1,
+        bc_y=0,
+        use_coriolis=True,
+        is_spherical=True,
+        polar_filter_lat_deg=60.0,
+        halo=20,
+    )
+
+    s_untiled = NonHydrostaticGPUSolver(
+        spec.vertical, spec.dx_m, spec.dy_m, hs, max_vram_bytes=2 * 1024**3, **common  # type: ignore[arg-type]
+    )
+    est_1 = estimate_vram_bytes(24, 161, 96, moist=True)
+    est_2 = estimate_vram_bytes(24, (161 + 1) // 2 + 20, 96, moist=True)
+    cap_bytes = (est_1 + est_2) // 2
+    s_tiled = NonHydrostaticGPUSolver(
+        spec.vertical, spec.dx_m, spec.dy_m, hs, max_vram_bytes=cap_bytes, **common  # type: ignore[arg-type]
+    )
+    try:
+        assert s_untiled.num_tiles == 1
+        assert s_tiled.nt_x == 1 and s_tiled.nt_y >= 2
+
+        st = s_untiled.empty_state()
+        lat_rad = np.radians(spec.lat2d)
+        lon_rad = np.radians(spec.lon2d)
+        u_c = np.broadcast_to((12.0 * np.cos(lat_rad))[None, :, :], (spec.nz, spec.ny, spec.nx)).copy()
+        st["u"][:, :, :-1] = u_c
+        st["u"][:, :, -1] = u_c[:, :, 0]
+        st["v"][:, 1:-1, :] = 2.0 * np.sin(2.0 * lon_rad)[None, 1:, :]
+        st["theta_p"][:] = (0.8 * np.cos(lat_rad) * np.sin(lon_rad))[None, :, :]
+        st["qv"][:] = 0.006 + 0.002 * np.cos(lat_rad)[None, :, :]
+
+        s_untiled.upload_state(st)
+        s_tiled.upload_state(st)
+        s_untiled.step_rk3(dt_s=45.0, n_steps=1)
+        s_tiled.step_rk3(dt_s=45.0, n_steps=1)
+        out_u = s_untiled.download_state()
+        out_t = s_tiled.download_state()
+    finally:
+        s_untiled.close()
+        s_tiled.close()
+
+    for key in ("u", "v", "w", "theta_p", "pi_p", "qv"):
+        max_diff = float(np.max(np.abs(out_u[key] - out_t[key])))
+        assert max_diff < 1e-5, f"Periodic strip tiling mismatch in {key}: {max_diff:.3e}"
+
+
+def test_rtx3060_d1_0p25_global_nz65_vram_and_tiled_smoke() -> None:
+    """Verify improved D1 0.25 deg (721x1440x65) fits RTX 3060 via periodic latitude-strip tiling + cuFFT polar filter."""
+    spec = get_domain_spec("d1_global_0p25", nz=65)
+    assert spec.name == "d1_global_0p25"
+    assert (spec.ny, spec.nx, spec.nz) == (721, 1440, 65)
+    assert spec.is_spherical and spec.is_periodic_lon
+
+    hs = _global_mountain(spec, amp_m=1500.0)
+    solver = NonHydrostaticGPUSolver(
+        spec.vertical,
+        spec.dx_m,
+        spec.dy_m,
+        hs,
+        msf=spec.map_factor,
+        f_cor=spec.coriolis_f,
+        has_moist=True,
+        bc_x=1,
+        bc_y=0,
+        use_coriolis=True,
+        is_spherical=True,
+        polar_filter_lat_deg=60.0,
+        sponge_depth_m=6000.0,
+        sponge_tau_max_s=0.015,
+    )
+    try:
+        assert solver.nt_x == 1 and solver.nt_y >= 2
+        st = solver.empty_state()
+        lat_rad = np.radians(spec.lat2d)
+        u_c = np.broadcast_to((14.0 * np.cos(lat_rad))[None, :, :], (spec.nz, spec.ny, spec.nx)).copy()
+        st["u"][:, :, :-1] = u_c
+        st["u"][:, :, -1] = u_c[:, :, 0]
+        st["qv"][:] = 0.005 + 0.004 * np.cos(lat_rad)[None, :, :]
+        st["qc"][10:15, 500:540, 20:60] = 0.0005
+
+        solver.upload_state(st)
+        solver.step_rk3(dt_s=60.0, n_steps=1)
+        out = solver.download_state()
+    finally:
+        solver.close()
+
+    for key in ("u", "v", "w", "theta_p", "pi_p", "qv", "qc"):
+        assert np.all(np.isfinite(out[key])), f"Non-finite values in D1 0.25 deg {key}"
+    for sp in solver.SPECIES:
+        assert float(np.min(out[sp])) >= 0.0
+    free_after, _ = cuda_vram_info()
+    assert free_after > 3_500_000_000, f"GPU VRAM leak after D1 0.25 deg close: free={free_after}"

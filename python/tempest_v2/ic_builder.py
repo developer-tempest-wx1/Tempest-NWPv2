@@ -45,15 +45,20 @@ DEFAULT_COPERNICUS_ROOT = Path("/mnt/d/AI/weer-ai/Tempest/COPERNICUS_DEM")
 DEFAULT_GEBCO_ROOT = Path("/mnt/d/AI/weer-ai/Tempest/bathymetrie")
 
 
-def stagger_uv(u_c: np.ndarray, v_c: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+def stagger_uv(u_c: np.ndarray, v_c: np.ndarray, *, periodic_x: bool = False) -> Tuple[np.ndarray, np.ndarray]:
     """Interpolate cell-centered 3D winds `[nz, ny, nx]` onto Arakawa C-grid faces."""
     u = np.asarray(u_c, dtype=np.float32)
     v = np.asarray(v_c, dtype=np.float32)
     nz, ny, nx = u.shape
     u_st = np.empty((nz, ny, nx + 1), dtype=np.float32)
     u_st[:, :, 1:-1] = 0.5 * (u[:, :, :-1] + u[:, :, 1:])
-    u_st[:, :, 0] = u[:, :, 0]
-    u_st[:, :, -1] = u[:, :, -1]
+    if periodic_x:
+        u_seam = 0.5 * (u[:, :, -1] + u[:, :, 0])
+        u_st[:, :, 0] = u_seam
+        u_st[:, :, -1] = u_seam
+    else:
+        u_st[:, :, 0] = u[:, :, 0]
+        u_st[:, :, -1] = u[:, :, -1]
 
     v_st = np.empty((nz, ny + 1, nx), dtype=np.float32)
     v_st[:, 1:-1, :] = 0.5 * (v[:, :-1, :] + v[:, 1:, :])
@@ -99,7 +104,44 @@ def build_domain_static_fields(
     ny, nx = spec.ny, spec.nx
 
     resolved_dem = Path(dem_root) if dem_root is not None else (DEFAULT_COPERNICUS_ROOT if DEFAULT_COPERNICUS_ROOT.exists() else None)
-    if resolved_dem is not None and resolved_dem.exists():
+    cop_cache = sdir / f"static_copernicus_{spec.name}.wx1"
+    used_fast_global_gebco = False
+    if not spec.is_projected and spec.dx_m >= 15_000.0 and not cop_cache.is_file() and gebco_root is not None and Path(gebco_root).exists():
+        nc_candidates = sorted(Path(gebco_root).rglob("*.nc"))
+        if nc_candidates:
+            try:
+                bathy_fast = sdir / f"bathymetry_{spec.name}.wx1"
+                if not bathy_fast.is_file() or force:
+                    prepare_bathymetry_on_2d_grid(
+                        nc_candidates[0], spec.name, spec.lat2d, spec.lon2d, vertical_datum="msl", output_path=bathy_fast
+                    )
+                with xr.open_dataset(nc_candidates[0]) as gds:
+                    sy = max(1, int(gds["elevation"].sizes["lat"]) // max(2 * ny, 720))
+                    sx = max(1, int(gds["elevation"].sizes["lon"]) // max(2 * nx, 1440))
+                    sub = gds["elevation"].isel(lat=slice(None, None, sy), lon=slice(None, None, sx))
+                    slat = np.asarray(sub.coords["lat"].values, dtype=np.float64)
+                    slon = np.asarray(sub.coords["lon"].values, dtype=np.float64)
+                    selev = np.asarray(sub.values, dtype=np.float64)
+                if slat[0] > slat[-1]:
+                    slat = slat[::-1]
+                    selev = selev[::-1, :]
+                slon_w = np.append(slon, slon[0] + 360.0)
+                selev_w = np.concatenate([selev, selev[:, :1]], axis=1)
+                tgt_lon = ((spec.lon2d + 180.0) % 360.0) - 180.0
+                tgt_lon = np.where(tgt_lon < slon_w[0], tgt_lon + 360.0, tgt_lon)
+                itp_e = RegularGridInterpolator((slat, slon_w), selev_w, method="linear", bounds_error=False, fill_value=0.0)
+                elev2d = itp_e(np.column_stack([spec.lat2d.ravel(), tgt_lon.ravel()])).reshape(ny, nx)
+                hs_m = np.maximum(elev2d, 0.0).astype(np.float64)
+                lsm_frac = np.where(elev2d > 0.0, 1.0, 0.0).astype(np.float32)
+                lake_frac = np.zeros((ny, nx), dtype=np.float32)
+                oro_std = np.zeros((ny, nx), dtype=np.float32)
+                used_fast_global_gebco = True
+            except Exception as exc:
+                logger.warning("Fast global GEBCO static fallback skipped (%s); trying Copernicus DEM.", exc)
+
+    if used_fast_global_gebco:
+        pass
+    elif resolved_dem is not None and resolved_dem.exists():
         try:
             cop_path = ensure_domain_copernicus_static(
                 spec, output_dir=sdir, local_dem_root=resolved_dem, prefer_glo30=True, smooth_passes=1, force=force
@@ -208,7 +250,13 @@ def _regrid_latlon_field(
         lons = lons_w[order]
         data = data[..., :, order]
 
+    if len(lons) >= 2 and (lons[-1] - lons[0]) > 350.0:
+        lons = np.append(lons, lons[0] + 360.0)
+        data = np.concatenate([data, data[..., :, :1]], axis=-1)
+
     tgt_lon = ((target_spec.lon2d + 180.0) % 360.0) - 180.0
+    if len(lons) >= 2 and lons[-1] > 180.0:
+        tgt_lon = np.where(tgt_lon < lons[0], tgt_lon + 360.0, tgt_lon)
     pts = np.column_stack([target_spec.lat2d.ravel(), tgt_lon.ravel()])
 
     def _interp_2d(slc: np.ndarray) -> np.ndarray:
@@ -316,7 +364,7 @@ def _vertical_map_isobaric_to_klemp(
     theta_3d = th_out.reshape(nz, ny, nx)
     p_3d = p_out.reshape(nz, ny, nx)
     pi_3d = np.power(np.maximum(p_3d, 10.0) / P0_PA, KAPPA)
-    u_st, v_st = stagger_uv(u_out.reshape(nz, ny, nx), v_out.reshape(nz, ny, nx))
+    u_st, v_st = stagger_uv(u_out.reshape(nz, ny, nx), v_out.reshape(nz, ny, nx), periodic_x=spec.is_periodic_lon)
 
     out: Dict[str, np.ndarray] = {
         "u": u_st,
@@ -505,7 +553,7 @@ def aurora_wx1_to_ic(
         p_sfc_ref=p_sfc_ref,
         n_ref_hz=n_ref_hz,
     )
-    u_st, v_st = stagger_uv(raw["u"], raw["v"])
+    u_st, v_st = stagger_uv(raw["u"], raw["v"], periodic_x=spec.is_periodic_lon)
     nz, ny, nx = spec.nz, spec.ny, spec.nx
     state_3d: Dict[str, np.ndarray] = {
         "u": u_st,

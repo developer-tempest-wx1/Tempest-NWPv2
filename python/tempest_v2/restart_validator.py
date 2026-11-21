@@ -27,8 +27,10 @@ logger = logging.getLogger("tempest_v2.restart_validator")
 
 # Domain expected grid geometries
 DOMAIN_GEOMETRIES: Dict[str, Tuple[int, int]] = {
-    # D1 Global 0.4°
+    # D1 Global 0.25° / 0.4°
+    "d1_global_0p25": (721, 1440),
     "d1_global": (451, 900),
+    "d1_global_0p4": (451, 900),
     "d1_0p4": (451, 900),
     "global04": (451, 900),
     "global025": (721, 1440),
@@ -45,11 +47,10 @@ DOMAIN_GEOMETRIES: Dict[str, Tuple[int, int]] = {
 
 
 def normalize_domain_name(domain: str) -> str:
-    """Normalize names without collapsing legacy global 0.25° into D1 0.4°."""
+    """Normalize names without collapsing global 0.25° into D1 0.4°."""
     d = str(domain).strip().lower().replace("-", "_")
-    # Test this legacy grid before the generic 'global' alias below.
-    if d in {"global025", "global_025", "global_0p25", "global0p25"}:
-        return "global025"
+    if d in {"d1_global_0p25", "global025", "global_025", "global_0p25", "global0p25"}:
+        return "d1_global_0p25"
     if "d1" in d or "global" in d or "0p4" in d or "04" in d:
         return "d1_0p4"
     if "d2" in d or "europe" in d:

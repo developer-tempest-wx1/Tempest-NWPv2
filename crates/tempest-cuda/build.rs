@@ -104,6 +104,7 @@ fn main() {
             shared_lib_path.to_str().unwrap(),
             &format!("-L{cuda_lib_dir}"),
             "-lcudart",
+            "-lcufft",
         ])
         .status()
         .expect("Failed to execute nvcc for shared library libtempest_cuda.so");
@@ -116,5 +117,6 @@ fn main() {
     println!("cargo:rustc-link-lib=static=tempest_nh_cuda");
     println!("cargo:rustc-link-search=native={cuda_lib_dir}");
     println!("cargo:rustc-link-lib=dylib=cudart");
+    println!("cargo:rustc-link-lib=dylib=cufft");
     println!("cargo:rustc-link-lib=dylib=stdc++");
 }

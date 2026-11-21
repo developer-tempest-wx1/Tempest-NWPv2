@@ -57,6 +57,10 @@ def _horizontal_regrid_3d_to_child(
         if lats[0] > lats[-1]:
             lats = lats[::-1]
             field_3d = field_3d[:, ::-1, :]
+        if parent_spec.is_periodic_lon and len(lons) >= 2:
+            lons = np.append(lons, lons[0] + 360.0)
+            field_3d = np.concatenate([field_3d, field_3d[:, :, :1]], axis=2)
+            lon_tgt = np.where(lon_tgt < lons[0], lon_tgt + 360.0, lon_tgt)
         py_axis = lats
         px_axis = lons
         pts = np.column_stack([lat_tgt.ravel(), lon_tgt.ravel()])

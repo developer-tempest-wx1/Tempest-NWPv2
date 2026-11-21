@@ -277,6 +277,10 @@ def prepare_bathymetry_on_2d_grid(
 
     with xr.open_dataset(src_p) as ds:
         sub = ds["elevation"].sel(lat=slice(lat_min, lat_max), lon=slice(lon_min, lon_max))
+        if sub.sizes.get("lat", 0) > 4096 or sub.sizes.get("lon", 0) > 4096:
+            sy = max(1, int(sub.sizes["lat"]) // 2048)
+            sx = max(1, int(sub.sizes["lon"]) // 2048)
+            sub = sub.isel(lat=slice(None, None, sy), lon=slice(None, None, sx))
         sub_lats = np.asarray(sub.coords["lat"].values, dtype=np.float64)
         sub_lons = np.asarray(sub.coords["lon"].values, dtype=np.float64)
         elev = np.asarray(sub.values, dtype=np.float64)

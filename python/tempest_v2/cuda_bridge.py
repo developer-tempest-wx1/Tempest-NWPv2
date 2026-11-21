@@ -43,6 +43,8 @@ class NhGridConfigC(ctypes.Structure):
         ("sponge_depth_m", ctypes.c_double),
         ("sponge_tau_max_s", ctypes.c_double),
         ("lbc_tau_max_s", ctypes.c_double),
+        ("is_spherical", ctypes.c_int32),
+        ("polar_filter_lat_deg", ctypes.c_double),
     ]
 
 
@@ -277,15 +279,18 @@ def plan_horizontal_tiling(
     has_physics: bool = False,
     max_vram_bytes: int = DEFAULT_MAX_VRAM_BYTES,
     halo: int = DEFAULT_HALO_CELLS,
+    allow_x_split: bool = True,
 ) -> Tuple[int, int, int]:
     """Compute minimal `(nt_y, nt_x, est_tile_bytes)` keeping peak VRAM <= `max_vram_bytes`."""
     nt_y = 1
     nt_x = 1
     while True:
+        core_y = math.ceil(ny / nt_y)
+        core_x = math.ceil(nx / nt_x)
         pad_y = 0 if nt_y == 1 else (halo if nt_y == 2 else 2 * halo)
         pad_x = 0 if nt_x == 1 else (halo if nt_x == 2 else 2 * halo)
-        tile_ny = min(ny, math.ceil(ny / nt_y) + pad_y)
-        tile_nx = min(nx, math.ceil(nx / nt_x) + pad_x)
+        tile_ny = min(ny, core_y + pad_y)
+        tile_nx = min(nx, core_x + pad_x)
         est = estimate_vram_bytes(
             nz,
             tile_ny,
@@ -295,11 +300,11 @@ def plan_horizontal_tiling(
             has_iau=has_iau,
             has_physics=has_physics,
         )
-        if est <= max_vram_bytes or (tile_ny <= 32 and tile_nx <= 32):
+        if est <= max_vram_bytes or ((not allow_x_split or core_x <= 16) and core_y <= 16):
             return nt_y, nt_x, est
-        if nt_x <= nt_y and tile_nx > 32:
+        if allow_x_split and nt_x <= nt_y and core_x > 16:
             nt_x += 1
-        elif tile_ny > 32:
+        elif core_y > 16:
             nt_y += 1
         else:
             return nt_y, nt_x, est
@@ -463,6 +468,8 @@ class NonHydrostaticGPUSolver:
         lbc_rim_width: int = 8,
         lbc_tau_max_s: float = 0.05,
         has_iau: bool = False,
+        is_spherical: bool = False,
+        polar_filter_lat_deg: float = 0.0,
         max_vram_bytes: int = DEFAULT_MAX_VRAM_BYTES,
         halo: int = DEFAULT_HALO_CELLS,
     ) -> None:
@@ -506,8 +513,15 @@ class NonHydrostaticGPUSolver:
         self.lbc_rim_width = int(lbc_rim_width)
         self.lbc_tau_max_s = float(lbc_tau_max_s)
         self.has_iau = bool(has_iau)
+        self.is_spherical = bool(is_spherical)
+        self.polar_filter_lat_deg = float(polar_filter_lat_deg)
         self.halo = int(halo)
 
+        eff_max_vram = (
+            min(int(max_vram_bytes), int(3.4 * (1024**3)))
+            if (self.is_spherical and self.bc_x == 1 and int(max_vram_bytes) == DEFAULT_MAX_VRAM_BYTES)
+            else int(max_vram_bytes)
+        )
         self.nt_y, self.nt_x, self.estimated_tile_vram_bytes = plan_horizontal_tiling(
             self.nz,
             self.ny,
@@ -516,8 +530,9 @@ class NonHydrostaticGPUSolver:
             has_lbc=(self.bc_x == 2 or self.bc_y == 2),
             has_iau=self.has_iau,
             has_physics=self.has_physics,
-            max_vram_bytes=max_vram_bytes,
+            max_vram_bytes=eff_max_vram,
             halo=self.halo,
+            allow_x_split=(self.bc_x != 1),
         )
         if (self.nt_y > 1 and self.bc_y == 1) or (self.nt_x > 1 and self.bc_x == 1):
             raise ValueError(
@@ -631,6 +646,8 @@ class NonHydrostaticGPUSolver:
             sponge_depth_m=self.sponge_depth_m,
             sponge_tau_max_s=self.sponge_tau_max_s,
             lbc_tau_max_s=self.lbc_tau_max_s,
+            is_spherical=1 if self.is_spherical else 0,
+            polar_filter_lat_deg=self.polar_filter_lat_deg,
         )
 
     def _create_tile_handle(self, tile: _TileBox) -> int:
@@ -940,7 +957,11 @@ class NonHydrostaticGPUSolver:
         th_tot = thb + self._state_host["theta_p"].astype(np.float64)
         pi_tot = np.maximum(1e-4, pib + self._state_host["pi_p"].astype(np.float64))
         t_tot = np.maximum(50.0, th_tot * pi_tot)
-        cs_msf = (np.sqrt((1004.5 / (1004.5 - 287.058)) * 287.058 * t_tot) * self.msf[None, :, :]).astype(np.float32)
+        msf_eff = self.msf
+        if self.is_spherical and 0.0 < self.polar_filter_lat_deg < 89.9:
+            cos_crit = max(math.cos(math.radians(self.polar_filter_lat_deg)), 1e-3)
+            msf_eff = np.minimum(self.msf, 1.0 / cos_crit)
+        cs_msf = (np.sqrt((1004.5 / (1004.5 - 287.058)) * 287.058 * t_tot) * msf_eff[None, :, :]).astype(np.float32)
         cs_max_f32 = np.float32(np.max(cs_msf))
         return int(cs_max_f32.view(np.uint32))
 
@@ -1215,7 +1236,8 @@ class NonHydrostaticGPUSolver:
             brunt_vaisala_hz=self.n_ref_s,
         )
         dzeta = self.vgrid.dzeta[:, None, None]
-        cell_area = (self.dx_m * self.dy_m) / (self.msf[None, :, :] ** 2)
+        msf_area = self.msf[None, :, :] if self.is_spherical else (self.msf[None, :, :] ** 2)
+        cell_area = (self.dx_m * self.dy_m) / msf_area
         return float(np.sum(ref["rho_bar"] * g_s * dzeta * cell_area * np.asarray(q, dtype=np.float64)))
 
     def close(self) -> None:

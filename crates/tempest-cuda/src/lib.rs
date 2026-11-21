@@ -45,6 +45,8 @@ pub struct NhGridConfig {
     pub sponge_depth_m: f64,
     pub sponge_tau_max_s: f64,
     pub lbc_tau_max_s: f64,
+    pub is_spherical: i32,
+    pub polar_filter_lat_deg: f64,
 }
 
 #[repr(C)]
@@ -567,6 +569,8 @@ mod tests {
             sponge_depth_m: 0.0,
             sponge_tau_max_s: 0.0,
             lbc_tau_max_s: 0.0,
+            is_spherical: 0,
+            polar_filter_lat_deg: 0.0,
         };
 
         let mut solver = NhSolver::new(
@@ -637,6 +641,8 @@ mod tests {
             sponge_depth_m: 0.0,
             sponge_tau_max_s: 0.0,
             lbc_tau_max_s: 0.0,
+            is_spherical: 0,
+            polar_filter_lat_deg: 0.0,
         };
         let mut solver = NhSolver::new(
             cfg, &zeta_w, &zeta_s, &dzeta, &b_w, &b_s, &db_w, &db_s, &hs, &msf, &fcor,

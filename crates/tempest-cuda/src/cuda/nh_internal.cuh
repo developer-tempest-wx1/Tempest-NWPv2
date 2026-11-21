@@ -4,6 +4,7 @@
 #include "nh_core.h"
 
 #include <cuda_runtime.h>
+#include <cufft.h>
 #include <math.h>
 #include <stdint.h>
 
@@ -28,6 +29,8 @@ constexpr double T_FREEZE = 273.15;
 constexpr double STEFAN_BOLTZMANN = 5.670374e-8;
 constexpr double KARMAN = 0.4;
 constexpr double PI_CONST = 3.14159265358979323846;
+constexpr double EARTH_RADIUS = 6371229.0;
+constexpr double OMEGA = 7.292115e-5;
 
 struct DeviceStaticGrid {
     const double* zeta_w;
@@ -59,6 +62,8 @@ constexpr float T_FREEZE_F = 273.15f;
 constexpr float STEFAN_BOLTZMANN_F = 5.670374e-8f;
 constexpr float KARMAN_F = 0.4f;
 constexpr float PI_CONST_F = 3.14159265358979323846f;
+constexpr float EARTH_RADIUS_F = 6371229.0f;
+constexpr float OMEGA_F = 7.292115e-5f;
 
 __device__ __host__ inline void eval_ref_state_pis(
     double z,
@@ -379,6 +384,22 @@ struct NhCudaHandle {
     // Transient intra-step physics coupling buffers [ny, nx]
     float *d_precip_liq_rate = nullptr, *d_precip_ice_rate = nullptr;
     float *d_sfc_drag_coeff = nullptr; // rho * u*^2 / wspd for implicit PBL bottom momentum stress
+
+    // GPU cuFFT 1D zonal polar filter state (allocated only when is_spherical == 1 && polar_filter_lat_deg > 0)
+    cufftHandle fft_r2c_s = 0;
+    cufftHandle fft_c2r_s = 0;
+    cufftHandle fft_r2c_v = 0;
+    cufftHandle fft_c2r_v = 0;
+    int32_t fft_ready = 0;
+    int32_t fft_n_rows_s = 0;
+    int32_t fft_n_rows_v = 0;
+    int32_t *d_polar_rows_s = nullptr;
+    int32_t *d_polar_rows_v = nullptr;
+    float *d_polar_cos_s = nullptr;
+    float *d_polar_cos_v = nullptr;
+    float *d_fft_real = nullptr;
+    float *d_polar_save = nullptr;
+    cufftComplex *d_fft_cplx = nullptr;
 };
 
 void nh_internal_set_error(const char* msg);
