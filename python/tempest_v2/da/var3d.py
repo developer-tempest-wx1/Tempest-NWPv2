@@ -579,6 +579,9 @@ def _apply_b_u(
         var = var_map.get(k, 1.0)
         if var == 0.0:
             continue
+        if not np.any(arr):
+            out.fields[k] = np.zeros_like(arr, dtype=np.float64)
+            continue
         work = arr
         if land_mask is not None and k == "sst":
             work = np.where(~land_mask, work, 0.0)

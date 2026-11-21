@@ -197,7 +197,20 @@ def export_child_lbc_step(
             "valid_time_utc": v_dt.isoformat(),
         },
     )
-    wx1.write_dataset(out_path, ds, dataset_id=f"lbc_{child_spec.name}_{step_index:04d}", codec="zstd_shuffle", workers=4)
+    kz_chunk = max(1, min(int(child_spec.nz), (16 * 1024 * 1024) // max(1, child_spec.ny * child_spec.nx * 4)))
+    chunks_map = {
+        str(vn): [min(int(da.shape[0]), kz_chunk), int(da.shape[1]), int(da.shape[2])]
+        for vn, da in ds.data_vars.items()
+        if da.ndim == 3
+    }
+    wx1.write_dataset(
+        out_path,
+        ds,
+        dataset_id=f"lbc_{child_spec.name}_{step_index:04d}",
+        codec="zstd_shuffle",
+        chunk_shapes=chunks_map,
+        workers=4,
+    )
     return out_path
 
 

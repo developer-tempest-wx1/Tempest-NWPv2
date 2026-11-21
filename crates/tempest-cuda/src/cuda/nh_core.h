@@ -249,6 +249,23 @@ int32_t nh_cuda_set_surface_static(NhCudaHandle* handle, const NhSurfaceStaticPt
 int32_t nh_cuda_upload_surface(NhCudaHandle* handle, const NhConstSurfaceStatePtrs* src);
 int32_t nh_cuda_download_surface(NhCudaHandle* handle, const NhSurfaceStatePtrs* dst);
 int32_t nh_cuda_step_physics(NhCudaHandle* handle, double dt_s);
+int32_t nh_cuda_rebind_tile_grid(
+    NhCudaHandle* handle,
+    const NhGridConfig* cfg,
+    const double* hs_m,
+    const double* msf,
+    const double* f_cor
+);
+int32_t nh_cuda_estimate_cs_u32(NhCudaHandle* handle, uint32_t* out_cs_u32);
+int32_t nh_cuda_sync_physics_cache(
+    NhCudaHandle* handle,
+    float* rad_dth_dt,
+    float* precip_liq_rate,
+    float* precip_ice_rate,
+    int32_t* rad_init,
+    double* rad_timer,
+    int32_t to_device
+);
 
 /**
  * Advance prognostic state by dt_s using split-explicit Wicker-Skamarock RK3.

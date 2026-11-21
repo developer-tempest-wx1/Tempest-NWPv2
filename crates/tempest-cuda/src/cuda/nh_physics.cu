@@ -2213,4 +2213,32 @@ int32_t nh_cuda_step_physics(NhCudaHandle* h, double dt_s) {
     return 0;
 }
 
+int32_t nh_cuda_sync_physics_cache(
+    NhCudaHandle* h,
+    float* rad_dth_dt,
+    float* precip_liq_rate,
+    float* precip_ice_rate,
+    int32_t* rad_init,
+    double* rad_timer,
+    int32_t to_device
+) {
+    if (!h) return -1;
+    if (ensure_physics_buffers(h) != 0) return -1;
+    const size_t n2 = static_cast<size_t>(h->cfg.ny) * static_cast<size_t>(h->cfg.nx);
+    if (to_device) {
+        if (rad_dth_dt) NH_CUDA_CHECK(cudaMemcpy(h->d_rad_dth_dt, rad_dth_dt, h->n_s * sizeof(float), cudaMemcpyHostToDevice));
+        if (precip_liq_rate) NH_CUDA_CHECK(cudaMemcpy(h->d_precip_liq_rate, precip_liq_rate, n2 * sizeof(float), cudaMemcpyHostToDevice));
+        if (precip_ice_rate) NH_CUDA_CHECK(cudaMemcpy(h->d_precip_ice_rate, precip_ice_rate, n2 * sizeof(float), cudaMemcpyHostToDevice));
+        if (rad_init) h->rad_initialized = *rad_init;
+        if (rad_timer) h->rad_timer_s = *rad_timer;
+    } else {
+        if (rad_dth_dt) NH_CUDA_CHECK(cudaMemcpy(rad_dth_dt, h->d_rad_dth_dt, h->n_s * sizeof(float), cudaMemcpyDeviceToHost));
+        if (precip_liq_rate) NH_CUDA_CHECK(cudaMemcpy(precip_liq_rate, h->d_precip_liq_rate, n2 * sizeof(float), cudaMemcpyDeviceToHost));
+        if (precip_ice_rate) NH_CUDA_CHECK(cudaMemcpy(precip_ice_rate, h->d_precip_ice_rate, n2 * sizeof(float), cudaMemcpyDeviceToHost));
+        if (rad_init) *rad_init = h->rad_initialized;
+        if (rad_timer) *rad_timer = h->rad_timer_s;
+    }
+    return 0;
+}
+
 } // extern "C"

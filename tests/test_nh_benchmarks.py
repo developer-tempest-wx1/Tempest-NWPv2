@@ -164,6 +164,16 @@ def test_straka_density_current() -> None:
     assert float(np.min(far_left)) < -1.0 and float(np.min(far_right)) < -1.0
     assert float(np.min(th_end)) >= -18.0
 
+    # Reference comparison against Straka et al. (1993, IJNMF) at t=480 s:
+    # Leading-edge gust front (-0.5 K contour at surface) reaches x - xc in [6.2, 8.8] km,
+    # with elevated Kelvin-Helmholtz head (k=2..8) and machine-level symmetry.
+    right_mask = (x - xc > 0.0) & (th_end[0, 1, :] < -0.5)
+    x_front_right = float(np.max(x[right_mask] - xc))
+    assert 6200.0 <= x_front_right <= 8800.0, f"Straka t=480s front position {x_front_right:.1f} m outside reference [6.2, 8.8] km"
+    sym_th = float(np.max(np.abs(th_end[:, 1, :] - th_end[:, 1, ::-1])))
+    sym_u = float(np.max(np.abs(u_end[:, 1, :] + u_end[:, 1, ::-1])))
+    assert sym_th < 1e-3 and sym_u < 1e-3, f"Straka symmetry error: sym_th={sym_th:.3e}, sym_u={sym_u:.3e}"
+
 
 @pytest.mark.parametrize("nz", [65, 137])
 def test_resting_atmosphere_2000m_mountain(nz: int) -> None:
@@ -273,6 +283,35 @@ def test_schar_mountain_wave_with_rayleigh_sponge() -> None:
     # Verify upper sponge cleanly absorbs wave energy near top
     w_top_rms = float(np.sqrt(np.mean(w_end[nz - 3 : nz, 1, :] ** 2)))
     assert w_top_rms < 0.2 * w_mid_max, f"Sponge ineffective: w_top_rms={w_top_rms:.3f} vs w_mid={w_mid_max:.3f}"
+
+    # Analytical 2D Linear Fourier Non-Hydrostatic Reference Comparison (Schar et al. 2002, Eq. 11-13):
+    # w_hat(kx, z) = i * kx * U0 * h_hat(kx) * sqrt(rho0 / rho_bar(z)) * exp(i*m*z or -mu*z)
+    u0 = 10.0
+    n_bv = 0.01
+    l_scorer = n_bv / u0  # Scorer parameter l = N / U0 = 1e-3 m^-1
+    kx = 2.0 * np.pi * np.fft.fftfreq(nx, d=dx)
+    h_hat = np.fft.fft(h_prof)
+    w0_hat = 1j * kx * u0 * h_hat
+
+    z_w, _, _ = vgrid.heights_3d(hs)
+    ref_w = VerticalGrid.reference_state(z_w[:, 1, :], theta_sfc_k=288.0, p_sfc_pa=101_325.0, brunt_vaisala_hz=n_bv)
+    rho_ratio_sqrt = np.sqrt(ref_w["rho_bar"][0:1, :] / np.maximum(ref_w["rho_bar"], 1e-6))
+
+    # Compare lower-tropospheric levels k=1..14 over the mountain ridge x in [-10 km, +10 km]
+    ridge_sl = slice(nx // 2 - 20, nx // 2 + 21)
+    w_ref = np.zeros((14, nx), dtype=np.float64)
+    for k in range(14):
+        z_lvl = float(np.mean(z_w[k, 1, ridge_sl]) - np.mean(hs[1, ridge_sl]))
+        prop = np.abs(kx) < l_scorer
+        m_vert = np.where(prop, np.sign(kx) * np.sqrt(np.maximum(0.0, l_scorer**2 - kx**2)), 0.0)
+        mu_evan = np.where(~prop, np.sqrt(np.maximum(0.0, kx**2 - l_scorer**2)), 0.0)
+        phase = np.where(prop, np.exp(1j * m_vert * z_lvl), np.exp(-mu_evan * z_lvl))
+        w_ref[k] = np.real(np.fft.ifft(w0_hat * phase)) * rho_ratio_sqrt[k]
+
+    w_sim_sub = w_end[1:14, 1, ridge_sl]
+    w_ref_sub = w_ref[1:14, ridge_sl]
+    corr = float(np.corrcoef(w_sim_sub.ravel(), w_ref_sub.ravel())[0, 1])
+    assert corr > 0.80, f"Schar mountain wave pattern correlation vs analytical linear Fourier solution too low: r={corr:.3f}"
 
 
 def test_moist_six_tracer_positivity_and_conservation() -> None:
@@ -399,3 +438,88 @@ def test_rtx3060_nz137_720x720_vram_and_tiled_smoke() -> None:
         assert float(np.min(out[sp])) >= 0.0
     free_after, _ = cuda_vram_info()
     assert free_after > 3_500_000_000, f"GPU VRAM leak after tiled close: free={free_after}"
+
+
+def test_multi_tile_matches_untiled_exact() -> None:
+    """Verify 2x2 tiled solver matches 1-tile untiled solver bit-for-bit across multi-step coupled dynamics+physics."""
+    nz, ny, nx = 16, 64, 64
+    dx = dy = 1500.0
+    vgrid = VerticalGrid(nz=nz, z_top_m=18_000.0, stretch_power=1.3, terrain_decay_power=2.0)
+
+    y = (np.arange(ny, dtype=np.float64) - 0.5 * (ny - 1)) * dy
+    x = (np.arange(nx, dtype=np.float64) - 0.5 * (nx - 1)) * dx
+    yy, xx = np.meshgrid(y, x, indexing="ij")
+    hs = 450.0 * np.exp(-((xx - 4000.0) ** 2 + (yy + 3000.0) ** 2) / (15_000.0**2))
+    msf = 1.0 + 0.01 * (yy / 50_000.0)
+    fcor = np.full((ny, nx), 1.15e-4, dtype=np.float64)
+    _, z_s, _ = vgrid.heights_3d(hs)
+
+    # Set max_vram_bytes to exact 2x2 tile VRAM so plan_horizontal_tiling selects 2x2=4 tiles
+    vram_2x2 = estimate_vram_bytes(nz, ny // 2 + 20, nx // 2 + 20, moist=True, has_lbc=True, has_iau=True, has_physics=True)
+    forced_budget = vram_2x2
+
+    def _run_case(max_vram: int):
+        solver = NonHydrostaticGPUSolver(
+            vgrid,
+            dx,
+            dy,
+            hs,
+            msf=msf,
+            f_cor=fcor,
+            has_moist=True,
+            has_physics=True,
+            bc_x=2,
+            bc_y=2,
+            use_coriolis=True,
+            has_iau=True,
+            sponge_depth_m=4000.0,
+            sponge_tau_max_s=0.02,
+            lbc_rim_width=6,
+            lbc_tau_max_s=0.04,
+            max_vram_bytes=max_vram,
+            halo=20,
+        )
+        try:
+            st = solver.empty_state()
+            st["u"][:] = 7.5
+            st["v"][:] = -2.0
+            st["theta_p"][:] = (1.5 * np.exp(-((xx[None, :, :] ** 2 + yy[None, :, :] ** 2) / (18_000.0**2)))).astype(np.float32)
+            st["qv"][:] = (0.008 * np.exp(-z_s / 2800.0)).astype(np.float32)
+            st["qc"][4:8, 24:40, 24:40] = 4.0e-4
+
+            lbc = {k: st[k].copy() for k in ("u", "v", "w", "theta_p", "pi_p")}
+            iau = {k: np.full_like(st[k], 1.0e-4 if k == "theta_p" else 0.0) for k in ("u", "v", "w", "theta_p", "pi_p")}
+
+            solver.upload_state(st)
+            solver.set_lbc_target(lbc)
+            solver.set_iau_forcing(iau)
+            solver.set_surface_static(solver.default_surface_static())
+            solver.upload_surface(solver.empty_surface_state())
+            solver.set_physics_config(
+                enable_microphysics=1,
+                enable_pbl=1,
+                enable_radiation=1,
+                enable_surface=1,
+                rad_interval_s=900.0,
+                julian_day=172.0,
+                utc_seconds=43_200.0,
+            )
+            # Step across 2 segment calls with physics_every=2 to test persistent cadence + multi-step halo sync
+            solver.step_full(dt_s=4.0, n_steps=1, physics_every=2)
+            solver.step_full(dt_s=4.0, n_steps=3, physics_every=2)
+            return solver.num_tiles, solver.download_state(), solver.download_surface()
+        finally:
+            solver.close()
+
+    n_untiled, st_untiled, sf_untiled = _run_case(DEFAULT_MAX_VRAM_BYTES)
+    n_tiled, st_tiled, sf_tiled = _run_case(forced_budget)
+
+    assert n_untiled == 1, f"Expected 1 tile for untiled reference, got {n_untiled}"
+    assert n_tiled == 4, f"Expected 4 tiles for tiled run, got {n_tiled}"
+
+    for key in st_untiled:
+        diff = float(np.max(np.abs(st_tiled[key] - st_untiled[key])))
+        assert diff < 1e-6, f"Tiled 3D field '{key}' diverged from untiled run: max_abs_diff={diff:.3e}"
+    for key in sf_untiled:
+        diff = float(np.max(np.abs(sf_tiled[key] - sf_untiled[key])))
+        assert diff < 1e-6, f"Tiled surface field '{key}' diverged from untiled run: max_abs_diff={diff:.3e}"

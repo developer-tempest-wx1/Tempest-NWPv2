@@ -6,13 +6,14 @@ import ctypes
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
 from tempest_v2.projection import VerticalGrid
 
-DEFAULT_MAX_VRAM_BYTES = int(3.8 * (1024**3))  # Reserve >2.0 GB headroom on 6 GB RTX 3060
+DEFAULT_MAX_VRAM_BYTES = int(4.45 * (1024**3))  # 4.45 GiB budget on 6 GiB RTX 3060 (1 tile @ nz=65, 2x2 tiles @ nz=137)
+DEFAULT_HALO_CELLS = 20  # >= 13 + 6*ns stencil radius for 1 full 3-stage WENO-5 RK3 + FCT step
 
 
 class NhGridConfigC(ctypes.Structure):
@@ -200,6 +201,26 @@ def load_cuda_library(lib_path: Optional[Path] = None) -> ctypes.CDLL:
     lib.nh_cuda_download_surface.restype = ctypes.c_int32
     lib.nh_cuda_step_physics.argtypes = [ctypes.c_void_p, ctypes.c_double]
     lib.nh_cuda_step_physics.restype = ctypes.c_int32
+    lib.nh_cuda_rebind_tile_grid.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(NhGridConfigC),
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+    ]
+    lib.nh_cuda_rebind_tile_grid.restype = ctypes.c_int32
+    lib.nh_cuda_estimate_cs_u32.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+    lib.nh_cuda_estimate_cs_u32.restype = ctypes.c_int32
+    lib.nh_cuda_sync_physics_cache.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_int32),
+        ctypes.POINTER(ctypes.c_double),
+        ctypes.c_int32,
+    ]
+    lib.nh_cuda_sync_physics_cache.restype = ctypes.c_int32
     lib.nh_cuda_step_rk3.argtypes = [ctypes.c_void_p, ctypes.c_double, ctypes.c_int32]
     lib.nh_cuda_step_rk3.restype = ctypes.c_int32
 
@@ -255,16 +276,16 @@ def plan_horizontal_tiling(
     has_iau: bool = False,
     has_physics: bool = False,
     max_vram_bytes: int = DEFAULT_MAX_VRAM_BYTES,
-    halo: int = 6,
+    halo: int = DEFAULT_HALO_CELLS,
 ) -> Tuple[int, int, int]:
     """Compute minimal `(nt_y, nt_x, est_tile_bytes)` keeping peak VRAM <= `max_vram_bytes`."""
     nt_y = 1
     nt_x = 1
     while True:
-        tile_ny = math.ceil(ny / nt_y) + (2 * halo if nt_y > 1 else 0)
-        tile_nx = math.ceil(nx / nt_x) + (2 * halo if nt_x > 1 else 0)
-        tile_ny = min(ny, tile_ny)
-        tile_nx = min(nx, tile_nx)
+        pad_y = 0 if nt_y == 1 else (halo if nt_y == 2 else 2 * halo)
+        pad_x = 0 if nt_x == 1 else (halo if nt_x == 2 else 2 * halo)
+        tile_ny = min(ny, math.ceil(ny / nt_y) + pad_y)
+        tile_nx = min(nx, math.ceil(nx / nt_x) + pad_x)
         est = estimate_vram_bytes(
             nz,
             tile_ny,
@@ -443,7 +464,7 @@ class NonHydrostaticGPUSolver:
         lbc_tau_max_s: float = 0.05,
         has_iau: bool = False,
         max_vram_bytes: int = DEFAULT_MAX_VRAM_BYTES,
-        halo: int = 6,
+        halo: int = DEFAULT_HALO_CELLS,
     ) -> None:
         self.lib = load_cuda_library()
         self.vgrid = vgrid
@@ -504,6 +525,10 @@ class NonHydrostaticGPUSolver:
             )
 
         self._handle: Optional[int] = None
+        self._tile_handles: List[int] = []
+        self._shared_tile_handle: Optional[int] = None
+        self._tile_phys_caches: List[Dict[str, Any]] = []
+        self._phys_accum_steps: int = 0
         self._state_host: Optional[Dict[str, np.ndarray]] = None
         self._lbc_host: Optional[Dict[str, np.ndarray]] = None
         self._iau_host: Optional[Dict[str, np.ndarray]] = None
@@ -514,6 +539,34 @@ class NonHydrostaticGPUSolver:
 
         if len(self._tiles) == 1:
             self._handle = self._create_tile_handle(self._tiles[0])
+        else:
+            total_tiles_vram = len(self._tiles) * self.estimated_tile_vram_bytes
+            try:
+                free_b, _ = cuda_vram_info()
+            except Exception:
+                free_b = DEFAULT_MAX_VRAM_BYTES
+            resident_budget = min(DEFAULT_MAX_VRAM_BYTES, int(free_b * 0.85))
+            if total_tiles_vram <= resident_budget:
+                # All tiles fit in GPU VRAM simultaneously: keep every tile permanently on GPU!
+                for t in self._tiles:
+                    self._tile_handles.append(self._create_tile_handle(t))
+            else:
+                # Out-of-core tiling (e.g. 720x720x137 on 6 GiB GPU): allocate ONE persistent reusable handle
+                t0 = self._tiles[0]
+                t0_shape = (t0.pj1 - t0.pj0, t0.pi1 - t0.pi0)
+                if all((t.pj1 - t.pj0, t.pi1 - t.pi0) == t0_shape for t in self._tiles):
+                    self._shared_tile_handle = self._create_tile_handle(t0)
+                for t in self._tiles:
+                    tny, tnx = t.pj1 - t.pj0, t.pi1 - t.pi0
+                    self._tile_phys_caches.append(
+                        {
+                            "rad_dth_dt": np.zeros((self.nz, tny, tnx), dtype=np.float32),
+                            "precip_liq_rate": np.zeros((tny, tnx), dtype=np.float32),
+                            "precip_ice_rate": np.zeros((tny, tnx), dtype=np.float32),
+                            "rad_init": ctypes.c_int32(0),
+                            "rad_timer": ctypes.c_double(0.0),
+                        }
+                    )
         if self.has_physics:
             self.set_physics_config()
 
@@ -552,21 +605,13 @@ class NonHydrostaticGPUSolver:
         return tiles
 
     def _make_cfg(self, tile: _TileBox) -> NhGridConfigC:
-        t_bc_x = self.bc_x
-        t_bc_y = self.bc_y
-        if len(self._tiles) > 1:
-            # Open interior tile seams cleanly (no wall u=0 clamp inside interior halo edges)
-            if tile.pi0 > 0 or tile.pi1 < self.nx:
-                t_bc_x = 2
-            if tile.pj0 > 0 or tile.pj1 < self.ny:
-                t_bc_y = 2
         return NhGridConfigC(
             nz=self.nz,
             ny=tile.pj1 - tile.pj0,
             nx=tile.pi1 - tile.pi0,
             has_moist=1 if self.has_moist else 0,
-            bc_x=t_bc_x,
-            bc_y=t_bc_y,
+            bc_x=self.bc_x,
+            bc_y=self.bc_y,
             lbc_edges=tile.lbc_edges,
             use_coriolis=1 if self.use_coriolis else 0,
             adv_order=self.adv_order,
@@ -681,6 +726,12 @@ class NonHydrostaticGPUSolver:
             del kept
         else:
             self._state_host = {k: np.ascontiguousarray(v, dtype=np.float32).copy() for k, v in state.items()}
+            if self._tile_handles:
+                for h, tile in zip(self._tile_handles, self._tiles):
+                    t_state = self._slice_tile_state(self._state_host, tile)
+                    ptrs, kept = _pack_state_ptrs(t_state, self.has_moist)
+                    self._raise_if_err(self.lib.nh_cuda_upload_state(h, ctypes.byref(ptrs)), "tile upload_state")
+                    del kept
 
     def set_lbc_target(self, target: Dict[str, np.ndarray]) -> None:
         if len(self._tiles) == 1:
@@ -689,6 +740,12 @@ class NonHydrostaticGPUSolver:
             del kept
         else:
             self._lbc_host = {k: np.ascontiguousarray(v, dtype=np.float32).copy() for k, v in target.items()}
+            if self._tile_handles and (self.bc_x == 2 or self.bc_y == 2):
+                for h, tile in zip(self._tile_handles, self._tiles):
+                    lbc_slice = self._slice_tile_state(self._lbc_host, tile, moist=False)
+                    ptrs, kept = _pack_state_ptrs(lbc_slice, False)
+                    self._raise_if_err(self.lib.nh_cuda_set_lbc_target(h, ctypes.byref(ptrs)), "tile set_lbc_target")
+                    del kept
 
     def set_iau_forcing(self, ddt_state: Dict[str, np.ndarray]) -> None:
         if len(self._tiles) == 1:
@@ -697,6 +754,12 @@ class NonHydrostaticGPUSolver:
             del kept
         else:
             self._iau_host = {k: np.ascontiguousarray(v, dtype=np.float32).copy() for k, v in ddt_state.items()}
+            if self._tile_handles and self.has_iau:
+                for h, tile in zip(self._tile_handles, self._tiles):
+                    iau_slice = self._slice_tile_state(self._iau_host, tile, moist=False)
+                    ptrs, kept = _pack_state_ptrs(iau_slice, False)
+                    self._raise_if_err(self.lib.nh_cuda_set_iau_forcing(h, ctypes.byref(ptrs)), "tile set_iau_forcing")
+                    del kept
 
     def default_surface_static(
         self,
@@ -791,6 +854,13 @@ class NonHydrostaticGPUSolver:
                 self.lib.nh_cuda_set_physics_config(self._handle, ctypes.byref(self._pcfg)),
                 "set_physics_config",
             )
+        elif self._tile_handles:
+            for h in self._tile_handles:
+                pcfg_copy = NhPhysicsConfigC.from_buffer_copy(self._pcfg)
+                self._raise_if_err(
+                    self.lib.nh_cuda_set_physics_config(h, ctypes.byref(pcfg_copy)),
+                    "tile set_physics_config",
+                )
 
     def set_surface_static(self, sstatic: Dict[str, np.ndarray]) -> None:
         if len(self._tiles) == 1:
@@ -801,6 +871,12 @@ class NonHydrostaticGPUSolver:
             self._surface_static_host = {
                 k: np.ascontiguousarray(v, dtype=np.float32).copy() for k, v in sstatic.items() if k in self.SURFACE_STATIC_FIELDS
             }
+            if self._tile_handles:
+                for h, tile in zip(self._tile_handles, self._tiles):
+                    ss_slice = self._slice_tile_surface(self._surface_static_host, tile)
+                    ptrs, kept = _pack_struct_ptrs(NhSurfaceStaticPtrsC, ss_slice, self.SURFACE_STATIC_FIELDS)
+                    self._raise_if_err(self.lib.nh_cuda_set_surface_static(h, ctypes.byref(ptrs)), "tile set_surface_static")
+                    del kept
 
     def upload_surface(self, surf: Dict[str, np.ndarray]) -> None:
         if len(self._tiles) == 1:
@@ -813,6 +889,12 @@ class NonHydrostaticGPUSolver:
             for k, v in surf.items():
                 if k in self.SURFACE_STATE_STRUCT_ORDER:
                     self._surface_state_host[k] = np.ascontiguousarray(v, dtype=np.float32).copy()
+            if self._tile_handles:
+                for h, tile in zip(self._tile_handles, self._tiles):
+                    sf_slice = self._slice_tile_surface(self._surface_state_host, tile)
+                    ptrs, kept = _pack_struct_ptrs(NhSurfaceStatePtrsC, sf_slice, self.SURFACE_STATE_STRUCT_ORDER)
+                    self._raise_if_err(self.lib.nh_cuda_upload_surface(h, ctypes.byref(ptrs)), "tile upload_surface")
+                    del kept
 
     def download_surface(self) -> Dict[str, np.ndarray]:
         if len(self._tiles) == 1:
@@ -820,6 +902,16 @@ class NonHydrostaticGPUSolver:
             ptrs, kept = _pack_struct_ptrs(NhSurfaceStatePtrsC, out, self.SURFACE_STATE_STRUCT_ORDER)
             self._raise_if_err(self.lib.nh_cuda_download_surface(self._handle, ctypes.byref(ptrs)), "download_surface")
             del kept
+            return out
+        if self._tile_handles:
+            out = self.empty_surface_state()
+            for h, tile in zip(self._tile_handles, self._tiles):
+                sf_slice = self._slice_tile_surface(out, tile)
+                ptrs, kept = _pack_struct_ptrs(NhSurfaceStatePtrsC, sf_slice, self.SURFACE_STATE_STRUCT_ORDER)
+                self._raise_if_err(self.lib.nh_cuda_download_surface(h, ctypes.byref(ptrs)), "tile download_surface")
+                del kept
+                self._write_tile_surface_interior(out, sf_slice, tile)
+            self._surface_state_host = {k: v.copy() for k, v in out.items()}
             return out
         if self._surface_state_host is None:
             return self.empty_surface_state()
@@ -835,7 +927,32 @@ class NonHydrostaticGPUSolver:
             if self._pcfg.julian_day > 366.0:
                 self._pcfg.julian_day -= 365.0
 
-    def _run_multi_tile(self, dt_s: float, n_steps: int, n_substeps: int, run_dyn: bool, run_phys: bool) -> None:
+    def _estimate_host_cs_u32(self) -> int:
+        """Compute exact IEEE-754 uint32 bit pattern of domain-max `cs * msf` matching `nh_estimate_cs_max_kernel`."""
+        assert self._state_host is not None
+        if not hasattr(self, "_ref_th_pi"):
+            _, z_s, _ = self.vgrid.heights_3d(self.hs_m)
+            ref = VerticalGrid.reference_state(
+                z_s, theta_sfc_k=self.theta_sfc_k, p_sfc_pa=self.p_sfc_pa, brunt_vaisala_hz=self.n_ref_s
+            )
+            self._ref_th_pi = (ref["theta_bar"], ref["pi_bar"])
+        thb, pib = self._ref_th_pi
+        th_tot = thb + self._state_host["theta_p"].astype(np.float64)
+        pi_tot = np.maximum(1e-4, pib + self._state_host["pi_p"].astype(np.float64))
+        t_tot = np.maximum(50.0, th_tot * pi_tot)
+        cs_msf = (np.sqrt((1004.5 / (1004.5 - 287.058)) * 287.058 * t_tot) * self.msf[None, :, :]).astype(np.float32)
+        cs_max_f32 = np.float32(np.max(cs_msf))
+        return int(cs_max_f32.view(np.uint32))
+
+    def _run_multi_tile(
+        self,
+        dt_s: float,
+        n_steps: int,
+        n_substeps: int,
+        run_dyn: bool,
+        run_phys: bool,
+        phys_dt_s: Optional[float] = None,
+    ) -> None:
         if self._state_host is None:
             raise RuntimeError("upload_state must be called before stepping multi-tile solver")
         if run_phys:
@@ -843,16 +960,88 @@ class NonHydrostaticGPUSolver:
                 self.set_physics_config()
             if self._surface_state_host is None:
                 self._surface_state_host = self.empty_surface_state()
+                if self._tile_handles:
+                    self.upload_surface(self._surface_state_host)
 
+        dt_p = float(dt_s if phys_dt_s is None else phys_dt_s)
+
+        # Path A: All tile handles permanently resident in GPU VRAM
+        if self._tile_handles:
+            for _ in range(n_steps):
+                eff_substeps = int(n_substeps)
+                if run_dyn and eff_substeps <= 0:
+                    cs_max_u32 = 0
+                    for h in self._tile_handles:
+                        val = ctypes.c_uint32(0)
+                        self._raise_if_err(self.lib.nh_cuda_estimate_cs_u32(h, ctypes.byref(val)), "tile estimate_cs_u32")
+                        if int(val.value) > cs_max_u32:
+                            cs_max_u32 = int(val.value)
+                    if cs_max_u32 > 0:
+                        eff_substeps = -cs_max_u32
+
+                next_state = {k: np.empty_like(v) for k, v in self._state_host.items()}
+                for h, tile in zip(self._tile_handles, self._tiles):
+                    if run_dyn:
+                        self._raise_if_err(
+                            self.lib.nh_cuda_step_rk3(h, float(dt_s), eff_substeps),
+                            "tile step_rk3",
+                        )
+                    if run_phys:
+                        self._raise_if_err(
+                            self.lib.nh_cuda_step_physics(h, dt_p),
+                            "tile step_physics",
+                        )
+                    t_state = self._slice_tile_state(self._state_host, tile)
+                    dst_ptrs, kept_d = _pack_state_ptrs(t_state, self.has_moist)
+                    self._raise_if_err(self.lib.nh_cuda_download_state(h, ctypes.byref(dst_ptrs)), "tile download")
+                    del kept_d
+                    self._write_tile_interior(next_state, t_state, tile)
+
+                self._state_host = next_state
+                for h, tile in zip(self._tile_handles, self._tiles):
+                    t_state = self._slice_tile_state(self._state_host, tile)
+                    ptrs, kept = _pack_state_ptrs(t_state, self.has_moist)
+                    self._raise_if_err(self.lib.nh_cuda_upload_state(h, ctypes.byref(ptrs)), "tile halo sync")
+                    del kept
+
+                if run_phys:
+                    self._advance_host_clock(dt_p)
+            return
+
+        # Path B: Out-of-core tiling (reusing persistent self._shared_tile_handle with 0 cudaMalloc/cudaFree)
         for _ in range(n_steps):
+            eff_substeps = int(n_substeps)
+            if run_dyn and eff_substeps <= 0:
+                cs_u32 = self._estimate_host_cs_u32()
+                if cs_u32 > 0:
+                    eff_substeps = -cs_u32
+
             next_state = {k: np.empty_like(v) for k, v in self._state_host.items()}
             next_surf = (
                 {k: np.empty_like(v) for k, v in self._surface_state_host.items()}
                 if run_phys and self._surface_state_host is not None
                 else None
             )
-            for tile in self._tiles:
-                h = self._create_tile_handle(tile)
+            for t_idx, tile in enumerate(self._tiles):
+                reused = self._shared_tile_handle is not None
+                if reused:
+                    h = int(self._shared_tile_handle)
+                    cfg = self._make_cfg(tile)
+                    hs_sub = np.ascontiguousarray(self.hs_m[tile.pj0 : tile.pj1, tile.pi0 : tile.pi1], dtype=np.float64)
+                    msf_sub = np.ascontiguousarray(self.msf[tile.pj0 : tile.pj1, tile.pi0 : tile.pi1], dtype=np.float64)
+                    fcor_sub = np.ascontiguousarray(self.f_cor[tile.pj0 : tile.pj1, tile.pi0 : tile.pi1], dtype=np.float64)
+                    self._raise_if_err(
+                        self.lib.nh_cuda_rebind_tile_grid(
+                            h,
+                            ctypes.byref(cfg),
+                            hs_sub.ctypes.data,
+                            msf_sub.ctypes.data,
+                            fcor_sub.ctypes.data,
+                        ),
+                        "tile rebind_grid",
+                    )
+                else:
+                    h = self._create_tile_handle(tile)
                 try:
                     t_state = self._slice_tile_state(self._state_host, tile)
                     ptrs, kept = _pack_state_ptrs(t_state, self.has_moist)
@@ -886,16 +1075,42 @@ class NonHydrostaticGPUSolver:
                         sf_ptrs, kept_sf = _pack_struct_ptrs(NhSurfaceStatePtrsC, sf_slice, self.SURFACE_STATE_STRUCT_ORDER)
                         self._raise_if_err(self.lib.nh_cuda_upload_surface(h, ctypes.byref(sf_ptrs)), "tile upload_surface")
                         del kept_sf
+                        pcache = self._tile_phys_caches[t_idx]
+                        self._raise_if_err(
+                            self.lib.nh_cuda_sync_physics_cache(
+                                h,
+                                pcache["rad_dth_dt"].ctypes.data,
+                                pcache["precip_liq_rate"].ctypes.data,
+                                pcache["precip_ice_rate"].ctypes.data,
+                                ctypes.byref(pcache["rad_init"]),
+                                ctypes.byref(pcache["rad_timer"]),
+                                1,
+                            ),
+                            "tile upload_phys_cache",
+                        )
 
                     if run_dyn:
                         self._raise_if_err(
-                            self.lib.nh_cuda_step_rk3(h, float(dt_s), int(n_substeps)),
+                            self.lib.nh_cuda_step_rk3(h, float(dt_s), eff_substeps),
                             "tile step_rk3",
                         )
                     if run_phys:
                         self._raise_if_err(
-                            self.lib.nh_cuda_step_physics(h, float(dt_s)),
+                            self.lib.nh_cuda_step_physics(h, dt_p),
                             "tile step_physics",
+                        )
+                        pcache = self._tile_phys_caches[t_idx]
+                        self._raise_if_err(
+                            self.lib.nh_cuda_sync_physics_cache(
+                                h,
+                                pcache["rad_dth_dt"].ctypes.data,
+                                pcache["precip_liq_rate"].ctypes.data,
+                                pcache["precip_ice_rate"].ctypes.data,
+                                ctypes.byref(pcache["rad_init"]),
+                                ctypes.byref(pcache["rad_timer"]),
+                                0,
+                            ),
+                            "tile download_phys_cache",
                         )
                         sf_d_ptrs, kept_sfd = _pack_struct_ptrs(NhSurfaceStatePtrsC, sf_slice, self.SURFACE_STATE_STRUCT_ORDER)
                         self._raise_if_err(self.lib.nh_cuda_download_surface(h, ctypes.byref(sf_d_ptrs)), "tile download_surface")
@@ -907,11 +1122,12 @@ class NonHydrostaticGPUSolver:
                     del kept_d
                     self._write_tile_interior(next_state, t_state, tile)
                 finally:
-                    self.lib.nh_cuda_destroy(h)
+                    if not reused:
+                        self.lib.nh_cuda_destroy(h)
             self._state_host = next_state
             if run_phys and next_surf is not None:
                 self._surface_state_host = next_surf
-                self._advance_host_clock(dt_s)
+                self._advance_host_clock(dt_p)
 
     def step_rk3(self, dt_s: float, n_steps: int = 1, n_substeps: int = 0) -> None:
         if len(self._tiles) == 1:
@@ -936,23 +1152,47 @@ class NonHydrostaticGPUSolver:
             return
         self._run_multi_tile(dt_s, n_steps, 0, run_dyn=False, run_phys=True)
 
-    def step_full(self, dt_s: float, n_steps: int = 1, n_substeps: int = 0) -> None:
-        """Advance coupled dynamics (split-explicit RK3 + FCT) + full GPU physics suite."""
+    def step_full(
+        self,
+        dt_s: float,
+        n_steps: int = 1,
+        n_substeps: int = 0,
+        *,
+        physics_every: int = 1,
+        flush_physics: bool = False,
+    ) -> None:
+        """Advance coupled dynamics (split-explicit RK3 + FCT) + GPU physics suite.
+
+        Maintains `self._phys_accum_steps` persistently across segment calls so
+        `physics_every` cadence never shifts across LBC or output breakpoints.
+        """
         if self._pcfg is None:
             self.set_physics_config()
+        phys_cadence = max(1, int(physics_every))
         if len(self._tiles) == 1:
-            for _ in range(n_steps):
+            for idx in range(n_steps):
                 self._raise_if_err(
                     self.lib.nh_cuda_step_rk3(self._handle, float(dt_s), int(n_substeps)),
                     "step_rk3",
                 )
-                self._raise_if_err(
-                    self.lib.nh_cuda_step_physics(self._handle, float(dt_s)),
-                    "step_physics",
-                )
-                self._advance_host_clock(dt_s)
+                self._phys_accum_steps += 1
+                if self._phys_accum_steps >= phys_cadence or (flush_physics and idx == n_steps - 1):
+                    dt_phys = float(dt_s) * self._phys_accum_steps
+                    self._raise_if_err(
+                        self.lib.nh_cuda_step_physics(self._handle, dt_phys),
+                        "step_physics",
+                    )
+                    self._advance_host_clock(dt_phys)
+                    self._phys_accum_steps = 0
             return
-        self._run_multi_tile(dt_s, n_steps, n_substeps, run_dyn=True, run_phys=True)
+
+        for idx in range(n_steps):
+            self._phys_accum_steps += 1
+            due = (self._phys_accum_steps >= phys_cadence) or (flush_physics and idx == n_steps - 1)
+            dt_phys = float(dt_s) * self._phys_accum_steps if due else None
+            self._run_multi_tile(dt_s, 1, n_substeps, run_dyn=True, run_phys=due, phys_dt_s=dt_phys)
+            if due:
+                self._phys_accum_steps = 0
 
     def download_state(self) -> Dict[str, np.ndarray]:
         if len(self._tiles) == 1:
@@ -982,6 +1222,14 @@ class NonHydrostaticGPUSolver:
         if getattr(self, "_handle", None):
             self.lib.nh_cuda_destroy(self._handle)
             self._handle = None
+        if getattr(self, "_tile_handles", None):
+            for h in self._tile_handles:
+                if h:
+                    self.lib.nh_cuda_destroy(h)
+            self._tile_handles = []
+        if getattr(self, "_shared_tile_handle", None):
+            self.lib.nh_cuda_destroy(self._shared_tile_handle)
+            self._shared_tile_handle = None
 
     def __del__(self) -> None:
         self.close()

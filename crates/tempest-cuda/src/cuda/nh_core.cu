@@ -1860,6 +1860,42 @@ int32_t nh_cuda_set_iau_forcing(NhCudaHandle* h, const NhConstStatePtrs* ddt_sta
     return 0;
 }
 
+int32_t nh_cuda_rebind_tile_grid(
+    NhCudaHandle* h,
+    const NhGridConfig* cfg,
+    const double* hs_m,
+    const double* msf,
+    const double* f_cor
+) {
+    if (!h || !cfg || !hs_m || !msf || !f_cor) {
+        set_error("Null pointer in nh_cuda_rebind_tile_grid");
+        return -1;
+    }
+    if (cfg->nz != h->cfg.nz || cfg->ny != h->cfg.ny || cfg->nx != h->cfg.nx) {
+        set_error("Dimension mismatch in nh_cuda_rebind_tile_grid");
+        return -1;
+    }
+    h->cfg = *cfg;
+    const size_t n2 = static_cast<size_t>(cfg->ny) * static_cast<size_t>(cfg->nx);
+    CUDA_CHECK(cudaMemcpy(h->d_hs, hs_m, n2 * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(h->d_msf, msf, n2 * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(cudaMemcpy(h->d_fcor, f_cor, n2 * sizeof(double), cudaMemcpyHostToDevice));
+    return 0;
+}
+
+int32_t nh_cuda_estimate_cs_u32(NhCudaHandle* h, uint32_t* out_cs_u32) {
+    if (!h || !out_cs_u32) return -1;
+    const int32_t nz = h->cfg.nz, ny = h->cfg.ny, nx = h->cfg.nx;
+    const DeviceStaticGrid g = static_view(h);
+    const dim3 block(32, 8, 1);
+    const dim3 grid_s((nx + 31) / 32, (ny + 7) / 8, nz);
+    CUDA_CHECK(cudaMemset(h->d_max_u32, 0, sizeof(uint32_t)));
+    nh_estimate_cs_max_kernel<<<grid_s, block>>>(h->cfg, g, h->d_thp, h->d_pip, h->d_max_u32);
+    CUDA_CHECK(cudaGetLastError());
+    CUDA_CHECK(cudaMemcpy(out_cs_u32, h->d_max_u32, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+    return 0;
+}
+
 int32_t nh_cuda_step_rk3(NhCudaHandle* h, double dt_s, int32_t n_substeps) {
     if (!h || dt_s <= 0.0) {
         set_error("Invalid handle or non-positive dt_s in nh_cuda_step_rk3");
@@ -1878,11 +1914,15 @@ int32_t nh_cuda_step_rk3(NhCudaHandle* h, double dt_s, int32_t n_substeps) {
 
     double cs_msf_max = 360.0;
     if (n_substeps <= 0) {
-        CUDA_CHECK(cudaMemset(h->d_max_u32, 0, sizeof(uint32_t)));
-        nh_estimate_cs_max_kernel<<<grid_s, block>>>(h->cfg, g, h->d_thp, h->d_pip, h->d_max_u32);
-        CUDA_CHECK(cudaGetLastError());
         uint32_t cs_u32 = 0;
-        CUDA_CHECK(cudaMemcpy(&cs_u32, h->d_max_u32, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+        if (n_substeps < 0) {
+            cs_u32 = static_cast<uint32_t>(-n_substeps);
+        } else {
+            CUDA_CHECK(cudaMemset(h->d_max_u32, 0, sizeof(uint32_t)));
+            nh_estimate_cs_max_kernel<<<grid_s, block>>>(h->cfg, g, h->d_thp, h->d_pip, h->d_max_u32);
+            CUDA_CHECK(cudaGetLastError());
+            CUDA_CHECK(cudaMemcpy(&cs_u32, h->d_max_u32, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+        }
         float cs_val = 0.0f;
         memcpy(&cs_val, &cs_u32, sizeof(float));
         if (cs_val > 10.0f) cs_msf_max = static_cast<double>(cs_val);

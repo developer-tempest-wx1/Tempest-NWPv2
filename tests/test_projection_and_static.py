@@ -86,7 +86,10 @@ def test_domain_presets_and_vertical_grid_137():
 
 
 def test_offline_copernicus_dem_polders_lakes_mountains_and_wx1_write(tmp_path):
-    dem_root = Path("/mnt/d/AI/weer-ai/Tempest/Tempest-NWPv2/data/static/copernicus_dem_raw")
+    repo_root = Path(__file__).resolve().parents[1]
+    dem_root = repo_root / "data/static/copernicus_dem_raw"
+    if not dem_root.exists():
+        dem_root = Path("/mnt/d/AI/weer-ai/Tempest/COPERNICUS_DEM")
     if not dem_root.exists():
         pytest.skip("Local Copernicus DEM directory not mounted")
 
@@ -135,8 +138,9 @@ def test_offline_copernicus_dem_polders_lakes_mountains_and_wx1_write(tmp_path):
 
 
 def test_offline_hwsd22_and_gebco_bathymetry_2d_patch(tmp_path):
-    hwsd_dir = Path("/mnt/d/AI/weer-ai/Tempest/Tempest-NWPv2/data/static/hwsd_v22/extracted/db/HWSD2.2.mdb")
-    gebco_nc = Path("/mnt/d/AI/weer-ai/Tempest/Tempest-NWPv2/data/static/bathymetry_raw/GEBCO_2026/GEBCO_2026.nc")
+    repo_root = Path(__file__).resolve().parents[1]
+    hwsd_dir = repo_root / "data/static/hwsd_v22/extracted/db/HWSD2.2.mdb"
+    gebco_nc = repo_root / "data/static/bathymetry_raw/GEBCO_2026/GEBCO_2026.nc"
     if not hwsd_dir.is_file() or not gebco_nc.is_file():
         pytest.skip("Local HWSD v2.2 or GEBCO_2026 not present")
 
