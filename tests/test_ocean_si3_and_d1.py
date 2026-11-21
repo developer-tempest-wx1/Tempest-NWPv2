@@ -2,12 +2,20 @@
 
 from __future__ import annotations
 
+import datetime
 import math
+from pathlib import Path
 from typing import Dict
 
 import numpy as np
 
 from tempest_v2.cuda_bridge import NonHydrostaticGPUSolver, cuda_vram_info, estimate_vram_bytes
+from tempest_v2.ocean_si3_bridge import (
+    NemoSi3GPUSolver,
+    estimate_ocean_si3_vram_bytes,
+    freezing_temp_c,
+    teos10_rho,
+)
 from tempest_v2.projection import EARTH_RADIUS_M, OMEGA_RAD_S, DomainSpec, VerticalGrid, get_domain_spec
 
 
@@ -239,3 +247,290 @@ def test_rtx3060_d1_0p25_global_nz65_vram_and_tiled_smoke() -> None:
         assert float(np.min(out[sp])) >= 0.0
     free_after, _ = cuda_vram_info()
     assert free_after > 3_500_000_000, f"GPU VRAM leak after D1 0.25 deg close: free={free_after}"
+
+
+def _make_regional_ocean_spec(ny: int = 24, nx: int = 24, dx_m: float = 20_000.0, lat0: float = 72.0) -> DomainSpec:
+    x_m = np.arange(nx, dtype=np.float64) * dx_m
+    y_m = np.arange(ny, dtype=np.float64) * dx_m
+    yy, xx = np.meshgrid(y_m, x_m, indexing="ij")
+    lat2d = lat0 + (yy - 0.5 * y_m[-1]) / 111_000.0
+    lon2d = 5.0 + (xx - 0.5 * x_m[-1]) / (111_000.0 * math.cos(math.radians(lat0)))
+    return DomainSpec(
+        name="ocean_test_reg",
+        ny=ny,
+        nx=nx,
+        dx_m=dx_m,
+        dy_m=dx_m,
+        is_projected=False,
+        is_periodic_lon=False,
+        projection=None,
+        x_m=x_m,
+        y_m=y_m,
+        lat2d=lat2d,
+        lon2d=lon2d,
+        map_factor=np.ones((ny, nx), dtype=np.float64),
+        coriolis_f=2.0 * OMEGA_RAD_S * np.sin(np.radians(lat2d)),
+        vertical=VerticalGrid(nz=14, z_top_m=15_000.0, stretch_power=1.2),
+        is_spherical=False,
+    )
+
+
+def test_nemo_teos10_eos_and_freezing_point_accuracy() -> None:
+    """Verify exact Roquet (2015) TEOS-10 density checkvalue and freezing point."""
+    rho_check = teos10_rho(3.0, 35.5, 3000.0)
+    assert abs(rho_check - 1028.21993233072) < 1e-8
+    rho_sfc = teos10_rho(10.0, 35.16504, 0.0)
+    assert 1026.7 <= rho_sfc <= 1027.2
+    tf0 = freezing_temp_c(35.0, 0.0)
+    tf500 = freezing_temp_c(35.0, 500.0)
+    assert -1.96 < tf0 < -1.86
+    assert abs((tf500 - tf0) + 0.3765) < 1e-3
+    assert estimate_ocean_si3_vram_bytes(16, 721, 1440, enable_si3=True) < 1_300_000_000
+
+
+def test_nemo_barotropic_inverse_barometer_and_land_mask_isolation() -> None:
+    """Split-explicit SSH responds to inverse-barometer cyclone while land & lake masks stay strictly zero."""
+    spec = _make_regional_ocean_spec(ny=24, nx=24, dx_m=25_000.0, lat0=54.0)
+    lsm = np.zeros((spec.ny, spec.nx), dtype=np.float32)
+    lsm[0, :] = 1.0
+    lsm[-1, :] = 1.0
+    lsm[:, 0] = 1.0
+    lsm[:, -1] = 1.0
+    lake = np.zeros((spec.ny, spec.nx), dtype=np.float32)
+    lake[3:5, 3:5] = 1.0
+    bathy = np.where((lsm < 0.5) & (lake < 0.5), 120.0, 4.5).astype(np.float32)
+    bathy[lsm >= 0.5] = 0.0
+    sstatic = {
+        "lat_deg": spec.lat2d.astype(np.float32),
+        "lon_deg": spec.lon2d.astype(np.float32),
+        "lsm": lsm,
+        "lake_mask": lake,
+        "bathy_depth_m": bathy,
+    }
+
+    yy, xx = np.mgrid[0:spec.ny, 0:spec.nx]
+    mslp = 101_325.0 - 4000.0 * np.exp(-(((yy - 12.0) ** 2 + (xx - 12.0) ** 2) / 16.0))
+    forcing = {
+        "u10m": np.zeros((spec.ny, spec.nx), dtype=np.float32),
+        "v10m": np.zeros((spec.ny, spec.nx), dtype=np.float32),
+        "t2m": np.full((spec.ny, spec.nx), 283.0, dtype=np.float32),
+        "q2m": np.full((spec.ny, spec.nx), 0.006, dtype=np.float32),
+        "mslp": mslp.astype(np.float32),
+        "sw_down": np.zeros((spec.ny, spec.nx), dtype=np.float32),
+        "lw_down": np.full((spec.ny, spec.nx), 320.0, dtype=np.float32),
+        "precip_liq": np.zeros((spec.ny, spec.nx), dtype=np.float32),
+        "precip_ice": np.zeros((spec.ny, spec.nx), dtype=np.float32),
+        "cld_fra": np.full((spec.ny, spec.nx), 0.5, dtype=np.float32),
+    }
+
+    with NemoSi3GPUSolver(spec, sstatic, nz=8) as solver:
+        st0 = solver.init_from_atmosphere_and_osisaf({"sst_bulk": np.full((spec.ny, spec.nx), 283.0, dtype=np.float32)})
+        solver.upload_state(st0)
+        for _ in range(15):
+            solver.step(forcing, dt_s=120.0)
+        st1 = solver.download_state()
+
+    dry = (lsm >= 0.5) | (lake >= 0.5)
+    assert float(st1["ssh"][12, 12]) > 0.10, f"Expected IB sea-level rise at storm center, got {st1['ssh'][12, 12]}"
+    assert float(np.max(np.abs(st1["ssh"][dry]))) == 0.0
+    assert float(np.max(np.abs(st1["temp_k"][:, dry]))) == 0.0
+    assert float(np.max(np.abs(st1["sal_psu"][:, dry]))) == 0.0
+    assert float(np.max(np.abs(st1["ice_frac"][dry]))) == 0.0
+
+
+def test_si3_polar_frazil_growth_brine_rejection_salt_conservation() -> None:
+    """Cold Arctic cooling freezes frazil ice, raises SSS via brine rejection, and conserves ocean+ice salt."""
+    spec = _make_regional_ocean_spec(ny=12, nx=12, dx_m=25_000.0, lat0=78.0)
+    sstatic = {
+        "lat_deg": spec.lat2d.astype(np.float32),
+        "lon_deg": spec.lon2d.astype(np.float32),
+        "lsm": np.zeros((spec.ny, spec.nx), dtype=np.float32),
+        "lake_mask": np.zeros((spec.ny, spec.nx), dtype=np.float32),
+        "bathy_depth_m": np.full((spec.ny, spec.nx), 500.0, dtype=np.float32),
+    }
+    forcing = {
+        "u10m": np.full((spec.ny, spec.nx), 10.0, dtype=np.float32),
+        "v10m": np.zeros((spec.ny, spec.nx), dtype=np.float32),
+        "t2m": np.full((spec.ny, spec.nx), 243.15, dtype=np.float32),
+        "q2m": np.full((spec.ny, spec.nx), 0.0003, dtype=np.float32),
+        "mslp": np.full((spec.ny, spec.nx), 101_325.0, dtype=np.float32),
+        "sw_down": np.zeros((spec.ny, spec.nx), dtype=np.float32),
+        "lw_down": np.full((spec.ny, spec.nx), 165.0, dtype=np.float32),
+        "precip_liq": np.zeros((spec.ny, spec.nx), dtype=np.float32),
+        "precip_ice": np.zeros((spec.ny, spec.nx), dtype=np.float32),
+        "cld_fra": np.full((spec.ny, spec.nx), 0.2, dtype=np.float32),
+    }
+
+    with NemoSi3GPUSolver(spec, sstatic, nz=8, enable_dynamics=False) as solver:
+        st0 = solver.empty_state()
+        for k in range(8):
+            st0["temp_k"][k] = 273.15 + freezing_temp_c(34.0, 2.5) + 0.005
+            st0["sal_psu"][k] = 34.0
+        salt0 = float(np.sum(solver.total_salt_kg_m2(st0)))
+        solver.upload_state(st0)
+        for _ in range(16):
+            solver.step(forcing, dt_s=900.0)
+        st1 = solver.download_state()
+        salt1 = float(np.sum(solver.total_salt_kg_m2(st1)))
+
+    rel_err = abs(salt1 - salt0) / max(salt0, 1.0)
+    assert float(np.mean(st1["ice_frac"])) > 0.05
+    assert float(np.mean(st1["ice_thick"])) > 0.05
+    assert float(np.mean(st1["ice_albedo"])) > 0.25
+    assert float(np.mean(st1["sal_psu"][0])) > 34.0, "Brine rejection must increase surface salinity"
+    assert rel_err < 1e-5, f"Total ocean+ice salt drift rel_err={rel_err:.3e}"
+
+
+def test_si3_mevp_wind_drift_and_thorndike_ridging_cap() -> None:
+    """mEVP rheology drifts pack ice downwind and Thorndike ridging strictly caps concentration <= 0.997."""
+    spec = _make_regional_ocean_spec(ny=16, nx=20, dx_m=20_000.0, lat0=76.0)
+    lsm = np.zeros((spec.ny, spec.nx), dtype=np.float32)
+    lsm[:, -2:] = 1.0
+    lsm[0, :] = 1.0
+    lsm[-1, :] = 1.0
+    bathy = np.where(lsm < 0.5, 250.0, 0.0).astype(np.float32)
+    sstatic = {
+        "lat_deg": spec.lat2d.astype(np.float32),
+        "lon_deg": spec.lon2d.astype(np.float32),
+        "lsm": lsm,
+        "lake_mask": np.zeros((spec.ny, spec.nx), dtype=np.float32),
+        "bathy_depth_m": bathy,
+    }
+    forcing = {
+        "u10m": np.full((spec.ny, spec.nx), 16.0, dtype=np.float32),
+        "v10m": np.zeros((spec.ny, spec.nx), dtype=np.float32),
+        "t2m": np.full((spec.ny, spec.nx), 263.15, dtype=np.float32),
+        "q2m": np.full((spec.ny, spec.nx), 0.001, dtype=np.float32),
+        "mslp": np.full((spec.ny, spec.nx), 101_325.0, dtype=np.float32),
+        "sw_down": np.full((spec.ny, spec.nx), 40.0, dtype=np.float32),
+        "lw_down": np.full((spec.ny, spec.nx), 210.0, dtype=np.float32),
+        "precip_liq": np.zeros((spec.ny, spec.nx), dtype=np.float32),
+        "precip_ice": np.zeros((spec.ny, spec.nx), dtype=np.float32),
+        "cld_fra": np.full((spec.ny, spec.nx), 0.5, dtype=np.float32),
+    }
+
+    with NemoSi3GPUSolver(spec, sstatic, nz=8, n_evp_substeps=40) as solver:
+        surf_in = {
+            "sst_bulk": np.full((spec.ny, spec.nx), 271.35, dtype=np.float32),
+            "sea_ice_frac": np.where(lsm < 0.5, 0.96, 0.0).astype(np.float32),
+            "sea_ice_thick": np.where(lsm < 0.5, 0.85, 0.0).astype(np.float32),
+            "sea_ice_tsfc": np.full((spec.ny, spec.nx), 263.15, dtype=np.float32),
+        }
+        st0 = solver.init_from_atmosphere_and_osisaf(surf_in)
+        solver.upload_state(st0)
+        for _ in range(4):
+            solver.step(forcing, dt_s=600.0)
+        st1 = solver.download_state()
+
+    wet = lsm < 0.5
+    assert float(np.max(st1["u_ice"][wet])) > 0.03
+    assert float(np.min(st1["a_i"])) >= 0.0 and float(np.min(st1["v_i"])) >= 0.0
+    assert float(np.max(np.sum(st1["a_i"], axis=0))) <= 0.9971
+
+
+def test_coupled_sea_ice_mosaic_radiation_and_heat_flux() -> None:
+    """Two-way SI3 mosaic reduces open-water heat loss and cools t_skin relative to ice-free ocean."""
+    vgrid = VerticalGrid(nz=16, z_top_m=15_000.0, stretch_power=1.2)
+    ny, nx = 8, 8
+    hs = np.zeros((ny, nx), dtype=np.float64)
+    msf = np.ones((ny, nx), dtype=np.float64)
+    fcor = np.full((ny, nx), 1.38e-4, dtype=np.float64)
+    sstatic = {
+        "lat_deg": np.full((ny, nx), 74.0, dtype=np.float32),
+        "lon_deg": np.full((ny, nx), 10.0, dtype=np.float32),
+        "lsm": np.zeros((ny, nx), dtype=np.float32),
+        "lake_mask": np.zeros((ny, nx), dtype=np.float32),
+        "soil_type": np.zeros((ny, nx), dtype=np.float32),
+        "bathy_depth_m": np.full((ny, nx), 150.0, dtype=np.float32),
+        "z0m_base": np.full((ny, nx), 1e-4, dtype=np.float32),
+        "albedo_base": np.full((ny, nx), 0.06, dtype=np.float32),
+        "veg_frac": np.zeros((ny, nx), dtype=np.float32),
+    }
+
+    def _run_case(sic: float) -> Dict[str, np.ndarray]:
+        solver = NonHydrostaticGPUSolver(
+            vgrid, 10_000.0, 10_000.0, hs, msf=msf, f_cor=fcor, has_moist=True,
+            bc_x=0, bc_y=0, use_coriolis=True, max_vram_bytes=2 * 1024**3,
+        )
+        try:
+            solver.set_surface_static(sstatic)
+            solver.set_physics_config(rad_interval_s=0.0, julian_day=172.0, utc_seconds=43200.0)
+            st = solver.empty_state()
+            st["u"][:] = 8.0
+            st["qv"][:] = 0.0012
+            st["theta_p"][:] = -30.0 # ~258 K cold Arctic air mass
+            surf = {
+                "t_skin": np.full((ny, nx), 271.5, dtype=np.float32),
+                "soil_t": np.full((4, ny, nx), 271.5, dtype=np.float32),
+                "soil_m": np.full((4, ny, nx), 0.25, dtype=np.float32),
+                "sst_bulk": np.full((ny, nx), 271.5, dtype=np.float32),
+                "sea_ice_frac": np.full((ny, nx), sic, dtype=np.float32),
+                "sea_ice_thick": np.full((ny, nx), 1.4 if sic > 0 else 0.0, dtype=np.float32),
+                "sea_ice_tsfc": np.full((ny, nx), 260.0, dtype=np.float32),
+                "sea_ice_albedo": np.full((ny, nx), 0.78, dtype=np.float32),
+            }
+            solver.upload_state(st)
+            solver.upload_surface(surf)
+            for _ in range(3):
+                solver.step_physics(dt_s=30.0)
+            return solver.download_surface()
+        finally:
+            solver.close()
+
+    surf_open = _run_case(0.0)
+    surf_ice = _run_case(0.85)
+    assert float(np.mean(surf_open["shf"])) > float(np.mean(surf_ice["shf"])) + 10.0
+    assert float(np.mean(surf_open["t_skin"])) > float(np.mean(surf_ice["t_skin"])) + 5.0
+
+
+def test_ocean_si3_wx1_restart_bit_exact_roundtrip(tmp_path: Path) -> None:
+    """NEMO+SI3 WX-1 lossless zstd_shuffle checkpoint reads back bit-exact and resumes identically."""
+    spec = _make_regional_ocean_spec(ny=10, nx=10, dx_m=20_000.0, lat0=72.0)
+    sstatic = {
+        "lat_deg": spec.lat2d.astype(np.float32),
+        "lon_deg": spec.lon2d.astype(np.float32),
+        "lsm": np.zeros((spec.ny, spec.nx), dtype=np.float32),
+        "lake_mask": np.zeros((spec.ny, spec.nx), dtype=np.float32),
+        "bathy_depth_m": np.full((spec.ny, spec.nx), 200.0, dtype=np.float32),
+    }
+    forcing = {
+        "u10m": np.full((spec.ny, spec.nx), 6.0, dtype=np.float32),
+        "v10m": np.full((spec.ny, spec.nx), -3.0, dtype=np.float32),
+        "t2m": np.full((spec.ny, spec.nx), 268.0, dtype=np.float32),
+        "q2m": np.full((spec.ny, spec.nx), 0.002, dtype=np.float32),
+        "mslp": np.full((spec.ny, spec.nx), 100_800.0, dtype=np.float32),
+        "sw_down": np.full((spec.ny, spec.nx), 80.0, dtype=np.float32),
+        "lw_down": np.full((spec.ny, spec.nx), 230.0, dtype=np.float32),
+        "precip_liq": np.zeros((spec.ny, spec.nx), dtype=np.float32),
+        "precip_ice": np.full((spec.ny, spec.nx), 1e-5, dtype=np.float32),
+        "cld_fra": np.full((spec.ny, spec.nx), 0.6, dtype=np.float32),
+    }
+    rst_p = tmp_path / "ocean_si3_restart.wx1"
+    valid_dt = datetime.datetime(2026, 11, 21, 6, 0, tzinfo=datetime.timezone.utc)
+
+    with NemoSi3GPUSolver(spec, sstatic, nz=8) as s1:
+        st0 = s1.init_from_atmosphere_and_osisaf({
+            "sst_bulk": np.full((spec.ny, spec.nx), 271.5, dtype=np.float32),
+            "sea_ice_frac": np.full((spec.ny, spec.nx), 0.70, dtype=np.float32),
+            "sea_ice_thick": np.full((spec.ny, spec.nx), 1.10, dtype=np.float32),
+            "sea_ice_tsfc": np.full((spec.ny, spec.nx), 266.0, dtype=np.float32),
+        })
+        s1.upload_state(st0)
+        s1.step(forcing, dt_s=300.0)
+        st_mid = s1.download_state()
+        s1.save_restart_wx1(rst_p, valid_dt, st_mid, sim_time_sec=300.0)
+        s1.step(forcing, dt_s=300.0)
+        st_cont = s1.download_state()
+
+    st_loaded, meta = NemoSi3GPUSolver.load_restart_wx1(rst_p)
+    assert meta["kind"] == "tempest_v2_ocean_si3_restart"
+    for k, arr in st_mid.items():
+        np.testing.assert_array_equal(st_loaded[k], arr)
+
+    with NemoSi3GPUSolver(spec, sstatic, nz=8) as s2:
+        s2.upload_state(st_loaded)
+        s2.step(forcing, dt_s=300.0)
+        st_resumed = s2.download_state()
+
+    for k in ("temp_k", "sal_psu", "ssh", "a_i", "v_i", "ice_frac", "ice_thick"):
+        np.testing.assert_array_equal(st_resumed[k], st_cont[k])

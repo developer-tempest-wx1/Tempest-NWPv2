@@ -390,6 +390,8 @@ def _empty_surface_state_for_spec(spec: DomainSpec) -> Dict[str, np.ndarray]:
     out["lake_tbot"].fill(281.0)
     out["lake_hmld"].fill(2.5)
     out["lake_ctheta"].fill(0.65)
+    out["sea_ice_tsfc"].fill(271.35)
+    out["sea_ice_albedo"].fill(0.64)
     return out
 
 

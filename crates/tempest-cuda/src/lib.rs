@@ -150,6 +150,10 @@ pub struct NhSurfaceStatePtrs {
     pub q2m: *mut f32,
     pub u10m: *mut f32,
     pub v10m: *mut f32,
+    pub sea_ice_frac: *mut f32,
+    pub sea_ice_thick: *mut f32,
+    pub sea_ice_tsfc: *mut f32,
+    pub sea_ice_albedo: *mut f32,
 }
 
 #[repr(C)]
@@ -178,6 +182,10 @@ pub struct NhConstSurfaceStatePtrs {
     pub q2m: *const f32,
     pub u10m: *const f32,
     pub v10m: *const f32,
+    pub sea_ice_frac: *const f32,
+    pub sea_ice_thick: *const f32,
+    pub sea_ice_tsfc: *const f32,
+    pub sea_ice_albedo: *const f32,
 }
 
 #[repr(C)]
@@ -234,6 +242,14 @@ unsafe extern "C" {
         handle: *mut NhCudaHandle,
         src: *const NhConstSurfaceStatePtrs,
     ) -> c_int;
+    pub fn nh_ocean_si3_estimate_vram_bytes(
+        nz: i32,
+        ny: i32,
+        nx: i32,
+        enable_si3: i32,
+    ) -> u64;
+    pub fn nh_ocean_si3_teos10_rho(ct_c: f64, sa_psu: f64, depth_m: f64) -> f64;
+    pub fn nh_ocean_si3_freezing_temp_c(sa_psu: f64, depth_m: f64) -> f64;
     pub fn nh_cuda_download_surface(
         handle: *mut NhCudaHandle,
         dst: *const NhSurfaceStatePtrs,
@@ -680,5 +696,21 @@ mod tests {
         assert!(thp.iter().all(|x| x.is_finite()));
         assert!(qv.iter().all(|x| x.is_finite() && *x >= 0.0));
         assert!(u.iter().all(|x| x.is_finite()));
+    }
+
+    #[test]
+    fn nemo_teos10_eos_and_freezing_point_reference() {
+        let rho_surf = unsafe { nh_ocean_si3_teos10_rho(10.0, 35.16504, 0.0) };
+        let rho_deep = unsafe { nh_ocean_si3_teos10_rho(3.0, 35.5, 3000.0) };
+        let tf_surf = unsafe { nh_ocean_si3_freezing_temp_c(35.0, 0.0) };
+        let tf_deep = unsafe { nh_ocean_si3_freezing_temp_c(35.0, 500.0) };
+        let vram_d1 = unsafe { nh_ocean_si3_estimate_vram_bytes(16, 721, 1440, 1) };
+
+        assert!((rho_surf - 1026.95).abs() < 0.25, "rho_surf={rho_surf}");
+        // Exact NEMO 5.0.2 eosbn2.F90 line 224 checkvalue: 1028.21993233072 kg/m^3
+        assert!((rho_deep - 1028.21993233072).abs() < 1e-10, "rho_deep={rho_deep}");
+        assert!((tf_surf + 1.91).abs() < 0.05, "tf_surf={tf_surf}");
+        assert!((tf_deep - (tf_surf - 0.3765)).abs() < 0.01, "tf_deep={tf_deep}");
+        assert!(vram_d1 < 1_300_000_000, "vram_d1={vram_d1}");
     }
 }

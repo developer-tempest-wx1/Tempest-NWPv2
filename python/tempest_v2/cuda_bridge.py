@@ -119,6 +119,10 @@ class NhSurfaceStatePtrsC(ctypes.Structure):
         ("q2m", ctypes.c_void_p),
         ("u10m", ctypes.c_void_p),
         ("v10m", ctypes.c_void_p),
+        ("sea_ice_frac", ctypes.c_void_p),
+        ("sea_ice_thick", ctypes.c_void_p),
+        ("sea_ice_tsfc", ctypes.c_void_p),
+        ("sea_ice_albedo", ctypes.c_void_p),
     ]
 
 
@@ -412,6 +416,10 @@ class NonHydrostaticGPUSolver:
         "q2m",
         "u10m",
         "v10m",
+        "sea_ice_frac",
+        "sea_ice_thick",
+        "sea_ice_tsfc",
+        "sea_ice_albedo",
     )
     SURFACE_STATE_STRUCT_ORDER = (
         "t_skin",
@@ -438,6 +446,10 @@ class NonHydrostaticGPUSolver:
         "q2m",
         "u10m",
         "v10m",
+        "sea_ice_frac",
+        "sea_ice_thick",
+        "sea_ice_tsfc",
+        "sea_ice_albedo",
     )
 
     def __init__(

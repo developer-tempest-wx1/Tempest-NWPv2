@@ -343,6 +343,7 @@ __global__ void nh_radiation_ecrad_kernel(
     const float* lat_deg, const float* lon_deg, const float* lsm,
     const float* albedo_base, const float* snow_swe, const float* lake_mask, const float* lake_hice,
     const float* t_skin,
+    const float* sea_ice_frac, const float* sea_ice_tsfc, const float* sea_ice_albedo,
     float* rad_dth_dt, float* sw_down_out, float* lw_down_out,
     float* scratch_f, double* tri_c, double* tri_d
 ) {
@@ -363,6 +364,8 @@ __global__ void nh_radiation_ecrad_kernel(
     const float snow_v = snow_swe ? snow_swe[col] : 0.0f;
     const float lake_v = lake_mask ? lake_mask[col] : 0.0f;
     const float hice_v = lake_hice ? lake_hice[col] : 0.0f;
+    const float sic_v = (lsm_v < 0.5f && lake_v < 0.5f && sea_ice_frac)
+                      ? fminf(1.0f, fmaxf(0.0f, sea_ice_frac[col])) : 0.0f;
     const float alb0 = albedo_base ? albedo_base[col] : ((lsm_v >= 0.5f) ? 0.20f : 0.06f);
     const float n_drop = static_cast<float>((lsm_v >= 0.5f) ? pcfg.cloud_num_land : pcfg.cloud_num_sea);
     const float co2_ppm = static_cast<float>(pcfg.co2_ppm);
@@ -373,9 +376,20 @@ __global__ void nh_radiation_ecrad_kernel(
         alb_sfc = (1.0f - sf) * alb0 + sf * 0.72f;
     } else if (lsm_v < 0.5f && lake_v >= 0.5f && hice_v > 1e-4f) {
         alb_sfc = 0.55f;
+    } else if (sic_v > 1e-4f) {
+        const float alb_i = sea_ice_albedo ? fminf(0.90f, fmaxf(0.15f, sea_ice_albedo[col])) : 0.64f;
+        alb_sfc = (1.0f - sic_v) * alb0 + sic_v * alb_i;
     }
-    const float emis_sfc = (lsm_v >= 0.5f) ? ((snow_v > 1.0f) ? 0.985f : 0.96f) : 0.97f;
+    float emis_sfc = (lsm_v >= 0.5f) ? ((snow_v > 1.0f) ? 0.985f : 0.96f) : 0.97f;
     const float t_sk = t_skin ? fminf(fmaxf(t_skin[col], 180.0f), 340.0f) : 285.0f;
+    float t_rad_sk = t_sk;
+    if (sic_v > 1e-4f) {
+        emis_sfc = (1.0f - sic_v) * 0.97f + sic_v * 0.985f;
+        const float t_ice = sea_ice_tsfc ? fminf(273.15f, fmaxf(180.0f, sea_ice_tsfc[col])) : 268.0f;
+        const float t_o4 = t_sk * t_sk * t_sk * t_sk;
+        const float t_i4 = t_ice * t_ice * t_ice * t_ice;
+        t_rad_sk = powf((1.0f - sic_v) * t_o4 + sic_v * t_i4, 0.25f);
+    }
 
     for (int32_t k = 0; k < nz; ++k) {
         rad_dth_dt[static_cast<size_t>(k) * str3 + col] = 0.0f;
@@ -485,9 +499,9 @@ __global__ void nh_radiation_ecrad_kernel(
     float lw_dn_sfc = 0.0f;
     for (int b = 0; b < 3; ++b) {
         tri_c[col] = static_cast<double>(1.0f - emis_sfc);
-        tri_d[col] = static_cast<double>(emis_sfc * lw_band_planck_flux(b, t_sk));
+        tri_d[col] = static_cast<double>(emis_sfc * lw_band_planck_flux(b, t_rad_sk));
 
-        float t_prev = t_sk;
+        float t_prev = t_rad_sk;
         float z_c, dz_c, thb_c, pib_c, th_c, pi_c, t_c, p_c, rho_c;
         eval_cell_thermo(cfg, g, 0, col, hs, pi_sfc_f, thp, pip, qv, qc, qr, qi, qs, qg,
                          z_c, dz_c, thb_c, pib_c, th_c, pi_c, t_c, p_c, rho_c);
@@ -733,6 +747,7 @@ __global__ void nh_surface_and_lsm_kernel(
     float* t_skin, float* soil_t, float* soil_m, float* snow_swe,
     float* sst_bulk, float* dt_cool, float* dt_warm,
     float* lake_tbot, float* lake_hmld, float* lake_ctheta, float* lake_hice,
+    const float* sea_ice_frac, const float* sea_ice_thick, const float* sea_ice_tsfc,
     float* shf, float* lhf, float* ustar, float* t2m, float* q2m, float* u10m, float* v10m,
     float* sfc_drag_coeff
 ) {
@@ -1041,6 +1056,38 @@ __global__ void nh_surface_and_lsm_kernel(
         t_sk_new = fminf(315.0f, fmaxf(271.15f, sst_b + d_cool + d_warm));
         if (dt_cool) dt_cool[col] = d_cool;
         if (dt_warm) dt_warm[col] = d_warm;
+
+        // Fractional SI3 sea-ice mosaic over ocean: blend COARE open-ocean fluxes with snow/ice M-O
+        const float sic_v = sea_ice_frac ? fminf(1.0f, fmaxf(0.0f, sea_ice_frac[col])) : 0.0f;
+        (void)sea_ice_thick;
+        if (sic_v > 1e-4f) {
+            const float t_ice = sea_ice_tsfc ? fminf(273.15f, fmaxf(190.0f, sea_ice_tsfc[col])) : 268.0f;
+            const float th_ice = t_ice / pi_s;
+            const float q_ice_sat = qsat_from_es(es_ice(t_ice), p_s);
+            const float z0m_ice = 0.001f;
+            const float z0h_ice = 0.0002f;
+            float ustar_ice = 0.05f, zol_ice = 0.0f, cm_ice = 1e-3f, ch_ice = 1e-3f;
+            solve_mo_sfclayrev(
+                za, wspd_eff,
+                th_a * (1.0f + 0.608f * qv_a),
+                th_ice * (1.0f + 0.608f * q_ice_sat),
+                z0m_ice, z0h_ice, ustar_ice, zol_ice, cm_ice, ch_ice
+            );
+            const float h_ice = rho_a * CP_D_F * ch_ice * wspd_eff * (th_ice - th_a);
+            const float le_ice = rho_a * 2.834e6f * ch_ice * wspd_eff * (q_ice_sat - qv_a);
+            const float open_f = 1.0f - sic_v;
+            h_flux = open_f * h_flux + sic_v * h_ice;
+            le_flux = open_f * le_flux + sic_v * le_ice;
+            q_sk_eff = open_f * q_sk_eff + sic_v * q_ice_sat;
+            t_sk_new = open_f * t_sk_new + sic_v * t_ice;
+            ustar_v = open_f * ustar_v + sic_v * ustar_ice;
+            cm_v = open_f * cm_v + sic_v * cm_ice;
+            ch_v = open_f * ch_v + sic_v * ch_ice;
+            z0m_v = open_f * z0m_v + sic_v * z0m_ice;
+            z0h_v = open_f * z0h_v + sic_v * z0h_ice;
+            zol_v = open_f * zol_v + sic_v * zol_ice;
+            wspd_drag = open_f * wspd_drag + sic_v * wspd_eff;
+        }
     }
 
     if (t_skin) t_skin[col] = t_sk_new;
@@ -1858,7 +1905,8 @@ __global__ void nh_init_default_surface_kernel(
     float* lat_deg, float* lon_deg, float* lsm, float* lake_mask, float* soil_type,
     float* bathy_depth_m, float* z0m_base, float* albedo_base, float* veg_frac,
     float* t_skin, float* soil_t, float* soil_m, float* sst_bulk,
-    float* lake_tbot, float* lake_hmld, float* lake_ctheta
+    float* lake_tbot, float* lake_hmld, float* lake_ctheta,
+    float* sea_ice_frac, float* sea_ice_thick, float* sea_ice_tsfc, float* sea_ice_albedo
 ) {
     const size_t col = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
     if (col >= n2) return;
@@ -1880,6 +1928,10 @@ __global__ void nh_init_default_surface_kernel(
     lake_tbot[col] = 281.0f;
     lake_hmld[col] = 2.5f;
     lake_ctheta[col] = 0.65f;
+    if (sea_ice_frac) sea_ice_frac[col] = 0.0f;
+    if (sea_ice_thick) sea_ice_thick[col] = 0.0f;
+    if (sea_ice_tsfc) sea_ice_tsfc[col] = 271.35f;
+    if (sea_ice_albedo) sea_ice_albedo[col] = 0.64f;
 }
 
 int32_t ensure_physics_buffers(NhCudaHandle* h) {
@@ -1931,6 +1983,10 @@ int32_t ensure_physics_buffers(NhCudaHandle* h) {
     NH_CUDA_CHECK(alloc_z(&h->d_q2m, n2));
     NH_CUDA_CHECK(alloc_z(&h->d_u10m, n2));
     NH_CUDA_CHECK(alloc_z(&h->d_v10m, n2));
+    NH_CUDA_CHECK(alloc_z(&h->d_sea_ice_frac, n2));
+    NH_CUDA_CHECK(alloc_z(&h->d_sea_ice_thick, n2));
+    NH_CUDA_CHECK(alloc_z(&h->d_sea_ice_tsfc, n2));
+    NH_CUDA_CHECK(alloc_z(&h->d_sea_ice_albedo, n2));
     NH_CUDA_CHECK(alloc_z(&h->d_precip_liq_rate, n2));
     NH_CUDA_CHECK(alloc_z(&h->d_precip_ice_rate, n2));
     NH_CUDA_CHECK(alloc_z(&h->d_sfc_drag_coeff, n2));
@@ -1941,7 +1997,8 @@ int32_t ensure_physics_buffers(NhCudaHandle* h) {
         n2, h->d_lat_deg, h->d_lon_deg, h->d_lsm, h->d_lake_mask, h->d_soil_type,
         h->d_bathy_depth_m, h->d_z0m_base, h->d_albedo_base, h->d_veg_frac,
         h->d_t_skin, h->d_soil_t, h->d_soil_m, h->d_sst_bulk,
-        h->d_lake_tbot, h->d_lake_hmld, h->d_lake_ctheta
+        h->d_lake_tbot, h->d_lake_hmld, h->d_lake_ctheta,
+        h->d_sea_ice_frac, h->d_sea_ice_thick, h->d_sea_ice_tsfc, h->d_sea_ice_albedo
     );
     NH_CUDA_CHECK(cudaGetLastError());
 
@@ -1971,6 +2028,7 @@ void nh_physics_free_buffers(NhCudaHandle* h) {
     cf(h->d_rain_acc); cf(h->d_snow_acc); cf(h->d_graupel_acc);
     cf(h->d_sw_down); cf(h->d_lw_down); cf(h->d_shf); cf(h->d_lhf);
     cf(h->d_ustar); cf(h->d_pblh); cf(h->d_t2m); cf(h->d_q2m); cf(h->d_u10m); cf(h->d_v10m);
+    cf(h->d_sea_ice_frac); cf(h->d_sea_ice_thick); cf(h->d_sea_ice_tsfc); cf(h->d_sea_ice_albedo);
     cf(h->d_precip_liq_rate); cf(h->d_precip_ice_rate); cf(h->d_sfc_drag_coeff);
     h->has_physics_alloc = 0;
     h->rad_initialized = 0;
@@ -2055,6 +2113,18 @@ int32_t nh_cuda_upload_surface(NhCudaHandle* h, const NhConstSurfaceStatePtrs* s
     if (cp(h->d_q2m, src->q2m, n2) != 0) return -1;
     if (cp(h->d_u10m, src->u10m, n2) != 0) return -1;
     if (cp(h->d_v10m, src->v10m, n2) != 0) return -1;
+    if (src->sea_ice_frac) {
+        if (cp(h->d_sea_ice_frac, src->sea_ice_frac, n2) != 0) return -1;
+    } else {
+        NH_CUDA_CHECK(cudaMemset(h->d_sea_ice_frac, 0, n2 * sizeof(float)));
+    }
+    if (src->sea_ice_thick) {
+        if (cp(h->d_sea_ice_thick, src->sea_ice_thick, n2) != 0) return -1;
+    } else {
+        NH_CUDA_CHECK(cudaMemset(h->d_sea_ice_thick, 0, n2 * sizeof(float)));
+    }
+    if (cp(h->d_sea_ice_tsfc, src->sea_ice_tsfc, n2) != 0) return -1;
+    if (cp(h->d_sea_ice_albedo, src->sea_ice_albedo, n2) != 0) return -1;
     return 0;
 }
 
@@ -2097,6 +2167,10 @@ int32_t nh_cuda_download_surface(NhCudaHandle* h, const NhSurfaceStatePtrs* dst)
     if (cp(dst->q2m, h->d_q2m, n2) != 0) return -1;
     if (cp(dst->u10m, h->d_u10m, n2) != 0) return -1;
     if (cp(dst->v10m, h->d_v10m, n2) != 0) return -1;
+    if (cp(dst->sea_ice_frac, h->d_sea_ice_frac, n2) != 0) return -1;
+    if (cp(dst->sea_ice_thick, h->d_sea_ice_thick, n2) != 0) return -1;
+    if (cp(dst->sea_ice_tsfc, h->d_sea_ice_tsfc, n2) != 0) return -1;
+    if (cp(dst->sea_ice_albedo, h->d_sea_ice_albedo, n2) != 0) return -1;
     return 0;
 }
 
@@ -2125,6 +2199,7 @@ int32_t nh_cuda_step_physics(NhCudaHandle* h, double dt_s) {
                 h->d_thp, h->d_pip, h->d_qv, h->d_qc, h->d_qr, h->d_qi, h->d_qs, h->d_qg,
                 h->d_lat_deg, h->d_lon_deg, h->d_lsm, h->d_albedo_base, h->d_snow_swe,
                 h->d_lake_mask, h->d_lake_hice, h->d_t_skin,
+                h->d_sea_ice_frac, h->d_sea_ice_tsfc, h->d_sea_ice_albedo,
                 h->d_rad_dth_dt, h->d_sw_down, h->d_lw_down,
                 h->d_div, h->d_tri_c, h->d_tri_d
             );
@@ -2137,7 +2212,7 @@ int32_t nh_cuda_step_physics(NhCudaHandle* h, double dt_s) {
         NH_CUDA_CHECK(cudaGetLastError());
     }
 
-    // 2. Surface Layer, Land LSM, Ocean COARE 3.6 + Skin, FLake
+    // 2. Surface Layer, Land LSM, Ocean COARE 3.6 + Skin + SI3 Sea-Ice Mosaic, FLake
     if (h->pcfg.enable_surface) {
         nh_surface_and_lsm_kernel<<<grid, block>>>(
             h->cfg, h->pcfg, g, dt_s,
@@ -2149,6 +2224,7 @@ int32_t nh_cuda_step_physics(NhCudaHandle* h, double dt_s) {
             h->d_t_skin, h->d_soil_t, h->d_soil_m, h->d_snow_swe,
             h->d_sst_bulk, h->d_dt_cool, h->d_dt_warm,
             h->d_lake_tbot, h->d_lake_hmld, h->d_lake_ctheta, h->d_lake_hice,
+            h->d_sea_ice_frac, h->d_sea_ice_thick, h->d_sea_ice_tsfc,
             h->d_shf, h->d_lhf, h->d_ustar, h->d_t2m, h->d_q2m, h->d_u10m, h->d_v10m,
             h->d_sfc_drag_coeff
         );

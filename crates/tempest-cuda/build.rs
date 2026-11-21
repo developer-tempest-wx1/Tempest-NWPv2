@@ -51,6 +51,8 @@ fn compile_cu_obj(nvcc: &str, arch_flag: &str, cu_path: &Path, obj_path: &Path) 
 fn main() {
     println!("cargo:rerun-if-changed=src/cuda/nh_core.cu");
     println!("cargo:rerun-if-changed=src/cuda/nh_physics.cu");
+    println!("cargo:rerun-if-changed=src/cuda/nh_ocean_si3.cu");
+    println!("cargo:rerun-if-changed=src/cuda/nh_ocean_si3.h");
     println!("cargo:rerun-if-changed=src/cuda/nh_internal.cuh");
     println!("cargo:rerun-if-changed=src/cuda/nh_core.h");
     println!("cargo:rerun-if-env-changed=CUDA_HOME");
@@ -60,8 +62,10 @@ fn main() {
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
     let core_cu = manifest_dir.join("src/cuda/nh_core.cu");
     let phys_cu = manifest_dir.join("src/cuda/nh_physics.cu");
+    let oce_cu = manifest_dir.join("src/cuda/nh_ocean_si3.cu");
     let core_obj = out_dir.join("nh_core.o");
     let phys_obj = out_dir.join("nh_physics.o");
+    let oce_obj = out_dir.join("nh_ocean_si3.o");
     let static_lib_path = out_dir.join("libtempest_nh_cuda.a");
     let shared_lib_path = manifest_dir.join("libtempest_cuda.so");
 
@@ -70,17 +74,19 @@ fn main() {
     let arch = env::var("TEMPEST_CUDA_ARCH").unwrap_or_else(|_| "sm_86".to_string());
     let arch_flag = format!("-arch={arch}");
 
-    // 1. Compile both CUDA translation units cleanly.
+    // 1. Compile all CUDA translation units cleanly.
     compile_cu_obj(&nvcc, &arch_flag, &core_cu, &core_obj);
     compile_cu_obj(&nvcc, &arch_flag, &phys_cu, &phys_obj);
+    compile_cu_obj(&nvcc, &arch_flag, &oce_cu, &oce_obj);
 
-    // 2. Archive both objects into libtempest_nh_cuda.a.
+    // 2. Archive objects into libtempest_nh_cuda.a.
     let ar_status = Command::new("ar")
         .args([
             "rcs",
             static_lib_path.to_str().unwrap(),
             core_obj.to_str().unwrap(),
             phys_obj.to_str().unwrap(),
+            oce_obj.to_str().unwrap(),
         ])
         .status()
         .expect("Failed to execute ar for libtempest_nh_cuda.a");
@@ -100,6 +106,7 @@ fn main() {
             "-fPIC",
             core_cu.to_str().unwrap(),
             phys_cu.to_str().unwrap(),
+            oce_cu.to_str().unwrap(),
             "-o",
             shared_lib_path.to_str().unwrap(),
             &format!("-L{cuda_lib_dir}"),

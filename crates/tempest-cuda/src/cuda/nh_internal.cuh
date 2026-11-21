@@ -380,6 +380,7 @@ struct NhCudaHandle {
     float *d_rain_acc = nullptr, *d_snow_acc = nullptr, *d_graupel_acc = nullptr;
     float *d_sw_down = nullptr, *d_lw_down = nullptr, *d_shf = nullptr, *d_lhf = nullptr;
     float *d_ustar = nullptr, *d_pblh = nullptr, *d_t2m = nullptr, *d_q2m = nullptr, *d_u10m = nullptr, *d_v10m = nullptr;
+    float *d_sea_ice_frac = nullptr, *d_sea_ice_thick = nullptr, *d_sea_ice_tsfc = nullptr, *d_sea_ice_albedo = nullptr;
 
     // Transient intra-step physics coupling buffers [ny, nx]
     float *d_precip_liq_rate = nullptr, *d_precip_ice_rate = nullptr;
