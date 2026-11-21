@@ -905,3 +905,171 @@ def verify_against_stations(
             "wind_rmse_ms": wr,
         }
     return out
+
+
+def compute_fair_crps(ensemble_values: np.ndarray, obs_value: np.ndarray | float) -> float:
+    """Compute Ferro (2014) fair Continuous Ranked Probability Score across ensemble samples."""
+    ens = np.asarray(ensemble_values, dtype=np.float64)
+    if ens.ndim == 1:
+        ens = ens[:, None]
+    if ens.ndim != 2:
+        raise ValueError(f"Expected 1D or 2D ensemble array, got shape {ens.shape}")
+    obs = np.broadcast_to(np.asarray(obs_value, dtype=np.float64), (ens.shape[1],))
+
+    scores = []
+    for n in range(ens.shape[1]):
+        y = obs[n]
+        if not np.isfinite(y):
+            continue
+        x = ens[:, n]
+        x = x[np.isfinite(x)]
+        m = x.size
+        if m == 0:
+            continue
+        term1 = float(np.mean(np.abs(x - y)))
+        if m == 1:
+            scores.append(term1)
+            continue
+        x_sorted = np.sort(x)
+        weights = (2.0 * np.arange(m, dtype=np.float64) - float(m) + 1.0)
+        term2 = float(np.dot(weights, x_sorted)) / float(m * (m - 1))
+        scores.append(term1 - term2)
+    return float(np.mean(scores)) if scores else float("nan")
+
+
+def compute_brier_score(prob: np.ndarray, obs_event: np.ndarray) -> float:
+    """Compute Brier score E[(p - o)^2] for probabilistic event forecasts vs binary obs."""
+    p = np.asarray(prob, dtype=np.float64)
+    o = np.asarray(obs_event, dtype=np.float64)
+    valid = np.isfinite(p) & np.isfinite(o)
+    if not np.any(valid):
+        return float("nan")
+    return float(np.mean((p[valid] - o[valid]) ** 2))
+
+
+def verify_ensemble_against_stations(
+    ens_dir: Path | str,
+    lead_hour: float,
+    spec: DomainSpec,
+    stations: Sequence[Any],
+    *,
+    hs_m: Optional[np.ndarray] = None,
+) -> Dict[str, Any]:
+    """Evaluate fair CRPS, ensemble spread-skill ratio, CF RMSE, and Brier frost score."""
+    ens_root = Path(ens_dir)
+    if not ens_root.exists():
+        raise FileNotFoundError(f"Ensemble directory not found: {ens_root}")
+
+    tag = f"{int(round(lead_hour)):03d}" if abs(lead_hour - round(lead_hour)) < 1e-4 else f"{lead_hour:06.2f}"
+    expected_name = f"forecast_{spec.name}_T+{tag}h.wx1"
+
+    member_dirs: List[Path] = []
+    cf_dir = ens_root / "cf"
+    if cf_dir.is_dir():
+        member_dirs.append(cf_dir)
+    pf_dirs = sorted(
+        d for d in ens_root.iterdir()
+        if d.is_dir() and d.name.startswith("pf") and d.name[2:].isdigit()
+    )
+    member_dirs.extend(pf_dirs)
+
+    member_files: List[Path] = []
+    for d in member_dirs:
+        cand = d / expected_name
+        if cand.exists():
+            member_files.append(cand)
+        else:
+            matches = sorted(d.glob(f"*T+{tag}h.wx1"))
+            if matches:
+                member_files.append(matches[0])
+
+    if not member_files or not stations:
+        return {
+            "n_members": len(member_files),
+            "n_stations": 0,
+            "lead_hour": float(lead_hour),
+            "t2m_crps_k": float("nan"),
+            "t2m_ens_mean_rmse_k": float("nan"),
+            "t2m_cf_rmse_k": float("nan"),
+            "t2m_spread_k": float("nan"),
+            "t2m_spread_skill_ratio": float("nan"),
+            "mslp_crps_hpa": float("nan"),
+            "wind10m_crps_ms": float("nan"),
+            "brier_frost": float("nan"),
+        }
+
+    def _row_val(r: Any, key: str, default: float = float("nan")) -> float:
+        if isinstance(r, dict):
+            return float(r.get(key, default))
+        return float(getattr(r, key, default))
+
+    x_pts = np.array([_row_val(r, "x_m") for r in stations], dtype=np.float64)
+    y_pts = np.array([_row_val(r, "y_m") for r in stations], dtype=np.float64)
+    elevs = np.array([_row_val(r, "elev_m", 0.0) for r in stations], dtype=np.float64)
+    obs_t2m = np.array([_row_val(r, "t2m_k") for r in stations], dtype=np.float64)
+    obs_mslp_hpa = np.array([_row_val(r, "mslp_pa") for r in stations], dtype=np.float64) / 100.0
+    obs_wspd = np.hypot(
+        np.array([_row_val(r, "u10_ms") for r in stations], dtype=np.float64),
+        np.array([_row_val(r, "v10_ms") for r in stations], dtype=np.float64),
+    )
+
+    hs_corr = (
+        0.0065 * (elevs - _bilinear_sample_2d(np.asarray(hs_m, dtype=np.float64), spec, x_pts, y_pts))
+        if hs_m is not None
+        else np.zeros_like(elevs)
+    )
+
+    m_cnt = len(member_files)
+    n_stn = len(stations)
+    mod_t2m = np.empty((m_cnt, n_stn), dtype=np.float64)
+    mod_mslp_hpa = np.empty((m_cnt, n_stn), dtype=np.float64)
+    mod_wspd = np.empty((m_cnt, n_stn), dtype=np.float64)
+
+    for m_idx, fp in enumerate(member_files):
+        with wx1.open_dataset(fp) as ds:
+            t2 = np.asarray(ds["t2m"].values, dtype=np.float64)
+            psl = np.asarray(ds["mslp"].values, dtype=np.float64) / 100.0
+            u10 = np.asarray(ds["u10m_geo"].values, dtype=np.float64)
+            v10 = np.asarray(ds["v10m_geo"].values, dtype=np.float64)
+        mod_t2m[m_idx] = _bilinear_sample_2d(t2, spec, x_pts, y_pts) - hs_corr
+        mod_mslp_hpa[m_idx] = _bilinear_sample_2d(psl, spec, x_pts, y_pts)
+        mod_wspd[m_idx] = np.hypot(
+            _bilinear_sample_2d(u10, spec, x_pts, y_pts),
+            _bilinear_sample_2d(v10, spec, x_pts, y_pts),
+        )
+
+    valid_t = np.isfinite(obs_t2m)
+    if np.any(valid_t):
+        t2m_crps_k = compute_fair_crps(mod_t2m[:, valid_t], obs_t2m[valid_t])
+        ens_mean_t = np.mean(mod_t2m[:, valid_t], axis=0)
+        t2m_ens_mean_rmse_k = float(np.sqrt(np.mean((ens_mean_t - obs_t2m[valid_t]) ** 2)))
+        t2m_cf_rmse_k = float(np.sqrt(np.mean((mod_t2m[0, valid_t] - obs_t2m[valid_t]) ** 2)))
+        t2m_spread_k = float(np.sqrt(np.mean(np.var(mod_t2m[:, valid_t], axis=0, ddof=1 if m_cnt > 1 else 0))))
+        t2m_spread_skill_ratio = t2m_spread_k / max(t2m_ens_mean_rmse_k, 1e-12)
+        p_frost = np.mean(mod_t2m[:, valid_t] < 273.15, axis=0)
+        o_frost = (obs_t2m[valid_t] < 273.15).astype(np.float64)
+        brier_frost = compute_brier_score(p_frost, o_frost)
+    else:
+        t2m_crps_k = float("nan")
+        t2m_ens_mean_rmse_k = float("nan")
+        t2m_cf_rmse_k = float("nan")
+        t2m_spread_k = float("nan")
+        t2m_spread_skill_ratio = float("nan")
+        brier_frost = float("nan")
+
+    mslp_crps_hpa = compute_fair_crps(mod_mslp_hpa, obs_mslp_hpa)
+    wind10m_crps_ms = compute_fair_crps(mod_wspd, obs_wspd)
+
+    return {
+        "n_members": m_cnt,
+        "n_stations": int(n_stn),
+        "lead_hour": float(lead_hour),
+        "t2m_crps_k": t2m_crps_k,
+        "t2m_ens_mean_rmse_k": t2m_ens_mean_rmse_k,
+        "t2m_cf_rmse_k": t2m_cf_rmse_k,
+        "t2m_spread_k": t2m_spread_k,
+        "t2m_spread_skill_ratio": t2m_spread_skill_ratio,
+        "mslp_crps_hpa": mslp_crps_hpa,
+        "wind10m_crps_ms": wind10m_crps_ms,
+        "brier_frost": brier_frost,
+    }

@@ -645,7 +645,64 @@ def run_two_nest_pipeline(
 
     all_cyc_restarts = [str(p) for p in (res_d2.get("cycle_restart_paths", []) + res_d3.get("cycle_restart_paths", []))]
     ens_summary: Optional[Dict[str, Any]] = None
-    _ = (ensemble_members, ensemble_lead_hours, ensemble_seed, ensemble_domain)
+    if int(ensemble_members) > 0:
+        from tempest_v2.ensemble import EnsembleConfig, run_ensemble_forecast
+
+        ens_hours = float(ensemble_lead_hours) if ensemble_lead_hours is not None else float(forecast_hours)
+        ens_sched = [hr for hr in sched if float(hr) <= ens_hours + 1e-6]
+        if ens_hours not in ens_sched:
+            ens_sched.append(ens_hours)
+            ens_sched = sorted(set(ens_sched))
+
+        def _extract_cf_map(paths: Sequence[Path], prefix: str) -> Dict[float, Path]:
+            cf_map: Dict[float, Path] = {}
+            for p in paths:
+                name = Path(p).name
+                if "_T+" in name and name.endswith("h.wx1"):
+                    try:
+                        hr_str = name.split("_T+")[1][:-5]
+                        cf_map[float(hr_str)] = Path(p)
+                    except ValueError:
+                        pass
+            return cf_map
+
+        is_d2_ens = ensemble_domain.strip().lower() == "d2"
+        spec_e = d2_spec if is_d2_ens else d3_spec
+        hs_e = hs_d2 if is_d2_ens else hs_d3
+        ss_e = ss_d2 if is_d2_ens else ss_d3
+        st_e = st_d2 if is_d2_ens else st_d3
+        sf_e = sf_d2 if is_d2_ens else sf_d3
+        dt_e = dt_d2_s if is_d2_ens else dt_d3_s
+        phys_e = max(1, physics_every // 2) if is_d2_ens else physics_every
+        lbc_e = None if is_d2_ens else lbc_interp
+        iau_e = None if is_d2_ens else iau_d3
+        cf_map = _extract_cf_map(
+            (res_d2 if is_d2_ens else res_d3).get("output_paths", []),
+            spec_e.name,
+        )
+        ens_cfg = EnsembleConfig(
+            n_members=int(ensemble_members),
+            seed=int(ensemble_seed) if ensemble_seed is not None else int(init_dt.strftime("%Y%m%d%H")),
+        )
+        ens_dir = layout["ensemble"] if layout is not None else (out_root / "ensemble")
+        ens_summary = run_ensemble_forecast(
+            spec_e,
+            hs_e,
+            ss_e,
+            st_e,
+            sf_e,
+            init_dt,
+            forecast_hours=ens_hours,
+            ens_dir=ens_dir,
+            cfg=ens_cfg,
+            dt_s=dt_e,
+            physics_every=phys_e,
+            lbc_interpolator=lbc_e,
+            base_iau_forcing=iau_e,
+            base_iau_duration_s=900.0 if iau_e is not None else 0.0,
+            output_hours=ens_sched,
+            existing_cf_outputs=cf_map if cf_map else None,
+        )
 
     if layout is not None and manifest_path is not None:
         manifest = {
