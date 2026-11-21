@@ -40,33 +40,45 @@ inline void set_error(const char* msg) {
         }                                                                       \
     } while (0)
 
-__device__ inline double weno5_left(double qm2, double qm1, double q0, double qp1, double qp2) {
-    constexpr double eps = 1e-18;
-    const double p0 = (1.0 / 3.0) * qm2 - (7.0 / 6.0) * qm1 + (11.0 / 6.0) * q0;
-    const double p1 = -(1.0 / 6.0) * qm1 + (5.0 / 6.0) * q0 + (1.0 / 3.0) * qp1;
-    const double p2 = (1.0 / 3.0) * q0 + (5.0 / 6.0) * qp1 - (1.0 / 6.0) * qp2;
+__device__ inline float weno5_left_f(float qm2, float qm1, float q0, float qp1, float qp2) {
+    constexpr float eps = 1e-12f;
+    const float p0 = (1.0f / 3.0f) * qm2 - (7.0f / 6.0f) * qm1 + (11.0f / 6.0f) * q0;
+    const float p1 = -(1.0f / 6.0f) * qm1 + (5.0f / 6.0f) * q0 + (1.0f / 3.0f) * qp1;
+    const float p2 = (1.0f / 3.0f) * q0 + (5.0f / 6.0f) * qp1 - (1.0f / 6.0f) * qp2;
 
-    const double s0a = qm2 - 2.0 * qm1 + q0;
-    const double s0b = qm2 - 4.0 * qm1 + 3.0 * q0;
-    const double b0 = (13.0 / 12.0) * s0a * s0a + 0.25 * s0b * s0b;
+    const float s0a = qm2 - 2.0f * qm1 + q0;
+    const float s0b = qm2 - 4.0f * qm1 + 3.0f * q0;
+    const float b0 = (13.0f / 12.0f) * s0a * s0a + 0.25f * s0b * s0b;
 
-    const double s1a = qm1 - 2.0 * q0 + qp1;
-    const double s1b = qm1 - qp1;
-    const double b1 = (13.0 / 12.0) * s1a * s1a + 0.25 * s1b * s1b;
+    const float s1a = qm1 - 2.0f * q0 + qp1;
+    const float s1b = qm1 - qp1;
+    const float b1 = (13.0f / 12.0f) * s1a * s1a + 0.25f * s1b * s1b;
 
-    const double s2a = q0 - 2.0 * qp1 + qp2;
-    const double s2b = 3.0 * q0 - 4.0 * qp1 + qp2;
-    const double b2 = (13.0 / 12.0) * s2a * s2a + 0.25 * s2b * s2b;
+    const float s2a = q0 - 2.0f * qp1 + qp2;
+    const float s2b = 3.0f * q0 - 4.0f * qp1 + qp2;
+    const float b2 = (13.0f / 12.0f) * s2a * s2a + 0.25f * s2b * s2b;
 
-    const double a0 = 0.1 / ((eps + b0) * (eps + b0));
-    const double a1 = 0.6 / ((eps + b1) * (eps + b1));
-    const double a2 = 0.3 / ((eps + b2) * (eps + b2));
-    const double inv_s = 1.0 / (a0 + a1 + a2);
+    const float d0 = eps + b0;
+    const float d1 = eps + b1;
+    const float d2 = eps + b2;
+    const float a0 = 0.1f / (d0 * d0);
+    const float a1 = 0.6f / (d1 * d1);
+    const float a2 = 0.3f / (d2 * d2);
+    const float inv_s = 1.0f / (a0 + a1 + a2);
     return (a0 * p0 + a1 * p1 + a2 * p2) * inv_s;
 }
 
-__device__ inline double up3_left(double qm1, double q0, double qp1) {
-    return (1.0 / 3.0) * qp1 + (5.0 / 6.0) * q0 - (1.0 / 6.0) * qm1;
+__device__ inline float up3_left_f(float qm1, float q0, float qp1) {
+    return (1.0f / 3.0f) * qp1 + (5.0f / 6.0f) * q0 - (1.0f / 6.0f) * qm1;
+}
+
+__device__ inline float koren_slope_f(float dl, float dr) {
+    if (dl * dr <= 0.0f) return 0.0f;
+    const float c = 0.5f * (dl + dr);
+    const float a = 2.0f * dl;
+    const float b = 2.0f * dr;
+    if (c > 0.0f) return fminf(c, fminf(a, b));
+    return fmaxf(c, fmaxf(a, b));
 }
 
 __device__ inline double koren_slope(double dl, double dr) {
@@ -122,8 +134,8 @@ __device__ inline double interp_pi_at_z(
     };
 
     auto hydro_slope = [&](size_t s_idx, double z_lvl) -> double {
-        double thb, pib, dthdz, rhob, cs2b, qvv, qhv;
-        eval_ref_state(z_lvl, cfg.theta_sfc_k, cfg.p_sfc_pa, cfg.n_ref_s, thb, pib, dthdz, rhob, cs2b);
+        double qvv, qhv;
+        const double thb = eval_theta_bar(z_lvl, cfg.theta_sfc_k, cfg.n_ref_s);
         const double vfac = moisture_load_scalar(cfg.has_moist, s_idx, qv, qc, qr, qi, qs, qg, qvv, qhv);
         const double th_tot = (thb + static_cast<double>(theta_p[s_idx])) * vfac;
         return (GRAVITY * (th_tot - thb)) / (CP_D * thb * fmax(th_tot, 50.0));
@@ -163,9 +175,9 @@ __device__ inline double interp_pi_at_z(
     return (1.0 - w) * static_cast<double>(pi_p[i0]) + w * static_cast<double>(pi_p[i1]);
 }
 
-__device__ inline double davies_weight(int32_t dist, int32_t rim_width, double tau_max) {
-    if (rim_width <= 0 || dist >= rim_width) return 0.0;
-    const double f = static_cast<double>(rim_width - dist) / static_cast<double>(rim_width);
+__device__ inline float davies_weight_f(int32_t dist, int32_t rim_width, float tau_max) {
+    if (rim_width <= 0 || dist >= rim_width) return 0.0f;
+    const float f = static_cast<float>(rim_width - dist) / static_cast<float>(rim_width);
     return tau_max * f * f;
 }
 
@@ -177,110 +189,116 @@ __device__ inline double sponge_tau(double z, double z_top, double depth, double
     return tau_max * s * s;
 }
 
-__device__ inline double horiz_face_val_x(
-    const float* f, int32_t k, int32_t j, int32_t i_face, double dir_u,
+__device__ inline float horiz_face_val_x_f(
+    const float* f, int32_t k, int32_t j, int32_t i_face, float dir_u,
     int32_t nz, int32_t ny, int32_t nx, int32_t bc_x, int32_t bc_y, int32_t adv_order
 ) {
     // Reconstruct scalar at x-face i_face - 1/2 (between i_face-1 and i_face).
-    if (dir_u >= 0.0) {
+    if (dir_u >= 0.0f) {
         if (adv_order >= 5) {
-            return weno5_left(
-                read_s(f, k, j, i_face - 3, nz, ny, nx, bc_x, bc_y),
-                read_s(f, k, j, i_face - 2, nz, ny, nx, bc_x, bc_y),
-                read_s(f, k, j, i_face - 1, nz, ny, nx, bc_x, bc_y),
-                read_s(f, k, j, i_face,     nz, ny, nx, bc_x, bc_y),
-                read_s(f, k, j, i_face + 1, nz, ny, nx, bc_x, bc_y)
+            return weno5_left_f(
+                read_s_f(f, k, j, i_face - 3, nz, ny, nx, bc_x, bc_y),
+                read_s_f(f, k, j, i_face - 2, nz, ny, nx, bc_x, bc_y),
+                read_s_f(f, k, j, i_face - 1, nz, ny, nx, bc_x, bc_y),
+                read_s_f(f, k, j, i_face,     nz, ny, nx, bc_x, bc_y),
+                read_s_f(f, k, j, i_face + 1, nz, ny, nx, bc_x, bc_y)
             );
         }
-        return up3_left(
-            read_s(f, k, j, i_face - 2, nz, ny, nx, bc_x, bc_y),
-            read_s(f, k, j, i_face - 1, nz, ny, nx, bc_x, bc_y),
-            read_s(f, k, j, i_face,     nz, ny, nx, bc_x, bc_y)
+        return up3_left_f(
+            read_s_f(f, k, j, i_face - 2, nz, ny, nx, bc_x, bc_y),
+            read_s_f(f, k, j, i_face - 1, nz, ny, nx, bc_x, bc_y),
+            read_s_f(f, k, j, i_face,     nz, ny, nx, bc_x, bc_y)
         );
     } else {
         if (adv_order >= 5) {
-            return weno5_left(
-                read_s(f, k, j, i_face + 2, nz, ny, nx, bc_x, bc_y),
-                read_s(f, k, j, i_face + 1, nz, ny, nx, bc_x, bc_y),
-                read_s(f, k, j, i_face,     nz, ny, nx, bc_x, bc_y),
-                read_s(f, k, j, i_face - 1, nz, ny, nx, bc_x, bc_y),
-                read_s(f, k, j, i_face - 2, nz, ny, nx, bc_x, bc_y)
+            return weno5_left_f(
+                read_s_f(f, k, j, i_face + 2, nz, ny, nx, bc_x, bc_y),
+                read_s_f(f, k, j, i_face + 1, nz, ny, nx, bc_x, bc_y),
+                read_s_f(f, k, j, i_face,     nz, ny, nx, bc_x, bc_y),
+                read_s_f(f, k, j, i_face - 1, nz, ny, nx, bc_x, bc_y),
+                read_s_f(f, k, j, i_face - 2, nz, ny, nx, bc_x, bc_y)
             );
         }
-        return up3_left(
-            read_s(f, k, j, i_face + 1, nz, ny, nx, bc_x, bc_y),
-            read_s(f, k, j, i_face,     nz, ny, nx, bc_x, bc_y),
-            read_s(f, k, j, i_face - 1, nz, ny, nx, bc_x, bc_y)
+        return up3_left_f(
+            read_s_f(f, k, j, i_face + 1, nz, ny, nx, bc_x, bc_y),
+            read_s_f(f, k, j, i_face,     nz, ny, nx, bc_x, bc_y),
+            read_s_f(f, k, j, i_face - 1, nz, ny, nx, bc_x, bc_y)
         );
     }
 }
 
-__device__ inline double horiz_face_val_y(
-    const float* f, int32_t k, int32_t j_face, int32_t i, double dir_v,
+__device__ inline float horiz_face_val_y_f(
+    const float* f, int32_t k, int32_t j_face, int32_t i, float dir_v,
     int32_t nz, int32_t ny, int32_t nx, int32_t bc_x, int32_t bc_y, int32_t adv_order
 ) {
-    if (dir_v >= 0.0) {
+    if (dir_v >= 0.0f) {
         if (adv_order >= 5) {
-            return weno5_left(
-                read_s(f, k, j_face - 3, i, nz, ny, nx, bc_x, bc_y),
-                read_s(f, k, j_face - 2, i, nz, ny, nx, bc_x, bc_y),
-                read_s(f, k, j_face - 1, i, nz, ny, nx, bc_x, bc_y),
-                read_s(f, k, j_face,     i, nz, ny, nx, bc_x, bc_y),
-                read_s(f, k, j_face + 1, i, nz, ny, nx, bc_x, bc_y)
+            return weno5_left_f(
+                read_s_f(f, k, j_face - 3, i, nz, ny, nx, bc_x, bc_y),
+                read_s_f(f, k, j_face - 2, i, nz, ny, nx, bc_x, bc_y),
+                read_s_f(f, k, j_face - 1, i, nz, ny, nx, bc_x, bc_y),
+                read_s_f(f, k, j_face,     i, nz, ny, nx, bc_x, bc_y),
+                read_s_f(f, k, j_face + 1, i, nz, ny, nx, bc_x, bc_y)
             );
         }
-        return up3_left(
-            read_s(f, k, j_face - 2, i, nz, ny, nx, bc_x, bc_y),
-            read_s(f, k, j_face - 1, i, nz, ny, nx, bc_x, bc_y),
-            read_s(f, k, j_face,     i, nz, ny, nx, bc_x, bc_y)
+        return up3_left_f(
+            read_s_f(f, k, j_face - 2, i, nz, ny, nx, bc_x, bc_y),
+            read_s_f(f, k, j_face - 1, i, nz, ny, nx, bc_x, bc_y),
+            read_s_f(f, k, j_face,     i, nz, ny, nx, bc_x, bc_y)
         );
     } else {
         if (adv_order >= 5) {
-            return weno5_left(
-                read_s(f, k, j_face + 2, i, nz, ny, nx, bc_x, bc_y),
-                read_s(f, k, j_face + 1, i, nz, ny, nx, bc_x, bc_y),
-                read_s(f, k, j_face,     i, nz, ny, nx, bc_x, bc_y),
-                read_s(f, k, j_face - 1, i, nz, ny, nx, bc_x, bc_y),
-                read_s(f, k, j_face - 2, i, nz, ny, nx, bc_x, bc_y)
+            return weno5_left_f(
+                read_s_f(f, k, j_face + 2, i, nz, ny, nx, bc_x, bc_y),
+                read_s_f(f, k, j_face + 1, i, nz, ny, nx, bc_x, bc_y),
+                read_s_f(f, k, j_face,     i, nz, ny, nx, bc_x, bc_y),
+                read_s_f(f, k, j_face - 1, i, nz, ny, nx, bc_x, bc_y),
+                read_s_f(f, k, j_face - 2, i, nz, ny, nx, bc_x, bc_y)
             );
         }
-        return up3_left(
-            read_s(f, k, j_face + 1, i, nz, ny, nx, bc_x, bc_y),
-            read_s(f, k, j_face,     i, nz, ny, nx, bc_x, bc_y),
-            read_s(f, k, j_face - 1, i, nz, ny, nx, bc_x, bc_y)
+        return up3_left_f(
+            read_s_f(f, k, j_face + 1, i, nz, ny, nx, bc_x, bc_y),
+            read_s_f(f, k, j_face,     i, nz, ny, nx, bc_x, bc_y),
+            read_s_f(f, k, j_face - 1, i, nz, ny, nx, bc_x, bc_y)
         );
     }
 }
 
-__device__ inline double vert_tvd_face_val(
-    const float* f, int32_t k_face, int32_t j, int32_t i, double dir_w,
+__device__ inline float vert_tvd_face_val_f(
+    const float* f, int32_t k_face, int32_t j, int32_t i, float dir_w,
     const double* dzeta, int32_t nz, int32_t ny, int32_t nx, int32_t bc_x, int32_t bc_y
 ) {
     // Reconstruct scalar onto interface k_face (between k_face-1 and k_face).
-    if (k_face <= 0) return read_s(f, 0, j, i, nz, ny, nx, bc_x, bc_y);
-    if (k_face >= nz) return read_s(f, nz - 1, j, i, nz, ny, nx, bc_x, bc_y);
-    if (dir_w >= 0.0) {
+    if (k_face <= 0) return read_s_f(f, 0, j, i, nz, ny, nx, bc_x, bc_y);
+    if (k_face >= nz) return read_s_f(f, nz - 1, j, i, nz, ny, nx, bc_x, bc_y);
+    if (dir_w >= 0.0f) {
         const int32_t km = k_face - 1;
-        const double vc = read_s(f, km, j, i, nz, ny, nx, bc_x, bc_y);
+        const float vc = read_s_f(f, km, j, i, nz, ny, nx, bc_x, bc_y);
         if (km == 0) return vc;
-        const double vm = read_s(f, km - 1, j, i, nz, ny, nx, bc_x, bc_y);
-        const double vp = read_s(f, km + 1, j, i, nz, ny, nx, bc_x, bc_y);
-        const double dl = (vc - vm) / (0.5 * (dzeta[km] + dzeta[km - 1]));
-        const double dr = (vp - vc) / (0.5 * (dzeta[km + 1] + dzeta[km]));
-        return vc + 0.5 * dzeta[km] * koren_slope(dl, dr);
+        const float vm = read_s_f(f, km - 1, j, i, nz, ny, nx, bc_x, bc_y);
+        const float vp = read_s_f(f, km + 1, j, i, nz, ny, nx, bc_x, bc_y);
+        const float dz_km = static_cast<float>(dzeta[km]);
+        const float dz_prev = static_cast<float>(dzeta[km - 1]);
+        const float dz_next = static_cast<float>(dzeta[km + 1]);
+        const float dl = (vc - vm) / (0.5f * (dz_km + dz_prev));
+        const float dr = (vp - vc) / (0.5f * (dz_next + dz_km));
+        return vc + 0.5f * dz_km * koren_slope_f(dl, dr);
     } else {
         const int32_t kp = k_face;
-        const double vc = read_s(f, kp, j, i, nz, ny, nx, bc_x, bc_y);
+        const float vc = read_s_f(f, kp, j, i, nz, ny, nx, bc_x, bc_y);
         if (kp == nz - 1) return vc;
-        const double vm = read_s(f, kp - 1, j, i, nz, ny, nx, bc_x, bc_y);
-        const double vp = read_s(f, kp + 1, j, i, nz, ny, nx, bc_x, bc_y);
-        const double dl = (vc - vm) / (0.5 * (dzeta[kp] + dzeta[kp - 1]));
-        const double dr = (vp - vc) / (0.5 * (dzeta[kp + 1] + dzeta[kp]));
-        return vc - 0.5 * dzeta[kp] * koren_slope(dl, dr);
+        const float vm = read_s_f(f, kp - 1, j, i, nz, ny, nx, bc_x, bc_y);
+        const float vp = read_s_f(f, kp + 1, j, i, nz, ny, nx, bc_x, bc_y);
+        const float dz_kp = static_cast<float>(dzeta[kp]);
+        const float dz_prev = static_cast<float>(dzeta[kp - 1]);
+        const float dz_next = static_cast<float>(dzeta[kp + 1]);
+        const float dl = (vc - vm) / (0.5f * (dz_kp + dz_prev));
+        const float dr = (vp - vc) / (0.5f * (dz_next + dz_kp));
+        return vc - 0.5f * dz_kp * koren_slope_f(dl, dr);
     }
 }
 
-__device__ inline void compute_contravariant_at_scalar_col(
+__device__ inline void compute_contravariant_at_scalar_col_f(
     const NhGridConfig& cfg,
     const DeviceStaticGrid& g,
     const float* u,
@@ -289,36 +307,38 @@ __device__ inline void compute_contravariant_at_scalar_col(
     int32_t k_iface,
     int32_t j,
     int32_t i,
-    double& gdotzeta_out
+    float& gdotzeta_out
 ) {
     if (k_iface <= 0 || k_iface >= cfg.nz) {
-        gdotzeta_out = 0.0;
+        gdotzeta_out = 0.0f;
         return;
     }
     const int32_t nz = cfg.nz, ny = cfg.ny, nx = cfg.nx;
-    const double msf = read_2d(g.msf, j, i, ny, nx, cfg.bc_x, cfg.bc_y);
-    const double dh_dx = (read_2d(g.hs, j, i + 1, ny, nx, cfg.bc_x, cfg.bc_y) -
-                          read_2d(g.hs, j, i - 1, ny, nx, cfg.bc_x, cfg.bc_y)) / (2.0 * cfg.dx_m);
-    const double dh_dy = (read_2d(g.hs, j + 1, i, ny, nx, cfg.bc_x, cfg.bc_y) -
-                          read_2d(g.hs, j - 1, i, ny, nx, cfg.bc_x, cfg.bc_y)) / (2.0 * cfg.dy_m);
+    const float msf = read_2d_f(g.msf, j, i, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float dx_f = static_cast<float>(cfg.dx_m);
+    const float dy_f = static_cast<float>(cfg.dy_m);
+    const float dh_dx = (read_2d_f(g.hs, j, i + 1, ny, nx, cfg.bc_x, cfg.bc_y) -
+                         read_2d_f(g.hs, j, i - 1, ny, nx, cfg.bc_x, cfg.bc_y)) / (2.0f * dx_f);
+    const float dh_dy = (read_2d_f(g.hs, j + 1, i, ny, nx, cfg.bc_x, cfg.bc_y) -
+                         read_2d_f(g.hs, j - 1, i, ny, nx, cfg.bc_x, cfg.bc_y)) / (2.0f * dy_f);
 
-    const double ds_k = g.dzeta[k_iface];
-    const double ds_km = g.dzeta[k_iface - 1];
-    const double wt = ds_km / (ds_k + ds_km);
+    const float ds_k = static_cast<float>(g.dzeta[k_iface]);
+    const float ds_km = static_cast<float>(g.dzeta[k_iface - 1]);
+    const float wt = ds_km / (ds_k + ds_km);
 
-    const double u_lo = 0.5 * (read_u(u, k_iface - 1, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y) +
-                               read_u(u, k_iface - 1, j, i + 1, nz, ny, nx, cfg.bc_x, cfg.bc_y));
-    const double u_hi = 0.5 * (read_u(u, k_iface, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y) +
-                               read_u(u, k_iface, j, i + 1, nz, ny, nx, cfg.bc_x, cfg.bc_y));
-    const double v_lo = 0.5 * (read_v(v, k_iface - 1, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y) +
-                               read_v(v, k_iface - 1, j + 1, i, nz, ny, nx, cfg.bc_x, cfg.bc_y));
-    const double v_hi = 0.5 * (read_v(v, k_iface, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y) +
-                               read_v(v, k_iface, j + 1, i, nz, ny, nx, cfg.bc_x, cfg.bc_y));
+    const float u_lo = 0.5f * (read_u_f(u, k_iface - 1, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y) +
+                               read_u_f(u, k_iface - 1, j, i + 1, nz, ny, nx, cfg.bc_x, cfg.bc_y));
+    const float u_hi = 0.5f * (read_u_f(u, k_iface, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y) +
+                               read_u_f(u, k_iface, j, i + 1, nz, ny, nx, cfg.bc_x, cfg.bc_y));
+    const float v_lo = 0.5f * (read_v_f(v, k_iface - 1, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y) +
+                               read_v_f(v, k_iface - 1, j + 1, i, nz, ny, nx, cfg.bc_x, cfg.bc_y));
+    const float v_hi = 0.5f * (read_v_f(v, k_iface, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y) +
+                               read_v_f(v, k_iface, j + 1, i, nz, ny, nx, cfg.bc_x, cfg.bc_y));
 
-    const double u_w = (1.0 - wt) * u_lo + wt * u_hi;
-    const double v_w = (1.0 - wt) * v_lo + wt * v_hi;
-    const double w_val = read_w(w, k_iface, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y);
-    const double bw = g.b_w[k_iface];
+    const float u_w = (1.0f - wt) * u_lo + wt * u_hi;
+    const float v_w = (1.0f - wt) * v_lo + wt * v_hi;
+    const float w_val = read_w_f(w, k_iface, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float bw = static_cast<float>(g.b_w[k_iface]);
     gdotzeta_out = w_val - msf * bw * (u_w * dh_dx + v_w * dh_dy);
 }
 
@@ -349,90 +369,94 @@ __global__ void nh_slow_scalar_kernel(
     const int32_t nz = cfg.nz, ny = cfg.ny, nx = cfg.nx;
     const size_t idx = static_cast<size_t>(k) * ny * nx + static_cast<size_t>(j) * nx + i;
 
-    const double msf = g.msf[j * nx + i];
-    const double hs = g.hs[j * nx + i];
-    const double g_s = 1.0 + g.db_s[k] * hs;
+    const float dx_f = static_cast<float>(cfg.dx_m);
+    const float dy_f = static_cast<float>(cfg.dy_m);
+    const float dz_k = static_cast<float>(g.dzeta[k]);
+    const float msf = static_cast<float>(g.msf[j * nx + i]);
+    const float hs = static_cast<float>(g.hs[j * nx + i]);
+    const float g_s = 1.0f + static_cast<float>(g.db_s[k]) * hs;
 
-    const double uc = 0.5 * (read_u(u, k, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y) +
-                             read_u(u, k, j, i + 1, nz, ny, nx, cfg.bc_x, cfg.bc_y));
-    const double vc = 0.5 * (read_v(v, k, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y) +
-                             read_v(v, k, j + 1, i, nz, ny, nx, cfg.bc_x, cfg.bc_y));
-    double gz_lo = 0.0, gz_hi = 0.0;
-    compute_contravariant_at_scalar_col(cfg, g, u, v, w, k, j, i, gz_lo);
-    compute_contravariant_at_scalar_col(cfg, g, u, v, w, k + 1, j, i, gz_hi);
-    const double zeta_dot = 0.5 * (gz_lo + gz_hi) / fmax(g_s, 1e-4);
+    const float uc = 0.5f * (read_u_f(u, k, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y) +
+                             read_u_f(u, k, j, i + 1, nz, ny, nx, cfg.bc_x, cfg.bc_y));
+    const float vc = 0.5f * (read_v_f(v, k, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y) +
+                             read_v_f(v, k, j + 1, i, nz, ny, nx, cfg.bc_x, cfg.bc_y));
+    float gz_lo = 0.0f, gz_hi = 0.0f;
+    compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, k, j, i, gz_lo);
+    compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, k + 1, j, i, gz_hi);
+    const float zeta_dot = 0.5f * (gz_lo + gz_hi) / fmaxf(g_s, 1e-4f);
 
     // Advect theta'
-    const double th_xp = horiz_face_val_x(thp, k, j, i + 1, uc, nz, ny, nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
-    const double th_xm = horiz_face_val_x(thp, k, j, i,     uc, nz, ny, nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
-    const double th_yp = horiz_face_val_y(thp, k, j + 1, i, vc, nz, ny, nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
-    const double th_ym = horiz_face_val_y(thp, k, j,     i, vc, nz, ny, nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
-    const double th_zp = vert_tvd_face_val(thp, k + 1, j, i, zeta_dot, g.dzeta, nz, ny, nx, cfg.bc_x, cfg.bc_y);
-    const double th_zm = vert_tvd_face_val(thp, k,     j, i, zeta_dot, g.dzeta, nz, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float th_xp = horiz_face_val_x_f(thp, k, j, i + 1, uc, nz, ny, nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
+    const float th_xm = horiz_face_val_x_f(thp, k, j, i,     uc, nz, ny, nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
+    const float th_yp = horiz_face_val_y_f(thp, k, j + 1, i, vc, nz, ny, nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
+    const float th_ym = horiz_face_val_y_f(thp, k, j,     i, vc, nz, ny, nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
+    const float th_zp = vert_tvd_face_val_f(thp, k + 1, j, i, zeta_dot, g.dzeta, nz, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float th_zm = vert_tvd_face_val_f(thp, k,     j, i, zeta_dot, g.dzeta, nz, ny, nx, cfg.bc_x, cfg.bc_y);
 
-    double tend_th = -msf * (uc * (th_xp - th_xm) / cfg.dx_m + vc * (th_yp - th_ym) / cfg.dy_m)
-                     - zeta_dot * (th_zp - th_zm) / g.dzeta[k];
+    float tend_th = -msf * (uc * (th_xp - th_xm) / dx_f + vc * (th_yp - th_ym) / dy_f)
+                    - zeta_dot * (th_zp - th_zm) / dz_k;
 
     // Advect pi'
-    const double pi_xp = horiz_face_val_x(pip, k, j, i + 1, uc, nz, ny, nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
-    const double pi_xm = horiz_face_val_x(pip, k, j, i,     uc, nz, ny, nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
-    const double pi_yp = horiz_face_val_y(pip, k, j + 1, i, vc, nz, ny, nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
-    const double pi_ym = horiz_face_val_y(pip, k, j,     i, vc, nz, ny, nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
-    const double pi_zp = vert_tvd_face_val(pip, k + 1, j, i, zeta_dot, g.dzeta, nz, ny, nx, cfg.bc_x, cfg.bc_y);
-    const double pi_zm = vert_tvd_face_val(pip, k,     j, i, zeta_dot, g.dzeta, nz, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float pi_xp = horiz_face_val_x_f(pip, k, j, i + 1, uc, nz, ny, nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
+    const float pi_xm = horiz_face_val_x_f(pip, k, j, i,     uc, nz, ny, nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
+    const float pi_yp = horiz_face_val_y_f(pip, k, j + 1, i, vc, nz, ny, nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
+    const float pi_ym = horiz_face_val_y_f(pip, k, j,     i, vc, nz, ny, nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
+    const float pi_zp = vert_tvd_face_val_f(pip, k + 1, j, i, zeta_dot, g.dzeta, nz, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float pi_zm = vert_tvd_face_val_f(pip, k,     j, i, zeta_dot, g.dzeta, nz, ny, nx, cfg.bc_x, cfg.bc_y);
 
-    double tend_pi = -msf * (uc * (pi_xp - pi_xm) / cfg.dx_m + vc * (pi_yp - pi_ym) / cfg.dy_m)
-                     - zeta_dot * (pi_zp - pi_zm) / g.dzeta[k];
+    float tend_pi = -msf * (uc * (pi_xp - pi_xm) / dx_f + vc * (pi_yp - pi_ym) / dy_f)
+                    - zeta_dot * (pi_zp - pi_zm) / dz_k;
 
     // Explicit 3D Laplacian diffusion (used cleanly for Straka K=75 m^2/s)
-    const double th0 = static_cast<double>(thp[idx]);
-    const double pi0 = static_cast<double>(pip[idx]);
+    const float th0 = thp[idx];
+    const float pi0 = pip[idx];
     if (cfg.kh_const > 0.0) {
-        const double th_e = read_s(thp, k, j, i + 1, nz, ny, nx, cfg.bc_x, cfg.bc_y);
-        const double th_w = read_s(thp, k, j, i - 1, nz, ny, nx, cfg.bc_x, cfg.bc_y);
-        const double th_n = read_s(thp, k, j + 1, i, nz, ny, nx, cfg.bc_x, cfg.bc_y);
-        const double th_s = read_s(thp, k, j - 1, i, nz, ny, nx, cfg.bc_x, cfg.bc_y);
-        const double lap_h = msf * msf * (
-            (th_e - 2.0 * th0 + th_w) / (cfg.dx_m * cfg.dx_m) +
-            (th_n - 2.0 * th0 + th_s) / (cfg.dy_m * cfg.dy_m)
+        const float th_e = read_s_f(thp, k, j, i + 1, nz, ny, nx, cfg.bc_x, cfg.bc_y);
+        const float th_w = read_s_f(thp, k, j, i - 1, nz, ny, nx, cfg.bc_x, cfg.bc_y);
+        const float th_n = read_s_f(thp, k, j + 1, i, nz, ny, nx, cfg.bc_x, cfg.bc_y);
+        const float th_s = read_s_f(thp, k, j - 1, i, nz, ny, nx, cfg.bc_x, cfg.bc_y);
+        const float lap_h = msf * msf * (
+            (th_e - 2.0f * th0 + th_w) / (dx_f * dx_f) +
+            (th_n - 2.0f * th0 + th_s) / (dy_f * dy_f)
         );
-        const double dz_c = g_s * g.dzeta[k];
-        double lap_v = 0.0;
+        const float dz_c = g_s * dz_k;
+        float lap_v = 0.0f;
         if (k < nz - 1) {
-            const double dz_p = 0.5 * (dz_c + (1.0 + g.db_s[k + 1] * hs) * g.dzeta[k + 1]);
-            lap_v += (read_s(thp, k + 1, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y) - th0) / (dz_p * dz_c);
+            const float dz_p = 0.5f * (dz_c + (1.0f + static_cast<float>(g.db_s[k + 1]) * hs) * static_cast<float>(g.dzeta[k + 1]));
+            lap_v += (read_s_f(thp, k + 1, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y) - th0) / (dz_p * dz_c);
         }
         if (k > 0) {
-            const double dz_m = 0.5 * (dz_c + (1.0 + g.db_s[k - 1] * hs) * g.dzeta[k - 1]);
-            lap_v -= (th0 - read_s(thp, k - 1, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y)) / (dz_m * dz_c);
+            const float dz_m = 0.5f * (dz_c + (1.0f + static_cast<float>(g.db_s[k - 1]) * hs) * static_cast<float>(g.dzeta[k - 1]));
+            lap_v -= (th0 - read_s_f(thp, k - 1, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y)) / (dz_m * dz_c);
         }
-        tend_th += cfg.kh_const * (lap_h + lap_v);
+        tend_th += static_cast<float>(cfg.kh_const) * (lap_h + lap_v);
     }
 
     // Optional Davies lateral boundary relaxation
     if ((cfg.bc_x == 2 || cfg.bc_y == 2) && lbc_thp != nullptr && cfg.lbc_tau_max_s > 0.0) {
-        double tau = 0.0;
+        const float tau_max = static_cast<float>(cfg.lbc_tau_max_s);
+        float tau = 0.0f;
         if (cfg.bc_x == 2) {
-            if (cfg.lbc_edges & 1) tau = fmax(tau, davies_weight(i, cfg.lbc_rim_width, cfg.lbc_tau_max_s));
-            if (cfg.lbc_edges & 2) tau = fmax(tau, davies_weight(nx - 1 - i, cfg.lbc_rim_width, cfg.lbc_tau_max_s));
+            if (cfg.lbc_edges & 1) tau = fmaxf(tau, davies_weight_f(i, cfg.lbc_rim_width, tau_max));
+            if (cfg.lbc_edges & 2) tau = fmaxf(tau, davies_weight_f(nx - 1 - i, cfg.lbc_rim_width, tau_max));
         }
         if (cfg.bc_y == 2) {
-            if (cfg.lbc_edges & 4) tau = fmax(tau, davies_weight(j, cfg.lbc_rim_width, cfg.lbc_tau_max_s));
-            if (cfg.lbc_edges & 8) tau = fmax(tau, davies_weight(ny - 1 - j, cfg.lbc_rim_width, cfg.lbc_tau_max_s));
+            if (cfg.lbc_edges & 4) tau = fmaxf(tau, davies_weight_f(j, cfg.lbc_rim_width, tau_max));
+            if (cfg.lbc_edges & 8) tau = fmaxf(tau, davies_weight_f(ny - 1 - j, cfg.lbc_rim_width, tau_max));
         }
-        if (tau > 0.0) {
-            tend_th -= tau * (th0 - static_cast<double>(lbc_thp[idx]));
+        if (tau > 0.0f) {
+            tend_th -= tau * (th0 - lbc_thp[idx]);
             if (lbc_pip != nullptr) {
-                tend_pi -= tau * (pi0 - static_cast<double>(lbc_pip[idx]));
+                tend_pi -= tau * (pi0 - lbc_pip[idx]);
             }
         }
     }
 
-    if (cfg.has_iau && iau_thp != nullptr) tend_th += static_cast<double>(iau_thp[idx]);
-    if (cfg.has_iau && iau_pip != nullptr) tend_pi += static_cast<double>(iau_pip[idx]);
+    if (cfg.has_iau && iau_thp != nullptr) tend_th += iau_thp[idx];
+    if (cfg.has_iau && iau_pip != nullptr) tend_pi += iau_pip[idx];
 
-    rth[idx] = static_cast<float>(tend_th);
-    rpi[idx] = static_cast<float>(tend_pi);
+    rth[idx] = tend_th;
+    rpi[idx] = tend_pi;
 }
 
 __global__ void nh_slow_u_kernel(
@@ -460,98 +484,104 @@ __global__ void nh_slow_u_kernel(
 
     const int32_t il = (cfg.bc_x == 1) ? wrap_idx(i - 1, nx) : ((i <= 0) ? 0 : i - 1);
     const int32_t ir = (cfg.bc_x == 1) ? wrap_idx(i, nx) : ((i >= nx) ? nx - 1 : i);
-    const double msf = 0.5 * (g.msf[j * nx + il] + g.msf[j * nx + ir]);
-    const double hs_u = 0.5 * (g.hs[j * nx + il] + g.hs[j * nx + ir]);
-    const double g_u = 1.0 + g.db_s[k] * hs_u;
+    const float dx_f = static_cast<float>(cfg.dx_m);
+    const float dy_f = static_cast<float>(cfg.dy_m);
+    const float msf_l0 = static_cast<float>(g.msf[j * nx + il]);
+    const float msf_r0 = static_cast<float>(g.msf[j * nx + ir]);
+    const float msf = 0.5f * (msf_l0 + msf_r0);
+    const float hs_u = 0.5f * (static_cast<float>(g.hs[j * nx + il]) + static_cast<float>(g.hs[j * nx + ir]));
+    const float g_u = 1.0f + static_cast<float>(g.db_s[k]) * hs_u;
 
-    const double uc = read_u(u, k, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y);
-    const double vc = 0.25 * (
-        read_v(v, k, j,     il, nz, ny, nx, cfg.bc_x, cfg.bc_y) +
-        read_v(v, k, j + 1, il, nz, ny, nx, cfg.bc_x, cfg.bc_y) +
-        read_v(v, k, j,     ir, nz, ny, nx, cfg.bc_x, cfg.bc_y) +
-        read_v(v, k, j + 1, ir, nz, ny, nx, cfg.bc_x, cfg.bc_y)
+    const float uc = read_u_f(u, k, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float vc = 0.25f * (
+        read_v_f(v, k, j,     il, nz, ny, nx, cfg.bc_x, cfg.bc_y) +
+        read_v_f(v, k, j + 1, il, nz, ny, nx, cfg.bc_x, cfg.bc_y) +
+        read_v_f(v, k, j,     ir, nz, ny, nx, cfg.bc_x, cfg.bc_y) +
+        read_v_f(v, k, j + 1, ir, nz, ny, nx, cfg.bc_x, cfg.bc_y)
     );
-    double gz_ll = 0.0, gz_lh = 0.0, gz_rl = 0.0, gz_rh = 0.0;
-    compute_contravariant_at_scalar_col(cfg, g, u, v, w, k,     j, il, gz_ll);
-    compute_contravariant_at_scalar_col(cfg, g, u, v, w, k + 1, j, il, gz_lh);
-    compute_contravariant_at_scalar_col(cfg, g, u, v, w, k,     j, ir, gz_rl);
-    compute_contravariant_at_scalar_col(cfg, g, u, v, w, k + 1, j, ir, gz_rh);
-    const double zeta_dot = 0.25 * (gz_ll + gz_lh + gz_rl + gz_rh) / fmax(g_u, 1e-4);
+    float gz_ll = 0.0f, gz_lh = 0.0f, gz_rl = 0.0f, gz_rh = 0.0f;
+    compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, k,     j, il, gz_ll);
+    compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, k + 1, j, il, gz_lh);
+    compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, k,     j, ir, gz_rl);
+    compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, k + 1, j, ir, gz_rh);
+    const float zeta_dot = 0.25f * (gz_ll + gz_lh + gz_rl + gz_rh) / fmaxf(g_u, 1e-4f);
 
     // Centered/UP3 momentum advection on u-points
-    auto u_get = [&](int32_t kk, int32_t jj, int32_t ii) -> double {
-        return read_u(u, kk, jj, ii, nz, ny, nx, cfg.bc_x, cfg.bc_y);
+    auto u_get = [&](int32_t kk, int32_t jj, int32_t ii) -> float {
+        return read_u_f(u, kk, jj, ii, nz, ny, nx, cfg.bc_x, cfg.bc_y);
     };
-    double dudx = 0.0;
-    if (uc >= 0.0) {
-        dudx = (up3_left(u_get(k, j, i - 1), uc, u_get(k, j, i + 1)) -
-                up3_left(u_get(k, j, i - 2), u_get(k, j, i - 1), uc)) / cfg.dx_m;
+    float dudx = 0.0f;
+    if (uc >= 0.0f) {
+        dudx = (up3_left_f(u_get(k, j, i - 1), uc, u_get(k, j, i + 1)) -
+                up3_left_f(u_get(k, j, i - 2), u_get(k, j, i - 1), uc)) / dx_f;
     } else {
-        dudx = (up3_left(u_get(k, j, i + 2), u_get(k, j, i + 1), uc) -
-                up3_left(u_get(k, j, i + 1), uc, u_get(k, j, i - 1))) / cfg.dx_m;
+        dudx = (up3_left_f(u_get(k, j, i + 2), u_get(k, j, i + 1), uc) -
+                up3_left_f(u_get(k, j, i + 1), uc, u_get(k, j, i - 1))) / dx_f;
     }
-    double dudy = 0.0;
-    if (vc >= 0.0) {
-        dudy = (up3_left(u_get(k, j - 1, i), uc, u_get(k, j + 1, i)) -
-                up3_left(u_get(k, j - 2, i), u_get(k, j - 1, i), uc)) / cfg.dy_m;
+    float dudy = 0.0f;
+    if (vc >= 0.0f) {
+        dudy = (up3_left_f(u_get(k, j - 1, i), uc, u_get(k, j + 1, i)) -
+                up3_left_f(u_get(k, j - 2, i), u_get(k, j - 1, i), uc)) / dy_f;
     } else {
-        dudy = (up3_left(u_get(k, j + 2, i), u_get(k, j + 1, i), uc) -
-                up3_left(u_get(k, j + 1, i), uc, u_get(k, j - 1, i))) / cfg.dy_m;
+        dudy = (up3_left_f(u_get(k, j + 2, i), u_get(k, j + 1, i), uc) -
+                up3_left_f(u_get(k, j + 1, i), uc, u_get(k, j - 1, i))) / dy_f;
     }
-    double dudz = 0.0;
-    if (zeta_dot >= 0.0 && k > 0) {
-        dudz = (uc - u_get(k - 1, j, i)) / (0.5 * (g.dzeta[k] + g.dzeta[k - 1]));
-    } else if (zeta_dot < 0.0 && k < nz - 1) {
-        dudz = (u_get(k + 1, j, i) - uc) / (0.5 * (g.dzeta[k + 1] + g.dzeta[k]));
+    const float dz_k = static_cast<float>(g.dzeta[k]);
+    float dudz = 0.0f;
+    if (zeta_dot >= 0.0f && k > 0) {
+        dudz = (uc - u_get(k - 1, j, i)) / (0.5f * (dz_k + static_cast<float>(g.dzeta[k - 1])));
+    } else if (zeta_dot < 0.0f && k < nz - 1) {
+        dudz = (u_get(k + 1, j, i) - uc) / (0.5f * (static_cast<float>(g.dzeta[k + 1]) + dz_k));
     }
 
-    double tend = -msf * (uc * dudx + vc * dudy) - zeta_dot * dudz;
+    float tend = -msf * (uc * dudx + vc * dudy) - zeta_dot * dudz;
 
     if (cfg.use_coriolis) {
-        const double f_u = 0.5 * (g.fcor[j * nx + il] + g.fcor[j * nx + ir]);
-        const double dm_dy = (read_2d(g.msf, j + 1, il, ny, nx, cfg.bc_x, cfg.bc_y) -
-                              read_2d(g.msf, j - 1, il, ny, nx, cfg.bc_x, cfg.bc_y) +
-                              read_2d(g.msf, j + 1, ir, ny, nx, cfg.bc_x, cfg.bc_y) -
-                              read_2d(g.msf, j - 1, ir, ny, nx, cfg.bc_x, cfg.bc_y)) / (4.0 * cfg.dy_m);
-        const double dm_dx = (g.msf[j * nx + ir] - g.msf[j * nx + il]) / cfg.dx_m;
+        const float f_u = 0.5f * (static_cast<float>(g.fcor[j * nx + il]) + static_cast<float>(g.fcor[j * nx + ir]));
+        const float dm_dy = (read_2d_f(g.msf, j + 1, il, ny, nx, cfg.bc_x, cfg.bc_y) -
+                             read_2d_f(g.msf, j - 1, il, ny, nx, cfg.bc_x, cfg.bc_y) +
+                             read_2d_f(g.msf, j + 1, ir, ny, nx, cfg.bc_x, cfg.bc_y) -
+                             read_2d_f(g.msf, j - 1, ir, ny, nx, cfg.bc_x, cfg.bc_y)) / (4.0f * dy_f);
+        const float dm_dx = (msf_r0 - msf_l0) / dx_f;
         tend += (f_u + uc * dm_dy - vc * dm_dx) * vc;
     }
 
     if (cfg.km_const > 0.0) {
-        const double lap_h = msf * msf * (
-            (u_get(k, j, i + 1) - 2.0 * uc + u_get(k, j, i - 1)) / (cfg.dx_m * cfg.dx_m) +
-            (u_get(k, j + 1, i) - 2.0 * uc + u_get(k, j - 1, i)) / (cfg.dy_m * cfg.dy_m)
+        const float lap_h = msf * msf * (
+            (u_get(k, j, i + 1) - 2.0f * uc + u_get(k, j, i - 1)) / (dx_f * dx_f) +
+            (u_get(k, j + 1, i) - 2.0f * uc + u_get(k, j - 1, i)) / (dy_f * dy_f)
         );
-        const double dz_c = g_u * g.dzeta[k];
-        double lap_v = 0.0;
+        const float dz_c = g_u * dz_k;
+        float lap_v = 0.0f;
         if (k < nz - 1) {
-            const double dz_p = 0.5 * (dz_c + (1.0 + g.db_s[k + 1] * hs_u) * g.dzeta[k + 1]);
+            const float dz_p = 0.5f * (dz_c + (1.0f + static_cast<float>(g.db_s[k + 1]) * hs_u) * static_cast<float>(g.dzeta[k + 1]));
             lap_v += (u_get(k + 1, j, i) - uc) / (dz_p * dz_c);
         }
         if (k > 0) {
-            const double dz_m = 0.5 * (dz_c + (1.0 + g.db_s[k - 1] * hs_u) * g.dzeta[k - 1]);
+            const float dz_m = 0.5f * (dz_c + (1.0f + static_cast<float>(g.db_s[k - 1]) * hs_u) * static_cast<float>(g.dzeta[k - 1]));
             lap_v -= (uc - u_get(k - 1, j, i)) / (dz_m * dz_c);
         }
-        tend += cfg.km_const * (lap_h + lap_v);
+        tend += static_cast<float>(cfg.km_const) * (lap_h + lap_v);
     }
 
     if ((cfg.bc_x == 2 || cfg.bc_y == 2) && lbc_u != nullptr && cfg.lbc_tau_max_s > 0.0) {
-        double tau = 0.0;
+        const float tau_max = static_cast<float>(cfg.lbc_tau_max_s);
+        float tau = 0.0f;
         if (cfg.bc_x == 2) {
-            if (cfg.lbc_edges & 1) tau = fmax(tau, davies_weight(i, cfg.lbc_rim_width, cfg.lbc_tau_max_s));
-            if (cfg.lbc_edges & 2) tau = fmax(tau, davies_weight(nx - i, cfg.lbc_rim_width, cfg.lbc_tau_max_s));
+            if (cfg.lbc_edges & 1) tau = fmaxf(tau, davies_weight_f(i, cfg.lbc_rim_width, tau_max));
+            if (cfg.lbc_edges & 2) tau = fmaxf(tau, davies_weight_f(nx - i, cfg.lbc_rim_width, tau_max));
         }
         if (cfg.bc_y == 2) {
-            if (cfg.lbc_edges & 4) tau = fmax(tau, davies_weight(j, cfg.lbc_rim_width, cfg.lbc_tau_max_s));
-            if (cfg.lbc_edges & 8) tau = fmax(tau, davies_weight(ny - 1 - j, cfg.lbc_rim_width, cfg.lbc_tau_max_s));
+            if (cfg.lbc_edges & 4) tau = fmaxf(tau, davies_weight_f(j, cfg.lbc_rim_width, tau_max));
+            if (cfg.lbc_edges & 8) tau = fmaxf(tau, davies_weight_f(ny - 1 - j, cfg.lbc_rim_width, tau_max));
         }
-        if (tau > 0.0) {
-            tend -= tau * (uc - static_cast<double>(lbc_u[idx]));
+        if (tau > 0.0f) {
+            tend -= tau * (uc - lbc_u[idx]);
         }
     }
 
-    if (cfg.has_iau && iau_u != nullptr) tend += static_cast<double>(iau_u[idx]);
-    ru[idx] = static_cast<float>(tend);
+    if (cfg.has_iau && iau_u != nullptr) tend += iau_u[idx];
+    ru[idx] = tend;
 }
 
 __global__ void nh_slow_v_kernel(
@@ -579,97 +609,103 @@ __global__ void nh_slow_v_kernel(
 
     const int32_t jl = (cfg.bc_y == 1) ? wrap_idx(j - 1, ny) : ((j <= 0) ? 0 : j - 1);
     const int32_t jr = (cfg.bc_y == 1) ? wrap_idx(j, ny) : ((j >= ny) ? ny - 1 : j);
-    const double msf = 0.5 * (g.msf[jl * nx + i] + g.msf[jr * nx + i]);
-    const double hs_v = 0.5 * (g.hs[jl * nx + i] + g.hs[jr * nx + i]);
-    const double g_v = 1.0 + g.db_s[k] * hs_v;
+    const float dx_f = static_cast<float>(cfg.dx_m);
+    const float dy_f = static_cast<float>(cfg.dy_m);
+    const float msf_l0 = static_cast<float>(g.msf[jl * nx + i]);
+    const float msf_r0 = static_cast<float>(g.msf[jr * nx + i]);
+    const float msf = 0.5f * (msf_l0 + msf_r0);
+    const float hs_v = 0.5f * (static_cast<float>(g.hs[jl * nx + i]) + static_cast<float>(g.hs[jr * nx + i]));
+    const float g_v = 1.0f + static_cast<float>(g.db_s[k]) * hs_v;
 
-    const double vc = read_v(v, k, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y);
-    const double uc = 0.25 * (
-        read_u(u, k, jl, i,     nz, ny, nx, cfg.bc_x, cfg.bc_y) +
-        read_u(u, k, jl, i + 1, nz, ny, nx, cfg.bc_x, cfg.bc_y) +
-        read_u(u, k, jr, i,     nz, ny, nx, cfg.bc_x, cfg.bc_y) +
-        read_u(u, k, jr, i + 1, nz, ny, nx, cfg.bc_x, cfg.bc_y)
+    const float vc = read_v_f(v, k, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float uc = 0.25f * (
+        read_u_f(u, k, jl, i,     nz, ny, nx, cfg.bc_x, cfg.bc_y) +
+        read_u_f(u, k, jl, i + 1, nz, ny, nx, cfg.bc_x, cfg.bc_y) +
+        read_u_f(u, k, jr, i,     nz, ny, nx, cfg.bc_x, cfg.bc_y) +
+        read_u_f(u, k, jr, i + 1, nz, ny, nx, cfg.bc_x, cfg.bc_y)
     );
-    double gz_ll = 0.0, gz_lh = 0.0, gz_rl = 0.0, gz_rh = 0.0;
-    compute_contravariant_at_scalar_col(cfg, g, u, v, w, k,     jl, i, gz_ll);
-    compute_contravariant_at_scalar_col(cfg, g, u, v, w, k + 1, jl, i, gz_lh);
-    compute_contravariant_at_scalar_col(cfg, g, u, v, w, k,     jr, i, gz_rl);
-    compute_contravariant_at_scalar_col(cfg, g, u, v, w, k + 1, jr, i, gz_rh);
-    const double zeta_dot = 0.25 * (gz_ll + gz_lh + gz_rl + gz_rh) / fmax(g_v, 1e-4);
+    float gz_ll = 0.0f, gz_lh = 0.0f, gz_rl = 0.0f, gz_rh = 0.0f;
+    compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, k,     jl, i, gz_ll);
+    compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, k + 1, jl, i, gz_lh);
+    compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, k,     jr, i, gz_rl);
+    compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, k + 1, jr, i, gz_rh);
+    const float zeta_dot = 0.25f * (gz_ll + gz_lh + gz_rl + gz_rh) / fmaxf(g_v, 1e-4f);
 
-    auto v_get = [&](int32_t kk, int32_t jj, int32_t ii) -> double {
-        return read_v(v, kk, jj, ii, nz, ny, nx, cfg.bc_x, cfg.bc_y);
+    auto v_get = [&](int32_t kk, int32_t jj, int32_t ii) -> float {
+        return read_v_f(v, kk, jj, ii, nz, ny, nx, cfg.bc_x, cfg.bc_y);
     };
-    double dvdx = 0.0;
-    if (uc >= 0.0) {
-        dvdx = (up3_left(v_get(k, j, i - 1), vc, v_get(k, j, i + 1)) -
-                up3_left(v_get(k, j, i - 2), v_get(k, j, i - 1), vc)) / cfg.dx_m;
+    float dvdx = 0.0f;
+    if (uc >= 0.0f) {
+        dvdx = (up3_left_f(v_get(k, j, i - 1), vc, v_get(k, j, i + 1)) -
+                up3_left_f(v_get(k, j, i - 2), v_get(k, j, i - 1), vc)) / dx_f;
     } else {
-        dvdx = (up3_left(v_get(k, j, i + 2), v_get(k, j, i + 1), vc) -
-                up3_left(v_get(k, j, i + 1), vc, v_get(k, j, i - 1))) / cfg.dx_m;
+        dvdx = (up3_left_f(v_get(k, j, i + 2), v_get(k, j, i + 1), vc) -
+                up3_left_f(v_get(k, j, i + 1), vc, v_get(k, j, i - 1))) / dx_f;
     }
-    double dvdy = 0.0;
-    if (vc >= 0.0) {
-        dvdy = (up3_left(v_get(k, j - 1, i), vc, v_get(k, j + 1, i)) -
-                up3_left(v_get(k, j - 2, i), v_get(k, j - 1, i), vc)) / cfg.dy_m;
+    float dvdy = 0.0f;
+    if (vc >= 0.0f) {
+        dvdy = (up3_left_f(v_get(k, j - 1, i), vc, v_get(k, j + 1, i)) -
+                up3_left_f(v_get(k, j - 2, i), v_get(k, j - 1, i), vc)) / dy_f;
     } else {
-        dvdy = (up3_left(v_get(k, j + 2, i), v_get(k, j + 1, i), vc) -
-                up3_left(v_get(k, j + 1, i), vc, v_get(k, j - 1, i))) / cfg.dy_m;
+        dvdy = (up3_left_f(v_get(k, j + 2, i), v_get(k, j + 1, i), vc) -
+                up3_left_f(v_get(k, j + 1, i), vc, v_get(k, j - 1, i))) / dy_f;
     }
-    double dvdz = 0.0;
-    if (zeta_dot >= 0.0 && k > 0) {
-        dvdz = (vc - v_get(k - 1, j, i)) / (0.5 * (g.dzeta[k] + g.dzeta[k - 1]));
-    } else if (zeta_dot < 0.0 && k < nz - 1) {
-        dvdz = (v_get(k + 1, j, i) - vc) / (0.5 * (g.dzeta[k + 1] + g.dzeta[k]));
+    const float dz_k = static_cast<float>(g.dzeta[k]);
+    float dvdz = 0.0f;
+    if (zeta_dot >= 0.0f && k > 0) {
+        dvdz = (vc - v_get(k - 1, j, i)) / (0.5f * (dz_k + static_cast<float>(g.dzeta[k - 1])));
+    } else if (zeta_dot < 0.0f && k < nz - 1) {
+        dvdz = (v_get(k + 1, j, i) - vc) / (0.5f * (static_cast<float>(g.dzeta[k + 1]) + dz_k));
     }
 
-    double tend = -msf * (uc * dvdx + vc * dvdy) - zeta_dot * dvdz;
+    float tend = -msf * (uc * dvdx + vc * dvdy) - zeta_dot * dvdz;
 
     if (cfg.use_coriolis) {
-        const double f_v = 0.5 * (g.fcor[jl * nx + i] + g.fcor[jr * nx + i]);
-        const double dm_dx = (read_2d(g.msf, jl, i + 1, ny, nx, cfg.bc_x, cfg.bc_y) -
-                              read_2d(g.msf, jl, i - 1, ny, nx, cfg.bc_x, cfg.bc_y) +
-                              read_2d(g.msf, jr, i + 1, ny, nx, cfg.bc_x, cfg.bc_y) -
-                              read_2d(g.msf, jr, i - 1, ny, nx, cfg.bc_x, cfg.bc_y)) / (4.0 * cfg.dx_m);
-        const double dm_dy = (g.msf[jr * nx + i] - g.msf[jl * nx + i]) / cfg.dy_m;
+        const float f_v = 0.5f * (static_cast<float>(g.fcor[jl * nx + i]) + static_cast<float>(g.fcor[jr * nx + i]));
+        const float dm_dx = (read_2d_f(g.msf, jl, i + 1, ny, nx, cfg.bc_x, cfg.bc_y) -
+                             read_2d_f(g.msf, jl, i - 1, ny, nx, cfg.bc_x, cfg.bc_y) +
+                             read_2d_f(g.msf, jr, i + 1, ny, nx, cfg.bc_x, cfg.bc_y) -
+                             read_2d_f(g.msf, jr, i - 1, ny, nx, cfg.bc_x, cfg.bc_y)) / (4.0f * dx_f);
+        const float dm_dy = (msf_r0 - msf_l0) / dy_f;
         tend -= (f_v + uc * dm_dy - vc * dm_dx) * uc;
     }
 
     if (cfg.km_const > 0.0) {
-        const double lap_h = msf * msf * (
-            (v_get(k, j, i + 1) - 2.0 * vc + v_get(k, j, i - 1)) / (cfg.dx_m * cfg.dx_m) +
-            (v_get(k, j + 1, i) - 2.0 * vc + v_get(k, j - 1, i)) / (cfg.dy_m * cfg.dy_m)
+        const float lap_h = msf * msf * (
+            (v_get(k, j, i + 1) - 2.0f * vc + v_get(k, j, i - 1)) / (dx_f * dx_f) +
+            (v_get(k, j + 1, i) - 2.0f * vc + v_get(k, j - 1, i)) / (dy_f * dy_f)
         );
-        const double dz_c = g_v * g.dzeta[k];
-        double lap_v = 0.0;
+        const float dz_c = g_v * dz_k;
+        float lap_v = 0.0f;
         if (k < nz - 1) {
-            const double dz_p = 0.5 * (dz_c + (1.0 + g.db_s[k + 1] * hs_v) * g.dzeta[k + 1]);
+            const float dz_p = 0.5f * (dz_c + (1.0f + static_cast<float>(g.db_s[k + 1]) * hs_v) * static_cast<float>(g.dzeta[k + 1]));
             lap_v += (v_get(k + 1, j, i) - vc) / (dz_p * dz_c);
         }
         if (k > 0) {
-            const double dz_m = 0.5 * (dz_c + (1.0 + g.db_s[k - 1] * hs_v) * g.dzeta[k - 1]);
+            const float dz_m = 0.5f * (dz_c + (1.0f + static_cast<float>(g.db_s[k - 1]) * hs_v) * static_cast<float>(g.dzeta[k - 1]));
             lap_v -= (vc - v_get(k - 1, j, i)) / (dz_m * dz_c);
         }
-        tend += cfg.km_const * (lap_h + lap_v);
+        tend += static_cast<float>(cfg.km_const) * (lap_h + lap_v);
     }
 
     if ((cfg.bc_x == 2 || cfg.bc_y == 2) && lbc_v != nullptr && cfg.lbc_tau_max_s > 0.0) {
-        double tau = 0.0;
+        const float tau_max = static_cast<float>(cfg.lbc_tau_max_s);
+        float tau = 0.0f;
         if (cfg.bc_x == 2) {
-            if (cfg.lbc_edges & 1) tau = fmax(tau, davies_weight(i, cfg.lbc_rim_width, cfg.lbc_tau_max_s));
-            if (cfg.lbc_edges & 2) tau = fmax(tau, davies_weight(nx - 1 - i, cfg.lbc_rim_width, cfg.lbc_tau_max_s));
+            if (cfg.lbc_edges & 1) tau = fmaxf(tau, davies_weight_f(i, cfg.lbc_rim_width, tau_max));
+            if (cfg.lbc_edges & 2) tau = fmaxf(tau, davies_weight_f(nx - 1 - i, cfg.lbc_rim_width, tau_max));
         }
         if (cfg.bc_y == 2) {
-            if (cfg.lbc_edges & 4) tau = fmax(tau, davies_weight(j, cfg.lbc_rim_width, cfg.lbc_tau_max_s));
-            if (cfg.lbc_edges & 8) tau = fmax(tau, davies_weight(ny - j, cfg.lbc_rim_width, cfg.lbc_tau_max_s));
+            if (cfg.lbc_edges & 4) tau = fmaxf(tau, davies_weight_f(j, cfg.lbc_rim_width, tau_max));
+            if (cfg.lbc_edges & 8) tau = fmaxf(tau, davies_weight_f(ny - j, cfg.lbc_rim_width, tau_max));
         }
-        if (tau > 0.0) {
-            tend -= tau * (vc - static_cast<double>(lbc_v[idx]));
+        if (tau > 0.0f) {
+            tend -= tau * (vc - lbc_v[idx]);
         }
     }
 
-    if (cfg.has_iau && iau_v != nullptr) tend += static_cast<double>(iau_v[idx]);
-    rv[idx] = static_cast<float>(tend);
+    if (cfg.has_iau && iau_v != nullptr) tend += iau_v[idx];
+    rv[idx] = tend;
 }
 
 __global__ void nh_slow_w_kernel(
@@ -692,80 +728,83 @@ __global__ void nh_slow_w_kernel(
 
     const int32_t nz = cfg.nz, ny = cfg.ny, nx = cfg.nx;
     const size_t idx = static_cast<size_t>(k) * ny * nx + static_cast<size_t>(j) * nx + i;
-    const double msf = g.msf[j * nx + i];
-    const double hs = g.hs[j * nx + i];
-    const double ds_k = g.dzeta[k];
-    const double ds_km = g.dzeta[k - 1];
-    const double wt = ds_km / (ds_k + ds_km);
+    const float dx_f = static_cast<float>(cfg.dx_m);
+    const float dy_f = static_cast<float>(cfg.dy_m);
+    const float msf = static_cast<float>(g.msf[j * nx + i]);
+    const float hs = static_cast<float>(g.hs[j * nx + i]);
+    const float ds_k = static_cast<float>(g.dzeta[k]);
+    const float ds_km = static_cast<float>(g.dzeta[k - 1]);
+    const float wt = ds_km / (ds_k + ds_km);
 
-    const double u_w = (1.0 - wt) * 0.5 * (read_u(u, k - 1, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y) +
-                                           read_u(u, k - 1, j, i + 1, nz, ny, nx, cfg.bc_x, cfg.bc_y)) +
-                       wt         * 0.5 * (read_u(u, k, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y) +
-                                           read_u(u, k, j, i + 1, nz, ny, nx, cfg.bc_x, cfg.bc_y));
-    const double v_w = (1.0 - wt) * 0.5 * (read_v(v, k - 1, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y) +
-                                           read_v(v, k - 1, j + 1, i, nz, ny, nx, cfg.bc_x, cfg.bc_y)) +
-                       wt         * 0.5 * (read_v(v, k, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y) +
-                                           read_v(v, k, j + 1, i, nz, ny, nx, cfg.bc_x, cfg.bc_y));
-    double gz_w = 0.0;
-    compute_contravariant_at_scalar_col(cfg, g, u, v, w, k, j, i, gz_w);
-    const double g_w = 1.0 + g.db_w[k] * hs;
-    const double zeta_dot = gz_w / fmax(g_w, 1e-4);
+    const float u_w = (1.0f - wt) * 0.5f * (read_u_f(u, k - 1, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y) +
+                                            read_u_f(u, k - 1, j, i + 1, nz, ny, nx, cfg.bc_x, cfg.bc_y)) +
+                      wt          * 0.5f * (read_u_f(u, k, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y) +
+                                            read_u_f(u, k, j, i + 1, nz, ny, nx, cfg.bc_x, cfg.bc_y));
+    const float v_w = (1.0f - wt) * 0.5f * (read_v_f(v, k - 1, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y) +
+                                            read_v_f(v, k - 1, j + 1, i, nz, ny, nx, cfg.bc_x, cfg.bc_y)) +
+                      wt          * 0.5f * (read_v_f(v, k, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y) +
+                                            read_v_f(v, k, j + 1, i, nz, ny, nx, cfg.bc_x, cfg.bc_y));
+    float gz_w = 0.0f;
+    compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, k, j, i, gz_w);
+    const float g_w = 1.0f + static_cast<float>(g.db_w[k]) * hs;
+    const float zeta_dot = gz_w / fmaxf(g_w, 1e-4f);
 
-    auto w_get = [&](int32_t kk, int32_t jj, int32_t ii) -> double {
-        return read_w(w, kk, jj, ii, nz, ny, nx, cfg.bc_x, cfg.bc_y);
+    auto w_get = [&](int32_t kk, int32_t jj, int32_t ii) -> float {
+        return read_w_f(w, kk, jj, ii, nz, ny, nx, cfg.bc_x, cfg.bc_y);
     };
-    const double wc = w_get(k, j, i);
-    double dwdx = 0.0;
-    if (u_w >= 0.0) {
-        dwdx = (up3_left(w_get(k, j, i - 1), wc, w_get(k, j, i + 1)) -
-                up3_left(w_get(k, j, i - 2), w_get(k, j, i - 1), wc)) / cfg.dx_m;
+    const float wc = w_get(k, j, i);
+    float dwdx = 0.0f;
+    if (u_w >= 0.0f) {
+        dwdx = (up3_left_f(w_get(k, j, i - 1), wc, w_get(k, j, i + 1)) -
+                up3_left_f(w_get(k, j, i - 2), w_get(k, j, i - 1), wc)) / dx_f;
     } else {
-        dwdx = (up3_left(w_get(k, j, i + 2), w_get(k, j, i + 1), wc) -
-                up3_left(w_get(k, j, i + 1), wc, w_get(k, j, i - 1))) / cfg.dx_m;
+        dwdx = (up3_left_f(w_get(k, j, i + 2), w_get(k, j, i + 1), wc) -
+                up3_left_f(w_get(k, j, i + 1), wc, w_get(k, j, i - 1))) / dx_f;
     }
-    double dwdy = 0.0;
-    if (v_w >= 0.0) {
-        dwdy = (up3_left(w_get(k, j - 1, i), wc, w_get(k, j + 1, i)) -
-                up3_left(w_get(k, j - 2, i), w_get(k, j - 1, i), wc)) / cfg.dy_m;
+    float dwdy = 0.0f;
+    if (v_w >= 0.0f) {
+        dwdy = (up3_left_f(w_get(k, j - 1, i), wc, w_get(k, j + 1, i)) -
+                up3_left_f(w_get(k, j - 2, i), w_get(k, j - 1, i), wc)) / dy_f;
     } else {
-        dwdy = (up3_left(w_get(k, j + 2, i), w_get(k, j + 1, i), wc) -
-                up3_left(w_get(k, j + 1, i), wc, w_get(k, j - 1, i))) / cfg.dy_m;
+        dwdy = (up3_left_f(w_get(k, j + 2, i), w_get(k, j + 1, i), wc) -
+                up3_left_f(w_get(k, j + 1, i), wc, w_get(k, j - 1, i))) / dy_f;
     }
-    double dwdz = 0.0;
-    if (zeta_dot >= 0.0) {
+    float dwdz = 0.0f;
+    if (zeta_dot >= 0.0f) {
         dwdz = (wc - w_get(k - 1, j, i)) / ds_km;
     } else {
         dwdz = (w_get(k + 1, j, i) - wc) / ds_k;
     }
 
-    double tend = -msf * (u_w * dwdx + v_w * dwdy) - zeta_dot * dwdz;
+    float tend = -msf * (u_w * dwdx + v_w * dwdy) - zeta_dot * dwdz;
 
     if (cfg.km_const > 0.0) {
-        const double lap_h = msf * msf * (
-            (w_get(k, j, i + 1) - 2.0 * wc + w_get(k, j, i - 1)) / (cfg.dx_m * cfg.dx_m) +
-            (w_get(k, j + 1, i) - 2.0 * wc + w_get(k, j - 1, i)) / (cfg.dy_m * cfg.dy_m)
+        const float lap_h = msf * msf * (
+            (w_get(k, j, i + 1) - 2.0f * wc + w_get(k, j, i - 1)) / (dx_f * dx_f) +
+            (w_get(k, j + 1, i) - 2.0f * wc + w_get(k, j - 1, i)) / (dy_f * dy_f)
         );
-        const double dz_w = g_w * 0.5 * (ds_k + ds_km);
-        const double dz_p = (1.0 + g.db_s[k] * hs) * ds_k;
-        const double dz_m = (1.0 + g.db_s[k - 1] * hs) * ds_km;
-        const double lap_v = ((w_get(k + 1, j, i) - wc) / dz_p - (wc - w_get(k - 1, j, i)) / dz_m) / dz_w;
-        tend += cfg.km_const * (lap_h + lap_v);
+        const float dz_w = g_w * 0.5f * (ds_k + ds_km);
+        const float dz_p = (1.0f + static_cast<float>(g.db_s[k]) * hs) * ds_k;
+        const float dz_m = (1.0f + static_cast<float>(g.db_s[k - 1]) * hs) * ds_km;
+        const float lap_v = ((w_get(k + 1, j, i) - wc) / dz_p - (wc - w_get(k - 1, j, i)) / dz_m) / dz_w;
+        tend += static_cast<float>(cfg.km_const) * (lap_h + lap_v);
     }
 
     if (cfg.bc_x == 2 || cfg.bc_y == 2) {
-        double tau = 0.0;
+        const float tau_max = static_cast<float>(cfg.lbc_tau_max_s);
+        float tau = 0.0f;
         if (cfg.bc_x == 2) {
-            if (cfg.lbc_edges & 1) tau = fmax(tau, davies_weight(i, cfg.lbc_rim_width, cfg.lbc_tau_max_s));
-            if (cfg.lbc_edges & 2) tau = fmax(tau, davies_weight(nx - 1 - i, cfg.lbc_rim_width, cfg.lbc_tau_max_s));
+            if (cfg.lbc_edges & 1) tau = fmaxf(tau, davies_weight_f(i, cfg.lbc_rim_width, tau_max));
+            if (cfg.lbc_edges & 2) tau = fmaxf(tau, davies_weight_f(nx - 1 - i, cfg.lbc_rim_width, tau_max));
         }
         if (cfg.bc_y == 2) {
-            if (cfg.lbc_edges & 4) tau = fmax(tau, davies_weight(j, cfg.lbc_rim_width, cfg.lbc_tau_max_s));
-            if (cfg.lbc_edges & 8) tau = fmax(tau, davies_weight(ny - 1 - j, cfg.lbc_rim_width, cfg.lbc_tau_max_s));
+            if (cfg.lbc_edges & 4) tau = fmaxf(tau, davies_weight_f(j, cfg.lbc_rim_width, tau_max));
+            if (cfg.lbc_edges & 8) tau = fmaxf(tau, davies_weight_f(ny - 1 - j, cfg.lbc_rim_width, tau_max));
         }
         tend -= tau * wc;
     }
 
-    rw[idx] = static_cast<float>(tend);
+    rw[idx] = tend;
 }
 
 // ---------------------------------------------------------------------------
@@ -786,46 +825,49 @@ __global__ void nh_compute_div_kernel(
 
     const int32_t nz = cfg.nz, ny = cfg.ny, nx = cfg.nx;
     const size_t idx = static_cast<size_t>(k) * ny * nx + static_cast<size_t>(j) * nx + i;
-    const double msf = g.msf[j * nx + i];
-    const double hs = g.hs[j * nx + i];
-    const double g_s = 1.0 + g.db_s[k] * hs;
+    const float dx_f = static_cast<float>(cfg.dx_m);
+    const float dy_f = static_cast<float>(cfg.dy_m);
+    const float db_s_k = static_cast<float>(g.db_s[k]);
+    const float msf = static_cast<float>(g.msf[j * nx + i]);
+    const float hs = static_cast<float>(g.hs[j * nx + i]);
+    const float g_s = 1.0f + db_s_k * hs;
 
-    const double u_r = read_u(u, k, j, i + 1, nz, ny, nx, cfg.bc_x, cfg.bc_y);
-    const double u_l = read_u(u, k, j, i,     nz, ny, nx, cfg.bc_x, cfg.bc_y);
-    const double v_n = read_v(v, k, j + 1, i, nz, ny, nx, cfg.bc_x, cfg.bc_y);
-    const double v_s = read_v(v, k, j,     i, nz, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float u_r = read_u_f(u, k, j, i + 1, nz, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float u_l = read_u_f(u, k, j, i,     nz, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float v_n = read_v_f(v, k, j + 1, i, nz, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float v_s = read_v_f(v, k, j,     i, nz, ny, nx, cfg.bc_x, cfg.bc_y);
 
-    const double msf_r = read_2d(g.msf, j, i + 1, ny, nx, cfg.bc_x, cfg.bc_y);
-    const double msf_l = read_2d(g.msf, j, i - 1, ny, nx, cfg.bc_x, cfg.bc_y);
-    const double msf_n = read_2d(g.msf, j + 1, i, ny, nx, cfg.bc_x, cfg.bc_y);
-    const double msf_s = read_2d(g.msf, j - 1, i, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float msf_r = read_2d_f(g.msf, j, i + 1, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float msf_l = read_2d_f(g.msf, j, i - 1, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float msf_n = read_2d_f(g.msf, j + 1, i, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float msf_s = read_2d_f(g.msf, j - 1, i, ny, nx, cfg.bc_x, cfg.bc_y);
 
-    const double hs_r = read_2d(g.hs, j, i + 1, ny, nx, cfg.bc_x, cfg.bc_y);
-    const double hs_l = read_2d(g.hs, j, i - 1, ny, nx, cfg.bc_x, cfg.bc_y);
-    const double hs_n = read_2d(g.hs, j + 1, i, ny, nx, cfg.bc_x, cfg.bc_y);
-    const double hs_s = read_2d(g.hs, j - 1, i, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float hs_r = read_2d_f(g.hs, j, i + 1, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float hs_l = read_2d_f(g.hs, j, i - 1, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float hs_n = read_2d_f(g.hs, j + 1, i, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float hs_s = read_2d_f(g.hs, j - 1, i, ny, nx, cfg.bc_x, cfg.bc_y);
 
-    const double gu_r = 1.0 + g.db_s[k] * 0.5 * (hs + hs_r);
-    const double gu_l = 1.0 + g.db_s[k] * 0.5 * (hs + hs_l);
-    const double gv_n = 1.0 + g.db_s[k] * 0.5 * (hs + hs_n);
-    const double gv_s = 1.0 + g.db_s[k] * 0.5 * (hs + hs_s);
+    const float gu_r = 1.0f + db_s_k * 0.5f * (hs + hs_r);
+    const float gu_l = 1.0f + db_s_k * 0.5f * (hs + hs_l);
+    const float gv_n = 1.0f + db_s_k * 0.5f * (hs + hs_n);
+    const float gv_s = 1.0f + db_s_k * 0.5f * (hs + hs_s);
 
-    const double mu_r = 0.5 * (msf + msf_r);
-    const double mu_l = 0.5 * (msf + msf_l);
-    const double mv_n = 0.5 * (msf + msf_n);
-    const double mv_s = 0.5 * (msf + msf_s);
+    const float mu_r = 0.5f * (msf + msf_r);
+    const float mu_l = 0.5f * (msf + msf_l);
+    const float mv_n = 0.5f * (msf + msf_n);
+    const float mv_s = 0.5f * (msf + msf_s);
 
-    const double hdiv = msf * msf * (
-        (gu_r * u_r / mu_r - gu_l * u_l / mu_l) / cfg.dx_m +
-        (gv_n * v_n / mv_n - gv_s * v_s / mv_s) / cfg.dy_m
+    const float hdiv = msf * msf * (
+        (gu_r * u_r / mu_r - gu_l * u_l / mu_l) / dx_f +
+        (gv_n * v_n / mv_n - gv_s * v_s / mv_s) / dy_f
     );
 
-    double gz_lo = 0.0, gz_hi = 0.0;
-    compute_contravariant_at_scalar_col(cfg, g, u, v, w, k,     j, i, gz_lo);
-    compute_contravariant_at_scalar_col(cfg, g, u, v, w, k + 1, j, i, gz_hi);
-    const double vdiv = (gz_hi - gz_lo) / g.dzeta[k];
+    float gz_lo = 0.0f, gz_hi = 0.0f;
+    compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, k,     j, i, gz_lo);
+    compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, k + 1, j, i, gz_hi);
+    const float vdiv = (gz_hi - gz_lo) / static_cast<float>(g.dzeta[k]);
 
-    div3d[idx] = static_cast<float>((hdiv + vdiv) / fmax(g_s, 1e-4));
+    div3d[idx] = (hdiv + vdiv) / fmaxf(g_s, 1e-4f);
 }
 
 __global__ void nh_acoustic_u_kernel(
@@ -877,8 +919,8 @@ __global__ void nh_acoustic_u_kernel(
     }
 
     const double z_u = g.zeta_s[k] + g.b_s[k] * 0.5 * (hs_l + hs_r);
-    double thb, pib, dthdz, rhob, cs2b, qvl, qhl, qvr, qhr;
-    eval_ref_state(z_u, cfg.theta_sfc_k, cfg.p_sfc_pa, cfg.n_ref_s, thb, pib, dthdz, rhob, cs2b);
+    double qvl, qhl, qvr, qhr;
+    const double thb = eval_theta_bar(z_u, cfg.theta_sfc_k, cfg.n_ref_s);
     const double vf_l = moisture_load_scalar(cfg.has_moist, idxl, qv, qc, qr, qi, qs, qg, qvl, qhl);
     const double vf_r = moisture_load_scalar(cfg.has_moist, idxr, qv, qc, qr, qi, qs, qg, qvr, qhr);
     const double thv_u = 0.5 * (
@@ -947,8 +989,8 @@ __global__ void nh_acoustic_v_kernel(
     }
 
     const double z_v = g.zeta_s[k] + g.b_s[k] * 0.5 * (hs_l + hs_r);
-    double thb, pib, dthdz, rhob, cs2b, qvl, qhl, qvr, qhr;
-    eval_ref_state(z_v, cfg.theta_sfc_k, cfg.p_sfc_pa, cfg.n_ref_s, thb, pib, dthdz, rhob, cs2b);
+    double qvl, qhl, qvr, qhr;
+    const double thb = eval_theta_bar(z_v, cfg.theta_sfc_k, cfg.n_ref_s);
     const double vf_l = moisture_load_scalar(cfg.has_moist, idxl, qv, qc, qr, qi, qs, qg, qvl, qhl);
     const double vf_r = moisture_load_scalar(cfg.has_moist, idxr, qv, qc, qr, qi, qs, qg, qvr, qhr);
     const double thv_v = 0.5 * (
@@ -1070,8 +1112,9 @@ __global__ void nh_acoustic_vert_implicit_kernel(
     //   SO in Pass 1, as soon as we compute pi_hat[k] from pi_m[k], we can overwrite pip[k-1] = pi_hat[k-1] (keeping pi_hat_prev in a register!),
     //   and overwrite pip[nz-1] = pi_hat[nz-1] at the end of Pass 1!! Zero extra arrays needed AND 100% coalesced!!
 
+    const double pi_sfc = pow(cfg.p_sfc_pa / P0_PA, KAPPA);
     double om_lo = omega_h_at(0);
-    double ap_prev = 0.0, am_prev = 0.0, pi_eff_prev = 0.0, pi_hat_prev = 0.0;
+    double ap_prev = 0.0, am_prev = 0.0, pi_eff_prev = 0.0, pi_hat_prev = 0.0, thb_km = 0.0;
     double wm_prev = static_cast<double>(w[h_idx]);
 
     for (int32_t k = 0; k < nz; ++k) {
@@ -1080,8 +1123,8 @@ __global__ void nh_acoustic_vert_implicit_kernel(
         const double g_s = 1.0 + g.db_s[k] * hs;
         const double dz_s = g_s * g.dzeta[k];
 
-        double thb, pib, dthdz, rhob, cs2b;
-        eval_ref_state(z_s, cfg.theta_sfc_k, cfg.p_sfc_pa, cfg.n_ref_s, thb, pib, dthdz, rhob, cs2b);
+        double thb = 0.0, pib = 0.0;
+        eval_theta_pi_bar_pis(z_s, cfg.theta_sfc_k, pi_sfc, cfg.n_ref_s, thb, pib);
         const double c_ac = (R_D / CV_D) * pib;
 
         const double om_hi = omega_h_at(k + 1);
@@ -1121,16 +1164,12 @@ __global__ void nh_acoustic_vert_implicit_kernel(
             const double g_w = 1.0 + g.db_w[k] * hs;
             const double dz_w = g_w * 0.5 * (g.dzeta[k] + g.dzeta[k - 1]);
 
-            double thb_w, pib_w, dth_w, rhob_w, cs2_w;
-            eval_ref_state(z_w, cfg.theta_sfc_k, cfg.p_sfc_pa, cfg.n_ref_s, thb_w, pib_w, dth_w, rhob_w, cs2_w);
+            const double thb_w = eval_theta_bar(z_w, cfg.theta_sfc_k, cfg.n_ref_s);
 
             const size_t idx_km = static_cast<size_t>(k - 1) * col_stride + h_idx;
             double qvm, qhm, qvp, qhp;
             const double vfm = moisture_load_scalar(cfg.has_moist, idx_km, qv, qc, qr, qi, qs, qg, qvm, qhm);
             const double vfp = moisture_load_scalar(cfg.has_moist, idx,    qv, qc, qr, qi, qs, qg, qvp, qhp);
-
-            double thb_km, pib_km, d_km, r_km, c_km;
-            eval_ref_state(g.zeta_s[k - 1] + g.b_s[k - 1] * hs, cfg.theta_sfc_k, cfg.p_sfc_pa, cfg.n_ref_s, thb_km, pib_km, d_km, r_km, c_km);
 
             const double wt = g.dzeta[k - 1] / (g.dzeta[k] + g.dzeta[k - 1]);
             const double dthv_km = (thb_km + static_cast<double>(thp[idx_km])) * vfm - thb_km;
@@ -1166,11 +1205,13 @@ __global__ void nh_acoustic_vert_implicit_kernel(
         am_prev = am;
         pi_eff_prev = pi_eff;
         pi_hat_prev = pi_hat;
+        thb_km = thb;
     }
     pip[static_cast<size_t>(nz - 1) * col_stride + h_idx] = static_cast<float>(pi_hat_prev);
 
     // Pass 2: Backward substitution for w[nz-1..1], then update pi_p[nz-1..0] and theta_p[nz-1..0]
     double w_above = 0.0; // w[nz] = 0
+    double thb_w_hi = eval_theta_bar(g.zeta_w[nz] + g.b_w[nz] * hs, cfg.theta_sfc_k, cfg.n_ref_s);
     for (int32_t k = nz - 1; k >= 0; --k) {
         double w_below = w0_new;
         if (k > 0) {
@@ -1183,8 +1224,8 @@ __global__ void nh_acoustic_vert_implicit_kernel(
         const double z_s = g.zeta_s[k] + g.b_s[k] * hs;
         const double g_s = 1.0 + g.db_s[k] * hs;
         const double dz_s = g_s * g.dzeta[k];
-        double thb, pib, dthdz, rhob, cs2b;
-        eval_ref_state(z_s, cfg.theta_sfc_k, cfg.p_sfc_pa, cfg.n_ref_s, thb, pib, dthdz, rhob, cs2b);
+        double thb = 0.0, pib = 0.0;
+        eval_theta_pi_bar_pis(z_s, cfg.theta_sfc_k, pi_sfc, cfg.n_ref_s, thb, pib);
         const double c_ac = (R_D / CV_D) * pib;
         const double ap = c_ac / dz_s - GRAVITY / (2.0 * CP_D * thb);
         const double am = c_ac / dz_s + GRAVITY / (2.0 * CP_D * thb);
@@ -1194,123 +1235,129 @@ __global__ void nh_acoustic_vert_implicit_kernel(
         pip[idx] = static_cast<float>(pi_new);
 
         // Symplectic Forward-Backward vertical theta_bar advection using updated w^{m+1}
-        double thb_w_lo, thb_w_hi, pi0_d, d0_d, r0_d, c0_d;
-        eval_ref_state(g.zeta_w[k]     + g.b_w[k]     * hs, cfg.theta_sfc_k, cfg.p_sfc_pa, cfg.n_ref_s, thb_w_lo, pi0_d, d0_d, r0_d, c0_d);
-        eval_ref_state(g.zeta_w[k + 1] + g.b_w[k + 1] * hs, cfg.theta_sfc_k, cfg.p_sfc_pa, cfg.n_ref_s, thb_w_hi, pi0_d, d0_d, r0_d, c0_d);
+        const double thb_w_lo = eval_theta_bar(g.zeta_w[k] + g.b_w[k] * hs, cfg.theta_sfc_k, cfg.n_ref_s);
         const double w_avg = 0.5 * (w_above + w_below);
         const double th_new = static_cast<double>(thp[idx])
                             + dts * (static_cast<double>(rth[idx]) - w_avg * (thb_w_hi - thb_w_lo) / dz_s);
         thp[idx] = static_cast<float>(th_new);
 
+        thb_w_hi = thb_w_lo;
         w_above = w_below;
     }
 }
 
 // ---------------------------------------------------------------------------
-// Kernel 4: Positive-definite conservative 3D FCT Zalesak tracer advection
+// Kernel 4: Positive-definite conservative 3D FCT Zalesak tracer advection (FP32)
 // Conserves integral sum(rho_bar * G_s * dzeta / msf^2 * q) >= 0 everywhere.
 // ---------------------------------------------------------------------------
-__device__ inline double cell_mass_vol(
-    const NhGridConfig& cfg, const DeviceStaticGrid& g, int32_t k, int32_t j, int32_t i
+__device__ inline float cell_mass_vol_f(
+    const NhGridConfig& cfg, const DeviceStaticGrid& g, float pi_sfc_f,
+    int32_t k, int32_t j, int32_t i
 ) {
-    const double hs = g.hs[j * cfg.nx + i];
-    const double msf = g.msf[j * cfg.nx + i];
-    const double z_s = g.zeta_s[k] + g.b_s[k] * hs;
-    const double g_s = 1.0 + g.db_s[k] * hs;
-    double thb, pib, dthdz, rhob, cs2b;
-    eval_ref_state(z_s, cfg.theta_sfc_k, cfg.p_sfc_pa, cfg.n_ref_s, thb, pib, dthdz, rhob, cs2b);
-    return rhob * g_s * g.dzeta[k] / (msf * msf);
+    const float hs = static_cast<float>(g.hs[j * cfg.nx + i]);
+    const float msf = static_cast<float>(g.msf[j * cfg.nx + i]);
+    const float z_s = static_cast<float>(g.zeta_s[k]) + static_cast<float>(g.b_s[k]) * hs;
+    const float g_s = 1.0f + static_cast<float>(g.db_s[k]) * hs;
+    const float rhob = eval_rho_bar_f32(
+        z_s, static_cast<float>(cfg.theta_sfc_k), pi_sfc_f, static_cast<float>(cfg.n_ref_s)
+    );
+    return rhob * g_s * static_cast<float>(g.dzeta[k]) / (msf * msf);
 }
 
-__device__ inline double face_flux_x(
-    const NhGridConfig& cfg, const DeviceStaticGrid& g,
+__device__ inline float face_flux_x_f(
+    const NhGridConfig& cfg, const DeviceStaticGrid& g, float pi_sfc_f,
     const float* u, int32_t k, int32_t j, int32_t i_face
 ) {
-    if (cfg.bc_x != 1 && (i_face <= 0 || i_face >= cfg.nx)) return 0.0;
+    if (cfg.bc_x != 1 && (i_face <= 0 || i_face >= cfg.nx)) return 0.0f;
     const int32_t il = (cfg.bc_x == 1) ? wrap_idx(i_face - 1, cfg.nx) : (i_face - 1);
     const int32_t ir = (cfg.bc_x == 1) ? wrap_idx(i_face, cfg.nx) : i_face;
-    const double hs_u = 0.5 * (g.hs[j * cfg.nx + il] + g.hs[j * cfg.nx + ir]);
-    const double msf_u = 0.5 * (g.msf[j * cfg.nx + il] + g.msf[j * cfg.nx + ir]);
-    const double z_u = g.zeta_s[k] + g.b_s[k] * hs_u;
-    const double g_u = 1.0 + g.db_s[k] * hs_u;
-    double thb, pib, dthdz, rhob, cs2b;
-    eval_ref_state(z_u, cfg.theta_sfc_k, cfg.p_sfc_pa, cfg.n_ref_s, thb, pib, dthdz, rhob, cs2b);
-    const double uval = read_u(u, k, j, i_face, cfg.nz, cfg.ny, cfg.nx, cfg.bc_x, cfg.bc_y);
-    return rhob * g_u * g.dzeta[k] * uval / msf_u;
+    const float hs_u = 0.5f * (static_cast<float>(g.hs[j * cfg.nx + il]) + static_cast<float>(g.hs[j * cfg.nx + ir]));
+    const float msf_u = 0.5f * (static_cast<float>(g.msf[j * cfg.nx + il]) + static_cast<float>(g.msf[j * cfg.nx + ir]));
+    const float z_u = static_cast<float>(g.zeta_s[k]) + static_cast<float>(g.b_s[k]) * hs_u;
+    const float g_u = 1.0f + static_cast<float>(g.db_s[k]) * hs_u;
+    const float rhob = eval_rho_bar_f32(
+        z_u, static_cast<float>(cfg.theta_sfc_k), pi_sfc_f, static_cast<float>(cfg.n_ref_s)
+    );
+    const float uval = read_u_f(u, k, j, i_face, cfg.nz, cfg.ny, cfg.nx, cfg.bc_x, cfg.bc_y);
+    return rhob * g_u * static_cast<float>(g.dzeta[k]) * uval / msf_u;
 }
 
-__device__ inline double face_flux_y(
-    const NhGridConfig& cfg, const DeviceStaticGrid& g,
+__device__ inline float face_flux_y_f(
+    const NhGridConfig& cfg, const DeviceStaticGrid& g, float pi_sfc_f,
     const float* v, int32_t k, int32_t j_face, int32_t i
 ) {
-    if (cfg.bc_y != 1 && (j_face <= 0 || j_face >= cfg.ny)) return 0.0;
+    if (cfg.bc_y != 1 && (j_face <= 0 || j_face >= cfg.ny)) return 0.0f;
     const int32_t jl = (cfg.bc_y == 1) ? wrap_idx(j_face - 1, cfg.ny) : (j_face - 1);
     const int32_t jr = (cfg.bc_y == 1) ? wrap_idx(j_face, cfg.ny) : j_face;
-    const double hs_v = 0.5 * (g.hs[jl * cfg.nx + i] + g.hs[jr * cfg.nx + i]);
-    const double msf_v = 0.5 * (g.msf[jl * cfg.nx + i] + g.msf[jr * cfg.nx + i]);
-    const double z_v = g.zeta_s[k] + g.b_s[k] * hs_v;
-    const double g_v = 1.0 + g.db_s[k] * hs_v;
-    double thb, pib, dthdz, rhob, cs2b;
-    eval_ref_state(z_v, cfg.theta_sfc_k, cfg.p_sfc_pa, cfg.n_ref_s, thb, pib, dthdz, rhob, cs2b);
-    const double vval = read_v(v, k, j_face, i, cfg.nz, cfg.ny, cfg.nx, cfg.bc_x, cfg.bc_y);
-    return rhob * g_v * g.dzeta[k] * vval / msf_v;
+    const float hs_v = 0.5f * (static_cast<float>(g.hs[jl * cfg.nx + i]) + static_cast<float>(g.hs[jr * cfg.nx + i]));
+    const float msf_v = 0.5f * (static_cast<float>(g.msf[jl * cfg.nx + i]) + static_cast<float>(g.msf[jr * cfg.nx + i]));
+    const float z_v = static_cast<float>(g.zeta_s[k]) + static_cast<float>(g.b_s[k]) * hs_v;
+    const float g_v = 1.0f + static_cast<float>(g.db_s[k]) * hs_v;
+    const float rhob = eval_rho_bar_f32(
+        z_v, static_cast<float>(cfg.theta_sfc_k), pi_sfc_f, static_cast<float>(cfg.n_ref_s)
+    );
+    const float vval = read_v_f(v, k, j_face, i, cfg.nz, cfg.ny, cfg.nx, cfg.bc_x, cfg.bc_y);
+    return rhob * g_v * static_cast<float>(g.dzeta[k]) * vval / msf_v;
 }
 
-__device__ inline double face_flux_z(
-    const NhGridConfig& cfg, const DeviceStaticGrid& g,
+__device__ inline float face_flux_z_f(
+    const NhGridConfig& cfg, const DeviceStaticGrid& g, float pi_sfc_f,
     const float* u, const float* v, const float* w, int32_t k_face, int32_t j, int32_t i
 ) {
-    if (k_face <= 0 || k_face >= cfg.nz) return 0.0;
-    const double hs = g.hs[j * cfg.nx + i];
-    const double msf = g.msf[j * cfg.nx + i];
-    const double z_w = g.zeta_w[k_face] + g.b_w[k_face] * hs;
-    double thb, pib, dthdz, rhob, cs2b, gz = 0.0;
-    eval_ref_state(z_w, cfg.theta_sfc_k, cfg.p_sfc_pa, cfg.n_ref_s, thb, pib, dthdz, rhob, cs2b);
-    compute_contravariant_at_scalar_col(cfg, g, u, v, w, k_face, j, i, gz);
+    if (k_face <= 0 || k_face >= cfg.nz) return 0.0f;
+    const float hs = static_cast<float>(g.hs[j * cfg.nx + i]);
+    const float msf = static_cast<float>(g.msf[j * cfg.nx + i]);
+    const float z_w = static_cast<float>(g.zeta_w[k_face]) + static_cast<float>(g.b_w[k_face]) * hs;
+    const float rhob = eval_rho_bar_f32(
+        z_w, static_cast<float>(cfg.theta_sfc_k), pi_sfc_f, static_cast<float>(cfg.n_ref_s)
+    );
+    float gz = 0.0f;
+    compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, k_face, j, i, gz);
     return rhob * gz / (msf * msf);
 }
 
-__device__ inline void compute_fluxes_for_cell(
-    const NhGridConfig& cfg, const DeviceStaticGrid& g,
+__device__ inline void compute_fluxes_for_cell_f(
+    const NhGridConfig& cfg, const DeviceStaticGrid& g, float pi_sfc_f,
     const float* q, const float* u, const float* v, const float* w,
     int32_t k, int32_t j, int32_t i,
-    double& fx_l_low, double& fx_l_hi,
-    double& fy_l_low, double& fy_l_hi,
-    double& fz_l_low, double& fz_l_hi
+    float& fx_l_low, float& fx_l_hi,
+    float& fy_l_low, float& fy_l_hi,
+    float& fz_l_low, float& fz_l_hi
 ) {
     const int32_t nz = cfg.nz, ny = cfg.ny, nx = cfg.nx;
     // Left x-face (i - 1/2)
-    const double ux = face_flux_x(cfg, g, u, k, j, i);
-    const double q_xl_up = (ux >= 0.0)
-        ? read_s(q, k, j, i - 1, nz, ny, nx, cfg.bc_x, cfg.bc_y)
-        : read_s(q, k, j, i,     nz, ny, nx, cfg.bc_x, cfg.bc_y);
-    const double q_xl_ho = horiz_face_val_x(q, k, j, i, ux, nz, ny, nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
+    const float ux = face_flux_x_f(cfg, g, pi_sfc_f, u, k, j, i);
+    const float q_xl_up = (ux >= 0.0f)
+        ? read_s_f(q, k, j, i - 1, nz, ny, nx, cfg.bc_x, cfg.bc_y)
+        : read_s_f(q, k, j, i,     nz, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float q_xl_ho = horiz_face_val_x_f(q, k, j, i, ux, nz, ny, nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
     fx_l_low = ux * q_xl_up;
-    fx_l_hi  = ux * fmax(0.0, q_xl_ho);
+    fx_l_hi  = ux * fmaxf(0.0f, q_xl_ho);
 
     // South y-face (j - 1/2)
-    const double vy = face_flux_y(cfg, g, v, k, j, i);
-    const double q_yl_up = (vy >= 0.0)
-        ? read_s(q, k, j - 1, i, nz, ny, nx, cfg.bc_x, cfg.bc_y)
-        : read_s(q, k, j,     i, nz, ny, nx, cfg.bc_x, cfg.bc_y);
-    const double q_yl_ho = horiz_face_val_y(q, k, j, i, vy, nz, ny, nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
+    const float vy = face_flux_y_f(cfg, g, pi_sfc_f, v, k, j, i);
+    const float q_yl_up = (vy >= 0.0f)
+        ? read_s_f(q, k, j - 1, i, nz, ny, nx, cfg.bc_x, cfg.bc_y)
+        : read_s_f(q, k, j,     i, nz, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float q_yl_ho = horiz_face_val_y_f(q, k, j, i, vy, nz, ny, nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
     fy_l_low = vy * q_yl_up;
-    fy_l_hi  = vy * fmax(0.0, q_yl_ho);
+    fy_l_hi  = vy * fmaxf(0.0f, q_yl_ho);
 
     // Bottom z-face (k - 1/2)
-    const double wz = face_flux_z(cfg, g, u, v, w, k, j, i);
-    const double q_zl_up = (wz >= 0.0)
-        ? read_s(q, k - 1, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y)
-        : read_s(q, k,     j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y);
-    const double q_zl_ho = vert_tvd_face_val(q, k, j, i, wz, g.dzeta, nz, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float wz = face_flux_z_f(cfg, g, pi_sfc_f, u, v, w, k, j, i);
+    const float q_zl_up = (wz >= 0.0f)
+        ? read_s_f(q, k - 1, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y)
+        : read_s_f(q, k,     j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float q_zl_ho = vert_tvd_face_val_f(q, k, j, i, wz, g.dzeta, nz, ny, nx, cfg.bc_x, cfg.bc_y);
     fz_l_low = wz * q_zl_up;
-    fz_l_hi  = wz * fmax(0.0, q_zl_ho);
+    fz_l_hi  = wz * fmaxf(0.0f, q_zl_ho);
 }
 
 __global__ void nh_tracer_cfl_kernel(
     NhGridConfig cfg,
     DeviceStaticGrid g,
-    double dt_s,
+    float dt_s,
+    float pi_sfc_f,
     const float* u,
     const float* v,
     const float* w,
@@ -1321,17 +1368,19 @@ __global__ void nh_tracer_cfl_kernel(
     const int32_t k = blockIdx.z;
     float cfl = 0.0f;
     if (k < cfg.nz && j < cfg.ny && i < cfg.nx) {
-        const double vol = fmax(cell_mass_vol(cfg, g, k, j, i), 1e-12);
-        const double fx_r = face_flux_x(cfg, g, u, k, j, i + 1);
-        const double fx_l = face_flux_x(cfg, g, u, k, j, i);
-        const double fy_n = face_flux_y(cfg, g, v, k, j + 1, i);
-        const double fy_s = face_flux_y(cfg, g, v, k, j, i);
-        const double fz_t = face_flux_z(cfg, g, u, v, w, k + 1, j, i);
-        const double fz_b = face_flux_z(cfg, g, u, v, w, k, j, i);
-        const double out = (fmax(0.0, fx_r) + fmax(0.0, -fx_l)) / cfg.dx_m
-                         + (fmax(0.0, fy_n) + fmax(0.0, -fy_s)) / cfg.dy_m
-                         +  fmax(0.0, fz_t) + fmax(0.0, -fz_b);
-        cfl = static_cast<float>((dt_s * out) / vol);
+        const float dx_f = static_cast<float>(cfg.dx_m);
+        const float dy_f = static_cast<float>(cfg.dy_m);
+        const float vol = fmaxf(cell_mass_vol_f(cfg, g, pi_sfc_f, k, j, i), 1e-12f);
+        const float fx_r = face_flux_x_f(cfg, g, pi_sfc_f, u, k, j, i + 1);
+        const float fx_l = face_flux_x_f(cfg, g, pi_sfc_f, u, k, j, i);
+        const float fy_n = face_flux_y_f(cfg, g, pi_sfc_f, v, k, j + 1, i);
+        const float fy_s = face_flux_y_f(cfg, g, pi_sfc_f, v, k, j, i);
+        const float fz_t = face_flux_z_f(cfg, g, pi_sfc_f, u, v, w, k + 1, j, i);
+        const float fz_b = face_flux_z_f(cfg, g, pi_sfc_f, u, v, w, k, j, i);
+        const float out = (fmaxf(0.0f, fx_r) + fmaxf(0.0f, -fx_l)) / dx_f
+                        + (fmaxf(0.0f, fy_n) + fmaxf(0.0f, -fy_s)) / dy_f
+                        +  fmaxf(0.0f, fz_t) + fmaxf(0.0f, -fz_b);
+        cfl = (dt_s * out) / vol;
     }
     const unsigned int lane = threadIdx.x & 31;
     for (int offset = 16; offset > 0; offset >>= 1) {
@@ -1345,7 +1394,8 @@ __global__ void nh_tracer_cfl_kernel(
 __global__ void nh_tracer_fct_pass1_kernel(
     NhGridConfig cfg,
     DeviceStaticGrid g,
-    double dt_q,
+    float dt_q,
+    float pi_sfc_f,
     const float* u,
     const float* v,
     const float* w,
@@ -1359,66 +1409,69 @@ __global__ void nh_tracer_fct_pass1_kernel(
     if (k >= cfg.nz || j >= cfg.ny || i >= cfg.nx) return;
 
     const size_t idx = static_cast<size_t>(k) * cfg.ny * cfg.nx + static_cast<size_t>(j) * cfg.nx + i;
-    const double vol = fmax(cell_mass_vol(cfg, g, k, j, i), 1e-12);
+    const float dx_f = static_cast<float>(cfg.dx_m);
+    const float dy_f = static_cast<float>(cfg.dy_m);
+    const float vol = fmaxf(cell_mass_vol_f(cfg, g, pi_sfc_f, k, j, i), 1e-12f);
 
-    double fxl_low, fxl_hi, fyl_low, fyl_hi, fzl_low, fzl_hi;
-    double fxr_low, fxr_hi, fyr_low, fyr_hi, fzr_low, fzr_hi;
-    compute_fluxes_for_cell(cfg, g, q, u, v, w, k, j, i, fxl_low, fxl_hi, fyl_low, fyl_hi, fzl_low, fzl_hi);
+    float fxl_low, fxl_hi, fyl_low, fyl_hi, fzl_low, fzl_hi;
+    float fxr_low, fxr_hi, fyr_low, fyr_hi, fzr_low, fzr_hi;
+    compute_fluxes_for_cell_f(cfg, g, pi_sfc_f, q, u, v, w, k, j, i, fxl_low, fxl_hi, fyl_low, fyl_hi, fzl_low, fzl_hi);
 
     // Right / North / Top face fluxes
     {
-        const double ux = face_flux_x(cfg, g, u, k, j, i + 1);
-        const double q_up = (ux >= 0.0)
-            ? read_s(q, k, j, i,     cfg.nz, cfg.ny, cfg.nx, cfg.bc_x, cfg.bc_y)
-            : read_s(q, k, j, i + 1, cfg.nz, cfg.ny, cfg.nx, cfg.bc_x, cfg.bc_y);
-        const double q_ho = horiz_face_val_x(q, k, j, i + 1, ux, cfg.nz, cfg.ny, cfg.nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
+        const float ux = face_flux_x_f(cfg, g, pi_sfc_f, u, k, j, i + 1);
+        const float q_up = (ux >= 0.0f)
+            ? read_s_f(q, k, j, i,     cfg.nz, cfg.ny, cfg.nx, cfg.bc_x, cfg.bc_y)
+            : read_s_f(q, k, j, i + 1, cfg.nz, cfg.ny, cfg.nx, cfg.bc_x, cfg.bc_y);
+        const float q_ho = horiz_face_val_x_f(q, k, j, i + 1, ux, cfg.nz, cfg.ny, cfg.nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
         fxr_low = ux * q_up;
-        fxr_hi  = ux * fmax(0.0, q_ho);
+        fxr_hi  = ux * fmaxf(0.0f, q_ho);
     }
     {
-        const double vy = face_flux_y(cfg, g, v, k, j + 1, i);
-        const double q_up = (vy >= 0.0)
-            ? read_s(q, k, j,     i, cfg.nz, cfg.ny, cfg.nx, cfg.bc_x, cfg.bc_y)
-            : read_s(q, k, j + 1, i, cfg.nz, cfg.ny, cfg.nx, cfg.bc_x, cfg.bc_y);
-        const double q_ho = horiz_face_val_y(q, k, j + 1, i, vy, cfg.nz, cfg.ny, cfg.nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
+        const float vy = face_flux_y_f(cfg, g, pi_sfc_f, v, k, j + 1, i);
+        const float q_up = (vy >= 0.0f)
+            ? read_s_f(q, k, j,     i, cfg.nz, cfg.ny, cfg.nx, cfg.bc_x, cfg.bc_y)
+            : read_s_f(q, k, j + 1, i, cfg.nz, cfg.ny, cfg.nx, cfg.bc_x, cfg.bc_y);
+        const float q_ho = horiz_face_val_y_f(q, k, j + 1, i, vy, cfg.nz, cfg.ny, cfg.nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
         fyr_low = vy * q_up;
-        fyr_hi  = vy * fmax(0.0, q_ho);
+        fyr_hi  = vy * fmaxf(0.0f, q_ho);
     }
     {
-        const double wz = face_flux_z(cfg, g, u, v, w, k + 1, j, i);
-        const double q_up = (wz >= 0.0)
-            ? read_s(q, k,     j, i, cfg.nz, cfg.ny, cfg.nx, cfg.bc_x, cfg.bc_y)
-            : read_s(q, k + 1, j, i, cfg.nz, cfg.ny, cfg.nx, cfg.bc_x, cfg.bc_y);
-        const double q_ho = vert_tvd_face_val(q, k + 1, j, i, wz, g.dzeta, cfg.nz, cfg.ny, cfg.nx, cfg.bc_x, cfg.bc_y);
+        const float wz = face_flux_z_f(cfg, g, pi_sfc_f, u, v, w, k + 1, j, i);
+        const float q_up = (wz >= 0.0f)
+            ? read_s_f(q, k,     j, i, cfg.nz, cfg.ny, cfg.nx, cfg.bc_x, cfg.bc_y)
+            : read_s_f(q, k + 1, j, i, cfg.nz, cfg.ny, cfg.nx, cfg.bc_x, cfg.bc_y);
+        const float q_ho = vert_tvd_face_val_f(q, k + 1, j, i, wz, g.dzeta, cfg.nz, cfg.ny, cfg.nx, cfg.bc_x, cfg.bc_y);
         fzr_low = wz * q_up;
-        fzr_hi  = wz * fmax(0.0, q_ho);
+        fzr_hi  = wz * fmaxf(0.0f, q_ho);
     }
 
-    const double q0 = fmax(0.0, static_cast<double>(q[idx]));
-    const double div_low = (fxr_low - fxl_low) / cfg.dx_m + (fyr_low - fyl_low) / cfg.dy_m + (fzr_low - fzl_low);
-    const double qlow_val = fmax(0.0, q0 - (dt_q / vol) * div_low);
-    q_low[idx] = static_cast<float>(qlow_val);
+    const float q0 = fmaxf(0.0f, q[idx]);
+    const float div_low = (fxr_low - fxl_low) / dx_f + (fyr_low - fyl_low) / dy_f + (fzr_low - fzl_low);
+    const float qlow_val = fmaxf(0.0f, q0 - (dt_q / vol) * div_low);
+    q_low[idx] = qlow_val;
 
-    const double ax_r = fxr_hi - fxr_low;
-    const double ax_l = fxl_hi - fxl_low;
-    const double ay_n = fyr_hi - fyr_low;
-    const double ay_s = fyl_hi - fyl_low;
-    const double az_t = fzr_hi - fzr_low;
-    const double az_b = fzl_hi - fzl_low;
+    const float ax_r = fxr_hi - fxr_low;
+    const float ax_l = fxl_hi - fxl_low;
+    const float ay_n = fyr_hi - fyr_low;
+    const float ay_s = fyl_hi - fyl_low;
+    const float az_t = fzr_hi - fzr_low;
+    const float az_b = fzl_hi - fzl_low;
 
-    const double p_out = dt_q * (
-        (fmax(0.0, ax_r) + fmax(0.0, -ax_l)) / cfg.dx_m +
-        (fmax(0.0, ay_n) + fmax(0.0, -ay_s)) / cfg.dy_m +
-        fmax(0.0, az_t) + fmax(0.0, -az_b)
+    const float p_out = dt_q * (
+        (fmaxf(0.0f, ax_r) + fmaxf(0.0f, -ax_l)) / dx_f +
+        (fmaxf(0.0f, ay_n) + fmaxf(0.0f, -ay_s)) / dy_f +
+        fmaxf(0.0f, az_t) + fmaxf(0.0f, -az_b)
     );
-    const double q_avail = vol * qlow_val;
-    r_out[idx] = static_cast<float>((p_out > 1e-30) ? fmin(1.0, 0.999999 * (q_avail / p_out)) : 1.0);
+    const float q_avail = vol * qlow_val;
+    r_out[idx] = (p_out > 1e-24f) ? fminf(1.0f, 0.999999f * (q_avail / p_out)) : 1.0f;
 }
 
 __global__ void nh_tracer_fct_pass2_kernel(
     NhGridConfig cfg,
     DeviceStaticGrid g,
-    double dt_q,
+    float dt_q,
+    float pi_sfc_f,
     const float* u,
     const float* v,
     const float* w,
@@ -1434,60 +1487,60 @@ __global__ void nh_tracer_fct_pass2_kernel(
 
     const int32_t nz = cfg.nz, ny = cfg.ny, nx = cfg.nx;
     const size_t idx = static_cast<size_t>(k) * ny * nx + static_cast<size_t>(j) * nx + i;
-    const double vol = fmax(cell_mass_vol(cfg, g, k, j, i), 1e-12);
-    const double rc = static_cast<double>(r_out[idx]);
+    const float dx_f = static_cast<float>(cfg.dx_m);
+    const float dy_f = static_cast<float>(cfg.dy_m);
+    const float vol = fmaxf(cell_mass_vol_f(cfg, g, pi_sfc_f, k, j, i), 1e-12f);
 
-    auto limited_x = [&](int32_t iface) -> double {
-        if (cfg.bc_x != 1 && (iface <= 0 || iface >= nx)) return 0.0;
-        const double ux = face_flux_x(cfg, g, u, k, j, iface);
-        const double q_up = (ux >= 0.0)
-            ? read_s(q_old, k, j, iface - 1, nz, ny, nx, cfg.bc_x, cfg.bc_y)
-            : read_s(q_old, k, j, iface,     nz, ny, nx, cfg.bc_x, cfg.bc_y);
-        const double q_ho = horiz_face_val_x(q_old, k, j, iface, ux, nz, ny, nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
-        const double A = ux * (fmax(0.0, q_ho) - q_up);
-        const double r_donor = (A >= 0.0)
-            ? read_s(r_out, k, j, iface - 1, nz, ny, nx, cfg.bc_x, cfg.bc_y)
-            : read_s(r_out, k, j, iface,     nz, ny, nx, cfg.bc_x, cfg.bc_y);
+    auto limited_x = [&](int32_t iface) -> float {
+        if (cfg.bc_x != 1 && (iface <= 0 || iface >= nx)) return 0.0f;
+        const float ux = face_flux_x_f(cfg, g, pi_sfc_f, u, k, j, iface);
+        const float q_up = (ux >= 0.0f)
+            ? read_s_f(q_old, k, j, iface - 1, nz, ny, nx, cfg.bc_x, cfg.bc_y)
+            : read_s_f(q_old, k, j, iface,     nz, ny, nx, cfg.bc_x, cfg.bc_y);
+        const float q_ho = horiz_face_val_x_f(q_old, k, j, iface, ux, nz, ny, nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
+        const float A = ux * (fmaxf(0.0f, q_ho) - q_up);
+        const float r_donor = (A >= 0.0f)
+            ? read_s_f(r_out, k, j, iface - 1, nz, ny, nx, cfg.bc_x, cfg.bc_y)
+            : read_s_f(r_out, k, j, iface,     nz, ny, nx, cfg.bc_x, cfg.bc_y);
         return A * r_donor;
     };
-    auto limited_y = [&](int32_t jface) -> double {
-        if (cfg.bc_y != 1 && (jface <= 0 || jface >= ny)) return 0.0;
-        const double vy = face_flux_y(cfg, g, v, k, jface, i);
-        const double q_up = (vy >= 0.0)
-            ? read_s(q_old, k, jface - 1, i, nz, ny, nx, cfg.bc_x, cfg.bc_y)
-            : read_s(q_old, k, jface,     i, nz, ny, nx, cfg.bc_x, cfg.bc_y);
-        const double q_ho = horiz_face_val_y(q_old, k, jface, i, vy, nz, ny, nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
-        const double A = vy * (fmax(0.0, q_ho) - q_up);
-        const double r_donor = (A >= 0.0)
-            ? read_s(r_out, k, jface - 1, i, nz, ny, nx, cfg.bc_x, cfg.bc_y)
-            : read_s(r_out, k, jface,     i, nz, ny, nx, cfg.bc_x, cfg.bc_y);
+    auto limited_y = [&](int32_t jface) -> float {
+        if (cfg.bc_y != 1 && (jface <= 0 || jface >= ny)) return 0.0f;
+        const float vy = face_flux_y_f(cfg, g, pi_sfc_f, v, k, jface, i);
+        const float q_up = (vy >= 0.0f)
+            ? read_s_f(q_old, k, jface - 1, i, nz, ny, nx, cfg.bc_x, cfg.bc_y)
+            : read_s_f(q_old, k, jface,     i, nz, ny, nx, cfg.bc_x, cfg.bc_y);
+        const float q_ho = horiz_face_val_y_f(q_old, k, jface, i, vy, nz, ny, nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
+        const float A = vy * (fmaxf(0.0f, q_ho) - q_up);
+        const float r_donor = (A >= 0.0f)
+            ? read_s_f(r_out, k, jface - 1, i, nz, ny, nx, cfg.bc_x, cfg.bc_y)
+            : read_s_f(r_out, k, jface,     i, nz, ny, nx, cfg.bc_x, cfg.bc_y);
         return A * r_donor;
     };
-    auto limited_z = [&](int32_t kface) -> double {
-        if (kface <= 0 || kface >= nz) return 0.0;
-        const double wz = face_flux_z(cfg, g, u, v, w, kface, j, i);
-        const double q_up = (wz >= 0.0)
-            ? read_s(q_old, kface - 1, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y)
-            : read_s(q_old, kface,     j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y);
-        const double q_ho = vert_tvd_face_val(q_old, kface, j, i, wz, g.dzeta, nz, ny, nx, cfg.bc_x, cfg.bc_y);
-        const double A = wz * (fmax(0.0, q_ho) - q_up);
-        const double r_donor = (A >= 0.0)
-            ? static_cast<double>(r_out[static_cast<size_t>(kface - 1) * ny * nx + j * nx + i])
-            : static_cast<double>(r_out[static_cast<size_t>(kface)     * ny * nx + j * nx + i]);
+    auto limited_z = [&](int32_t kface) -> float {
+        if (kface <= 0 || kface >= nz) return 0.0f;
+        const float wz = face_flux_z_f(cfg, g, pi_sfc_f, u, v, w, kface, j, i);
+        const float q_up = (wz >= 0.0f)
+            ? read_s_f(q_old, kface - 1, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y)
+            : read_s_f(q_old, kface,     j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y);
+        const float q_ho = vert_tvd_face_val_f(q_old, kface, j, i, wz, g.dzeta, nz, ny, nx, cfg.bc_x, cfg.bc_y);
+        const float A = wz * (fmaxf(0.0f, q_ho) - q_up);
+        const float r_donor = (A >= 0.0f)
+            ? r_out[static_cast<size_t>(kface - 1) * ny * nx + j * nx + i]
+            : r_out[static_cast<size_t>(kface)     * ny * nx + j * nx + i];
         return A * r_donor;
     };
 
-    const double ax_r = limited_x(i + 1);
-    const double ax_l = limited_x(i);
-    const double ay_n = limited_y(j + 1);
-    const double ay_s = limited_y(j);
-    const double az_t = limited_z(k + 1);
-    const double az_b = limited_z(k);
+    const float ax_r = limited_x(i + 1);
+    const float ax_l = limited_x(i);
+    const float ay_n = limited_y(j + 1);
+    const float ay_s = limited_y(j);
+    const float az_t = limited_z(k + 1);
+    const float az_b = limited_z(k);
 
-    const double div_anti = (ax_r - ax_l) / cfg.dx_m + (ay_n - ay_s) / cfg.dy_m + (az_t - az_b);
-    const double qn = static_cast<double>(q_low[idx]) - (dt_q / vol) * div_anti;
-    q_new[idx] = static_cast<float>(fmax(0.0, qn));
-    (void)rc;
+    const float div_anti = (ax_r - ax_l) / dx_f + (ay_n - ay_s) / dy_f + (az_t - az_b);
+    const float qn = q_low[idx] - (dt_q / vol) * div_anti;
+    q_new[idx] = fmaxf(0.0f, qn);
 }
 
 __global__ void nh_sync_periodic_faces_kernel(
@@ -1521,12 +1574,15 @@ __global__ void nh_estimate_cs_max_kernel(
     float cs_msf = 0.0f;
     if (k < cfg.nz && j < cfg.ny && i < cfg.nx) {
         const size_t idx = static_cast<size_t>(k) * cfg.ny * cfg.nx + j * cfg.nx + i;
-        const double z = g.zeta_s[k] + g.b_s[k] * g.hs[j * cfg.nx + i];
-        double thb, pib, dthdz, rhob, cs2b;
-        eval_ref_state(z, cfg.theta_sfc_k, cfg.p_sfc_pa, cfg.n_ref_s, thb, pib, dthdz, rhob, cs2b);
-        const double t_tot = fmax(50.0, (thb + static_cast<double>(thp[idx])) * fmax(1e-4, pib + static_cast<double>(pip[idx])));
-        const double cs = sqrt(GAMMA_GAS * R_D * t_tot);
-        cs_msf = static_cast<float>(cs * g.msf[j * cfg.nx + i]);
+        const float z = static_cast<float>(g.zeta_s[k] + g.b_s[k] * g.hs[j * cfg.nx + i]);
+        const float pi_sfc_f = powf(static_cast<float>(cfg.p_sfc_pa) / P0_PA_F, KAPPA_F);
+        float thb = 0.0f, pib = 0.0f;
+        eval_theta_pi_bar_f32(
+            z, static_cast<float>(cfg.theta_sfc_k), pi_sfc_f, static_cast<float>(cfg.n_ref_s), thb, pib
+        );
+        const float t_tot = fmaxf(50.0f, (thb + thp[idx]) * fmaxf(1e-4f, pib + pip[idx]));
+        const float cs = sqrtf(GAMMA_GAS_F * R_D_F * t_tot);
+        cs_msf = cs * static_cast<float>(g.msf[j * cfg.nx + i]);
     }
     const unsigned int lane = threadIdx.x & 31;
     for (int offset = 16; offset > 0; offset >>= 1) {
@@ -1540,7 +1596,9 @@ __global__ void nh_estimate_cs_max_kernel(
 inline int32_t advect_one_tracer(
     NhCudaHandle* h,
     float* q_ptr,
-    double dt_s
+    int32_t n_sub_q,
+    float dt_q,
+    float pi_sfc_f
 );
 
 } // namespace
@@ -1555,33 +1613,26 @@ inline DeviceStaticGrid static_view(const NhCudaHandle* h) {
     };
 }
 
-inline int32_t advect_one_tracer(NhCudaHandle* h, float* q_ptr, double dt_s) {
-    if (!q_ptr || dt_s <= 0.0) return 0;
+inline int32_t advect_one_tracer(
+    NhCudaHandle* h,
+    float* q_ptr,
+    int32_t n_sub_q,
+    float dt_q,
+    float pi_sfc_f
+) {
+    if (!q_ptr || dt_q <= 0.0f || n_sub_q < 1) return 0;
     const int32_t nz = h->cfg.nz, ny = h->cfg.ny, nx = h->cfg.nx;
     const DeviceStaticGrid g = static_view(h);
-
-    CUDA_CHECK(cudaMemset(h->d_max_u32, 0, sizeof(uint32_t)));
     dim3 b3(32, 8, 1);
     dim3 g3((nx + 31) / 32, (ny + 7) / 8, nz);
-    nh_tracer_cfl_kernel<<<g3, b3>>>(h->cfg, g, dt_s, h->d_u, h->d_v, h->d_w, h->d_max_u32);
-    CUDA_CHECK(cudaGetLastError());
-
-    uint32_t cfl_u32 = 0;
-    CUDA_CHECK(cudaMemcpy(&cfl_u32, h->d_max_u32, sizeof(uint32_t), cudaMemcpyDeviceToHost));
-    float cfl_max = 0.0f;
-    memcpy(&cfl_max, &cfl_u32, sizeof(float));
-
-    int32_t n_sub_q = static_cast<int32_t>(ceil(static_cast<double>(cfl_max) / 0.70));
-    if (n_sub_q < 1) n_sub_q = 1;
-    const double dt_q = dt_s / static_cast<double>(n_sub_q);
 
     for (int32_t s = 0; s < n_sub_q; ++s) {
         nh_tracer_fct_pass1_kernel<<<g3, b3>>>(
-            h->cfg, g, dt_q, h->d_u, h->d_v, h->d_w, q_ptr, h->d_q_tmp, h->d_div
+            h->cfg, g, dt_q, pi_sfc_f, h->d_u, h->d_v, h->d_w, q_ptr, h->d_q_tmp, h->d_div
         );
         CUDA_CHECK(cudaGetLastError());
         nh_tracer_fct_pass2_kernel<<<g3, b3>>>(
-            h->cfg, g, dt_q, h->d_u, h->d_v, h->d_w, q_ptr, h->d_q_tmp, h->d_div, h->d_q_tmp
+            h->cfg, g, dt_q, pi_sfc_f, h->d_u, h->d_v, h->d_w, q_ptr, h->d_q_tmp, h->d_div, h->d_q_tmp
         );
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaMemcpy(q_ptr, h->d_q_tmp, h->n_s * sizeof(float), cudaMemcpyDeviceToDevice));
@@ -1995,12 +2046,30 @@ int32_t nh_cuda_step_rk3(NhCudaHandle* h, double dt_s, int32_t n_substeps) {
 
     // 3. Conservative positive-definite FCT advection of all 6 moist species on full dt_s.
     if (h->cfg.has_moist) {
-        if (advect_one_tracer(h, h->d_qv, dt_s) != 0) return -1;
-        if (advect_one_tracer(h, h->d_qc, dt_s) != 0) return -1;
-        if (advect_one_tracer(h, h->d_qr, dt_s) != 0) return -1;
-        if (advect_one_tracer(h, h->d_qi, dt_s) != 0) return -1;
-        if (advect_one_tracer(h, h->d_qs, dt_s) != 0) return -1;
-        if (advect_one_tracer(h, h->d_qg, dt_s) != 0) return -1;
+        const float pi_sfc_f = static_cast<float>(pow(h->cfg.p_sfc_pa / P0_PA, KAPPA));
+        CUDA_CHECK(cudaMemset(h->d_max_u32, 0, sizeof(uint32_t)));
+        dim3 b_cfl(32, 8, 1);
+        dim3 g_cfl((h->cfg.nx + 31) / 32, (h->cfg.ny + 7) / 8, h->cfg.nz);
+        nh_tracer_cfl_kernel<<<g_cfl, b_cfl>>>(
+            h->cfg, g, static_cast<float>(dt_s), pi_sfc_f, h->d_u, h->d_v, h->d_w, h->d_max_u32
+        );
+        CUDA_CHECK(cudaGetLastError());
+
+        uint32_t cfl_u32 = 0;
+        CUDA_CHECK(cudaMemcpy(&cfl_u32, h->d_max_u32, sizeof(uint32_t), cudaMemcpyDeviceToHost));
+        float cfl_max = 0.0f;
+        memcpy(&cfl_max, &cfl_u32, sizeof(float));
+
+        int32_t n_sub_q = static_cast<int32_t>(ceil(static_cast<double>(cfl_max) / 0.70));
+        if (n_sub_q < 1) n_sub_q = 1;
+        const float dt_q = static_cast<float>(dt_s / static_cast<double>(n_sub_q));
+
+        if (advect_one_tracer(h, h->d_qv, n_sub_q, dt_q, pi_sfc_f) != 0) return -1;
+        if (advect_one_tracer(h, h->d_qc, n_sub_q, dt_q, pi_sfc_f) != 0) return -1;
+        if (advect_one_tracer(h, h->d_qr, n_sub_q, dt_q, pi_sfc_f) != 0) return -1;
+        if (advect_one_tracer(h, h->d_qi, n_sub_q, dt_q, pi_sfc_f) != 0) return -1;
+        if (advect_one_tracer(h, h->d_qs, n_sub_q, dt_q, pi_sfc_f) != 0) return -1;
+        if (advect_one_tracer(h, h->d_qg, n_sub_q, dt_q, pi_sfc_f) != 0) return -1;
     }
 
     CUDA_CHECK(cudaDeviceSynchronize());

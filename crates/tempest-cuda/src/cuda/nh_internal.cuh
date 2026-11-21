@@ -42,6 +42,133 @@ struct DeviceStaticGrid {
     const double* fcor;
 };
 
+constexpr float R_D_F = 287.058f;
+constexpr float R_V_F = 461.5f;
+constexpr float CP_D_F = 1004.5f;
+constexpr float CV_D_F = CP_D_F - R_D_F;
+constexpr float KAPPA_F = R_D_F / CP_D_F;
+constexpr float GAMMA_GAS_F = CP_D_F / CV_D_F;
+constexpr float GRAVITY_F = 9.80665f;
+constexpr float P0_PA_F = 100000.0f;
+constexpr float EPS_V_F = (R_V_F / R_D_F) - 1.0f;
+constexpr float EPS_MW_F = R_D_F / R_V_F;
+constexpr float LV0_F = 2.501e6f;
+constexpr float LF0_F = 3.337e5f;
+constexpr float LS0_F = LV0_F + LF0_F;
+constexpr float T_FREEZE_F = 273.15f;
+constexpr float STEFAN_BOLTZMANN_F = 5.670374e-8f;
+constexpr float KARMAN_F = 0.4f;
+constexpr float PI_CONST_F = 3.14159265358979323846f;
+
+__device__ __host__ inline void eval_ref_state_pis(
+    double z,
+    double theta_sfc,
+    double pi_sfc,
+    double n_ref,
+    double& theta_bar,
+    double& pi_bar,
+    double& dtheta_dz,
+    double& rho_bar,
+    double& cs2_bar
+) {
+    const double n2 = n_ref * n_ref;
+    if (n2 > 1e-12) {
+        const double exp_arg = (n2 * z) / GRAVITY;
+        const double e_pos = exp(exp_arg);
+        const double e_neg = exp(-exp_arg);
+        theta_bar = theta_sfc * e_pos;
+        pi_bar = pi_sfc - (GRAVITY * GRAVITY) / (CP_D * theta_sfc * n2) * (1.0 - e_neg);
+        dtheta_dz = theta_bar * (n2 / GRAVITY);
+    } else {
+        theta_bar = theta_sfc;
+        pi_bar = pi_sfc - (GRAVITY * z) / (CP_D * theta_sfc);
+        dtheta_dz = 0.0;
+    }
+    if (pi_bar < 1e-4) pi_bar = 1e-4;
+    const double p_bar = P0_PA * pow(pi_bar, 1.0 / KAPPA);
+    const double t_bar = theta_bar * pi_bar;
+    rho_bar = p_bar / (R_D * t_bar);
+    cs2_bar = GAMMA_GAS * R_D * t_bar;
+}
+
+__device__ __host__ inline double eval_theta_bar(
+    double z,
+    double theta_sfc,
+    double n_ref
+) {
+    const double n2 = n_ref * n_ref;
+    if (n2 > 1e-12) {
+        return theta_sfc * exp((n2 * z) / GRAVITY);
+    }
+    return theta_sfc;
+}
+
+__device__ __host__ inline void eval_theta_pi_bar_pis(
+    double z,
+    double theta_sfc,
+    double pi_sfc,
+    double n_ref,
+    double& theta_bar,
+    double& pi_bar
+) {
+    const double n2 = n_ref * n_ref;
+    if (n2 > 1e-12) {
+        const double e_pos = exp((n2 * z) / GRAVITY);
+        const double e_neg = 1.0 / e_pos;
+        theta_bar = theta_sfc * e_pos;
+        pi_bar = pi_sfc - (GRAVITY * GRAVITY) / (CP_D * theta_sfc * n2) * (1.0 - e_neg);
+    } else {
+        theta_bar = theta_sfc;
+        pi_bar = pi_sfc - (GRAVITY * z) / (CP_D * theta_sfc);
+    }
+    if (pi_bar < 1e-4) pi_bar = 1e-4;
+}
+
+__device__ __host__ inline void eval_theta_pi_bar_f32(
+    float z,
+    float theta_sfc,
+    float pi_sfc,
+    float n_ref,
+    float& theta_bar,
+    float& pi_bar
+) {
+    const float n2 = n_ref * n_ref;
+    if (n2 > 1e-12f) {
+        const float e_pos = expf((n2 * z) / GRAVITY_F);
+        const float e_neg = 1.0f / e_pos;
+        theta_bar = theta_sfc * e_pos;
+        pi_bar = pi_sfc - (GRAVITY_F * GRAVITY_F) / (CP_D_F * theta_sfc * n2) * (1.0f - e_neg);
+    } else {
+        theta_bar = theta_sfc;
+        pi_bar = pi_sfc - (GRAVITY_F * z) / (CP_D_F * theta_sfc);
+    }
+    if (pi_bar < 1e-4f) pi_bar = 1e-4f;
+}
+
+__device__ __host__ inline float eval_rho_bar_f32(
+    float z,
+    float theta_sfc,
+    float pi_sfc,
+    float n_ref
+) {
+    const float n2 = n_ref * n_ref;
+    float theta_bar;
+    float pi_bar;
+    if (n2 > 1e-12f) {
+        const float e_pos = expf((n2 * z) / GRAVITY_F);
+        const float e_neg = 1.0f / e_pos;
+        theta_bar = theta_sfc * e_pos;
+        pi_bar = pi_sfc - (GRAVITY_F * GRAVITY_F) / (CP_D_F * theta_sfc * n2) * (1.0f - e_neg);
+    } else {
+        theta_bar = theta_sfc;
+        pi_bar = pi_sfc - (GRAVITY_F * z) / (CP_D_F * theta_sfc);
+    }
+    if (pi_bar < 1e-4f) pi_bar = 1e-4f;
+    const float p_bar = P0_PA_F * powf(pi_bar, 1.0f / KAPPA_F);
+    const float t_bar = theta_bar * pi_bar;
+    return p_bar / (R_D_F * t_bar);
+}
+
 __device__ __host__ inline void eval_ref_state(
     double z,
     double theta_sfc,
@@ -141,6 +268,64 @@ __device__ inline double read_w(
     if (k <= 0) return static_cast<double>(w[idx_h(j, i, ny, nx, bc_x, bc_y)]);
     if (k >= nz) return 0.0;
     return static_cast<double>(w[static_cast<size_t>(k) * ny * nx + idx_h(j, i, ny, nx, bc_x, bc_y)]);
+}
+
+__device__ inline float read_2d_f(
+    const double* arr, int32_t j, int32_t i,
+    int32_t ny, int32_t nx, int32_t bc_x, int32_t bc_y
+) {
+    return static_cast<float>(arr[idx_h(j, i, ny, nx, bc_x, bc_y)]);
+}
+
+__device__ inline float read_s_f(
+    const float* arr, int32_t k, int32_t j, int32_t i,
+    int32_t nz, int32_t ny, int32_t nx, int32_t bc_x, int32_t bc_y
+) {
+    const int32_t kk = (k < 0) ? 0 : ((k >= nz) ? nz - 1 : k);
+    return arr[static_cast<size_t>(kk) * ny * nx + idx_h(j, i, ny, nx, bc_x, bc_y)];
+}
+
+__device__ inline float read_u_f(
+    const float* u, int32_t k, int32_t j, int32_t i,
+    int32_t nz, int32_t ny, int32_t nx, int32_t bc_x, int32_t bc_y
+) {
+    const int32_t kk = (k < 0) ? 0 : ((k >= nz) ? nz - 1 : k);
+    const int32_t jj = (bc_y == 1) ? wrap_idx(j, ny) : ((j < 0) ? 0 : ((j >= ny) ? ny - 1 : j));
+    int32_t ii = i;
+    if (bc_x == 1) {
+        ii = wrap_idx(i, nx);
+    } else {
+        if (bc_x == 0 && (i <= 0 || i >= nx)) return 0.0f;
+        if (ii < 0) ii = 0;
+        if (ii > nx) ii = nx;
+    }
+    return u[static_cast<size_t>(kk) * ny * (nx + 1) + jj * (nx + 1) + ii];
+}
+
+__device__ inline float read_v_f(
+    const float* v, int32_t k, int32_t j, int32_t i,
+    int32_t nz, int32_t ny, int32_t nx, int32_t bc_x, int32_t bc_y
+) {
+    const int32_t kk = (k < 0) ? 0 : ((k >= nz) ? nz - 1 : k);
+    const int32_t ii = (bc_x == 1) ? wrap_idx(i, nx) : ((i < 0) ? 0 : ((i >= nx) ? nx - 1 : i));
+    int32_t jj = j;
+    if (bc_y == 1) {
+        jj = wrap_idx(j, ny);
+    } else {
+        if (bc_y == 0 && (j <= 0 || j >= ny)) return 0.0f;
+        if (jj < 0) jj = 0;
+        if (jj > ny) jj = ny;
+    }
+    return v[static_cast<size_t>(kk) * (ny + 1) * nx + jj * nx + ii];
+}
+
+__device__ inline float read_w_f(
+    const float* w, int32_t k, int32_t j, int32_t i,
+    int32_t nz, int32_t ny, int32_t nx, int32_t bc_x, int32_t bc_y
+) {
+    if (k <= 0) return w[idx_h(j, i, ny, nx, bc_x, bc_y)];
+    if (k >= nz) return 0.0f;
+    return w[static_cast<size_t>(k) * ny * nx + idx_h(j, i, ny, nx, bc_x, bc_y)];
 }
 
 } // namespace tempest_cuda_internal
