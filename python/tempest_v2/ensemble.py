@@ -208,6 +208,7 @@ def generate_balanced_member_perturbation(
     stoch_iau = {
         "u": tu_s.astype(np.float32),
         "v": tv_s.astype(np.float32),
+        "w": np.zeros((nz + 1, ny, nx), dtype=np.float32),
         "theta_p": (sign * cfg.amp_stoch_tend_th * tth_pat).astype(np.float32),
         "pi_p": np.zeros((nz, ny, nx), dtype=np.float32),
     }
@@ -458,7 +459,7 @@ def run_ensemble_forecast(
                     np.asarray(base_iau_forcing.get(k, 0.0), dtype=np.float32)
                     + np.asarray(stoch.get(k, 0.0), dtype=np.float32)
                 ).astype(np.float32)
-                for k in ("u", "v", "theta_p", "pi_p")
+                for k in ("u", "v", "w", "theta_p", "pi_p")
             }
             eff_iau_dur = max(float(base_iau_duration_s), float(cfg.stoch_forcing_duration_s))
         elif stoch is not None:

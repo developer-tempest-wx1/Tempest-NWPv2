@@ -37,7 +37,7 @@ KNMI_RADAR_PROJ4_DEFAULT = (
     "+proj=stere +lat_0=90 +lon_0=0 +lat_ts=60 +a=6378137 +b=6356752 +x_0=0 +y_0=0 +units=km"
 )
 # Official DWD RADOLAN polar stereographic sphere (R = 6370.04 km, true at 60N, lon_0=10E)
-DWD_RADOLAN_PROJ4 = "+proj=stere +lat_0=90 +lat_ts=60 +lon_0=10 +R=6370.04 +x_0=0 +y_0=0 +units=km"
+DWD_RADOLAN_PROJ4 = "+proj=stere +lat_0=90 +lat_ts=60 +lon_0=10 +a=6370040 +b=6370040 +units=km"
 DWD_RADOLAN_X0_KM = -523.4622
 DWD_RADOLAN_Y0_KM = -4658.6447
 
@@ -275,7 +275,7 @@ def fetch_dwd_radolan_rw(
         1.0,
         spec,
         y_ascending=True,
-        geo_crs="+proj=longlat +R=6370.04 +no_defs",
+        geo_crs="+proj=longlat +a=6370040 +b=6370040 +no_defs",
     )
     return grid, str(fname)
 
