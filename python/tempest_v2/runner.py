@@ -23,6 +23,11 @@ import xarray as xr
 import wx1
 
 from tempest_v2.cuda_bridge import NonHydrostaticGPUSolver
+from tempest_v2.diagnostics import (
+    STANDARD_PLEV_PA,
+    compute_pressure_level_fields,
+    compute_synoptic_convective_2d,
+)
 from tempest_v2.ic_builder import (
     aurora_wx1_to_ic,
     build_domain_static_fields,
@@ -128,6 +133,32 @@ def _lbc_dict_to_staggered(
     }
 
 
+def extract_ocean_surface_diag(oce_state: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
+    """Extract centered 2D surface ocean & SI3 sea-ice diagnostics from a GPU NEMO+SI3 state."""
+    u0 = np.asarray(oce_state["u_oce"][0], dtype=np.float32)
+    v0 = np.asarray(oce_state["v_oce"][0], dtype=np.float32)
+    u_c = 0.5 * (u0 + np.roll(u0, 1, axis=1))
+    v_c = 0.5 * (v0 + np.pad(v0[:-1, :], ((1, 0), (0, 0)), mode="edge"))
+    ui = np.asarray(oce_state.get("u_ice", np.zeros_like(u0)), dtype=np.float32)
+    vi = np.asarray(oce_state.get("v_ice", np.zeros_like(v0)), dtype=np.float32)
+    ui_c = 0.5 * (ui + np.roll(ui, 1, axis=1))
+    vi_c = 0.5 * (vi + np.pad(vi[:-1, :], ((1, 0), (0, 0)), mode="edge"))
+    return {
+        "sst": np.asarray(oce_state["temp_k"][0], dtype=np.float32),
+        "sss": np.asarray(oce_state["sal_psu"][0], dtype=np.float32),
+        "ssh": np.asarray(oce_state["ssh"], dtype=np.float32),
+        "mld": np.asarray(oce_state["mld"], dtype=np.float32),
+        "u_oce_sfc": u_c.astype(np.float32),
+        "v_oce_sfc": v_c.astype(np.float32),
+        "sea_ice_frac": np.asarray(oce_state["ice_frac"], dtype=np.float32),
+        "sea_ice_thick": np.asarray(oce_state["ice_thick"], dtype=np.float32),
+        "sea_ice_tsfc": np.asarray(oce_state["ice_tsfc"], dtype=np.float32),
+        "sea_ice_albedo": np.asarray(oce_state["ice_albedo"], dtype=np.float32),
+        "u_ice": ui_c.astype(np.float32),
+        "v_ice": vi_c.astype(np.float32),
+    }
+
+
 def write_forecast_wx1(
     out_path: Path | str,
     valid_time_utc: datetime.datetime,
@@ -140,8 +171,12 @@ def write_forecast_wx1(
     theta_sfc_ref: float = 288.15,
     p_sfc_ref: float = 101_325.0,
     n_ref_hz: float = 0.01,
+    include_3d_diagnostics: bool = True,
+    ocean_diag: Optional[Dict[str, np.ndarray]] = None,
+    prev_precip_total: Optional[np.ndarray] = None,
+    interval_s: float = 0.0,
 ) -> Path:
-    """Write synoptic 2D + 4-layer soil forecast product in WX-1 v0.1.8 (`zstd_shuffle`)."""
+    """Write synoptic 2D, soil, optional 3D isobaric & NEMO+SI3 forecast product in WX-1 (`zstd_shuffle`)."""
     p = Path(out_path)
     p.parent.mkdir(parents=True, exist_ok=True)
     v_dt = (
@@ -202,14 +237,93 @@ def write_forecast_wx1(
     if "soil_m" in surf_state:
         data_vars["soil_m"] = (("soil_layer", "y", "x"), np.asarray(surf_state["soil_m"], dtype=np.float32), {"units": "m3 m-3"})
 
+    coords: Dict[str, Any] = {
+        "time": ("time", t_coord),
+        "soil_layer": ("soil_layer", np.array([0, 1, 2, 3], dtype=np.int32)),
+        "y": ("y", spec.y_m.astype(np.float64), {"units": "m"}),
+        "x": ("x", spec.x_m.astype(np.float64), {"units": "m"}),
+    }
+
+    if include_3d_diagnostics:
+        pl_fields = compute_pressure_level_fields(
+            spec,
+            hs_m,
+            state_3d,
+            plev_pa=STANDARD_PLEV_PA,
+            theta_sfc_ref=theta_sfc_ref,
+            p_sfc_ref=p_sfc_ref,
+            n_ref_hz=n_ref_hz,
+        )
+        pl_units = {
+            "t_pl": "K",
+            "gh_pl": "m",
+            "q_pl": "kg kg-1",
+            "rh_pl": "%",
+            "u_pl": "m s-1",
+            "v_pl": "m s-1",
+            "w_pl": "m s-1",
+        }
+        coords["plev"] = ("plev", STANDARD_PLEV_PA, {"units": "Pa", "standard_name": "air_pressure"})
+        for k, arr in pl_fields.items():
+            data_vars[k] = (("plev", "y", "x"), arr, {"units": pl_units[k]})
+
+        syn_fields = compute_synoptic_convective_2d(
+            spec,
+            hs_m,
+            state_3d,
+            surf_state,
+            theta_sfc_ref=theta_sfc_ref,
+            p_sfc_ref=p_sfc_ref,
+            n_ref_hz=n_ref_hz,
+            prev_precip_total=prev_precip_total,
+            interval_s=interval_s,
+        )
+        syn_units = {
+            "td2m": "K",
+            "rh2m": "%",
+            "gust10m": "m s-1",
+            "tcc": "1",
+            "lcc": "1",
+            "mcc": "1",
+            "hcc": "1",
+            "tcwv": "kg m-2",
+            "lwp": "kg m-2",
+            "iwp": "kg m-2",
+            "cape_sb": "J kg-1",
+            "cin_sb": "J kg-1",
+            "cape_mu": "J kg-1",
+            "shear_0_6km": "m s-1",
+            "srh_0_3km": "m2 s-2",
+            "freezing_level_m": "m",
+            "vis_m": "m",
+            "precip_rate": "kg m-2 s-1",
+        }
+        for k, arr in syn_fields.items():
+            data_vars[k] = (("y", "x"), arr, {"units": syn_units[k]})
+
+    if ocean_diag is not None:
+        od = extract_ocean_surface_diag(ocean_diag) if "temp_k" in ocean_diag else ocean_diag
+        oce_units = {
+            "sst": "K",
+            "sss": "g kg-1",
+            "ssh": "m",
+            "mld": "m",
+            "u_oce_sfc": "m s-1",
+            "v_oce_sfc": "m s-1",
+            "sea_ice_frac": "1",
+            "sea_ice_thick": "m",
+            "sea_ice_tsfc": "K",
+            "sea_ice_albedo": "1",
+            "u_ice": "m s-1",
+            "v_ice": "m s-1",
+        }
+        for k, unit in oce_units.items():
+            if k in od:
+                data_vars[k] = (("y", "x"), np.asarray(od[k], dtype=np.float32), {"units": unit})
+
     ds = xr.Dataset(
         data_vars=data_vars,
-        coords={
-            "time": ("time", t_coord),
-            "soil_layer": ("soil_layer", np.array([0, 1, 2, 3], dtype=np.int32)),
-            "y": ("y", spec.y_m.astype(np.float64), {"units": "m"}),
-            "x": ("x", spec.x_m.astype(np.float64), {"units": "m"}),
-        },
+        coords=coords,
         attrs={
             "model": "Tempest-NWP v2 (0% AI/ML)",
             "domain_name": spec.name,

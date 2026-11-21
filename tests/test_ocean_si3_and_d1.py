@@ -534,3 +534,132 @@ def test_ocean_si3_wx1_restart_bit_exact_roundtrip(tmp_path: Path) -> None:
 
     for k in ("temp_k", "sal_psu", "ssh", "a_i", "v_i", "ice_frac", "ice_thick"):
         np.testing.assert_array_equal(st_resumed[k], st_cont[k])
+
+
+def test_diagnostics_pressure_levels_convective_and_wx1_roundtrip(tmp_path: Path) -> None:
+    """Verify 3D pressure-level interpolation, CAPE/CIN, visibility, and lossless WX-1 forecast write/read."""
+    import wx1
+    from tempest_v2.diagnostics import (
+        STANDARD_PLEV_PA,
+        compute_pressure_level_fields,
+        compute_synoptic_convective_2d,
+    )
+    from tempest_v2.runner import write_forecast_wx1
+
+    spec = _make_regional_ocean_spec(ny=8, nx=8, dx_m=5000.0, lat0=52.1)
+    # Use high top (22 km) and 32 levels for accurate pressure-level sounding test
+    spec = DomainSpec(
+        name=spec.name, ny=8, nx=8, dx_m=5000.0, dy_m=5000.0, is_projected=False,
+        is_periodic_lon=False, projection=None, x_m=spec.x_m, y_m=spec.y_m,
+        lat2d=spec.lat2d, lon2d=spec.lon2d, map_factor=spec.map_factor,
+        coriolis_f=spec.coriolis_f,
+        vertical=VerticalGrid(nz=32, z_top_m=22_000.0, stretch_power=1.2),
+        is_spherical=False,
+    )
+    hs = np.zeros((spec.ny, spec.nx), dtype=np.float64)
+    z_w, z_s, _ = spec.vertical.heights_3d(hs)
+    ref = VerticalGrid.reference_state(z_s, theta_sfc_k=288.15, p_sfc_pa=101_325.0, brunt_vaisala_hz=0.01)
+
+    # Analytical ISA column (T = 288.15 - 0.0065*z, hydrostatic pressure)
+    gamma = 0.0065
+    t_isa = np.maximum(216.65, 288.15 - gamma * z_s)
+    p_isa = 101_325.0 * np.power(t_isa / 288.15, 9.80665 / (287.058 * gamma))
+    below_tp = (288.15 - gamma * z_s) >= 216.65
+    z_tp = (288.15 - 216.65) / gamma
+    p_tp = 101_325.0 * ((216.65 / 288.15) ** (9.80665 / (287.058 * gamma)))
+    p_isa = np.where(below_tp, p_isa, p_tp * np.exp(-9.80665 * (z_s - z_tp) / (287.058 * 216.65)))
+    pi_isa = np.power(p_isa / 100_000.0, 287.058 / 1004.64)
+    th_isa = t_isa / pi_isa
+
+    st_isa = {
+        "u": np.full((32, 8, 9), 12.0, dtype=np.float32),
+        "v": np.full((32, 9, 8), -4.0, dtype=np.float32),
+        "w": np.zeros((33, 8, 8), dtype=np.float32),
+        "theta_p": (th_isa - ref["theta_bar"]).astype(np.float32),
+        "pi_p": (pi_isa - ref["pi_bar"]).astype(np.float32),
+        "qv": np.full((32, 8, 8), 0.006, dtype=np.float32),
+        "qc": np.zeros((32, 8, 8), dtype=np.float32),
+        "qr": np.zeros((32, 8, 8), dtype=np.float32),
+        "qi": np.zeros((32, 8, 8), dtype=np.float32),
+        "qs": np.zeros((32, 8, 8), dtype=np.float32),
+        "qg": np.zeros((32, 8, 8), dtype=np.float32),
+    }
+    pl = compute_pressure_level_fields(spec, hs, st_isa)
+    # At 500 hPa (index 4 in 1000,925,850,700,500,300,200): exact ISA gh ~ 5574 m, T ~ 251.9 K
+    t500_exact = 288.15 * ((50_000.0 / 101_325.0) ** (287.058 * gamma / 9.80665))
+    z500_exact = (288.15 - t500_exact) / gamma
+    assert abs(float(np.mean(pl["t_pl"][4])) - t500_exact) < 0.8
+    assert abs(float(np.mean(pl["gh_pl"][4])) - z500_exact) < 35.0
+    assert abs(float(np.mean(pl["u_pl"][4])) - 12.0) < 1e-4
+
+    # Sounding A: stable ISA -> zero CAPE; Sounding B: warm moist surface (303 K, qv=0.018) -> CAPE > 1500 J/kg
+    surf_base = {
+        "t2m": np.full((8, 8), 288.0, dtype=np.float32),
+        "q2m": np.full((8, 8), 0.007, dtype=np.float32),
+        "u10m": np.full((8, 8), 8.0, dtype=np.float32),
+        "v10m": np.full((8, 8), -2.0, dtype=np.float32),
+        "ustar": np.full((8, 8), 0.35, dtype=np.float32),
+        "rain_acc": np.full((8, 8), 1.8, dtype=np.float32),
+        "snow_acc": np.zeros((8, 8), dtype=np.float32),
+        "graupel_acc": np.zeros((8, 8), dtype=np.float32),
+    }
+    syn_stable = compute_synoptic_convective_2d(spec, hs, st_isa, surf_base)
+    assert float(np.max(syn_stable["cape_sb"])) == 0.0
+    assert float(np.min(syn_stable["vis_m"])) > 10_000.0
+
+    st_unstab = {k: v.copy() for k, v in st_isa.items()}
+    # Warm moist PBL below ~1500 m + midlevel cold anomaly + dense surface fog in right half
+    st_unstab["theta_p"][:3] += 15.0
+    st_unstab["theta_p"][8:18] -= 6.0
+    st_unstab["qv"][:3] = 0.018
+    st_unstab["qc"][0, :, 4:] = 0.0005  # fog liquid water -> low vis_m
+    syn_unstab = compute_synoptic_convective_2d(
+        spec, hs, st_unstab, surf_base, prev_precip_total=np.zeros((8, 8), dtype=np.float32), interval_s=3600.0
+    )
+    assert float(np.mean(syn_unstab["cape_sb"])) > 1000.0
+    assert float(np.mean(syn_unstab["cape_mu"])) >= float(np.mean(syn_unstab["cape_sb"])) - 1e-3
+    assert np.all(syn_unstab["td2m"] <= surf_base["t2m"] + 1e-4)
+    assert np.all((syn_unstab["rh2m"] >= 0.0) & (syn_unstab["rh2m"] <= 100.0))
+    assert np.all((syn_unstab["tcc"] >= 0.0) & (syn_unstab["tcc"] <= 1.0))
+    assert float(np.mean(syn_unstab["vis_m"][:, 4:])) < 500.0
+    assert abs(float(np.mean(syn_unstab["precip_rate"])) - (1.8 / 3600.0)) < 1e-6
+
+    # Write forecast WX-1 with 3D pressure levels + NEMO/SI3 diagnostics and verify round-trip
+    oce_diag = {
+        "sst": np.full((8, 8), 283.5, dtype=np.float32),
+        "sss": np.full((8, 8), 34.2, dtype=np.float32),
+        "ssh": np.full((8, 8), 0.12, dtype=np.float32),
+        "mld": np.full((8, 8), 38.0, dtype=np.float32),
+        "u_oce_sfc": np.full((8, 8), 0.25, dtype=np.float32),
+        "v_oce_sfc": np.full((8, 8), -0.10, dtype=np.float32),
+        "sea_ice_frac": np.full((8, 8), 0.45, dtype=np.float32),
+        "sea_ice_thick": np.full((8, 8), 0.85, dtype=np.float32),
+        "sea_ice_tsfc": np.full((8, 8), 268.0, dtype=np.float32),
+        "sea_ice_albedo": np.full((8, 8), 0.68, dtype=np.float32),
+        "u_ice": np.full((8, 8), 0.08, dtype=np.float32),
+        "v_ice": np.full((8, 8), 0.02, dtype=np.float32),
+    }
+    fc_path = tmp_path / "fc_diag_test.wx1"
+    write_forecast_wx1(
+        fc_path,
+        datetime.datetime(2026, 11, 21, 12, 0, tzinfo=datetime.timezone.utc),
+        3.0,
+        spec,
+        hs,
+        st_unstab,
+        surf_base,
+        include_3d_diagnostics=True,
+        ocean_diag=oce_diag,
+        prev_precip_total=np.zeros((8, 8), dtype=np.float32),
+        interval_s=3600.0,
+    )
+    with wx1.open_dataset(fc_path) as ds:
+        assert "plev" in ds.coords
+        np.testing.assert_allclose(ds.coords["plev"].values, STANDARD_PLEV_PA)
+        for vname in ("t_pl", "gh_pl", "q_pl", "rh_pl", "u_pl", "v_pl", "w_pl"):
+            assert vname in ds.data_vars
+            assert ds[vname].shape == (7, 8, 8)
+            assert np.all(np.isfinite(ds[vname].values))
+        for vname in ("td2m", "rh2m", "gust10m", "tcc", "cape_sb", "shear_0_6km", "vis_m", "sst", "sss", "ssh", "sea_ice_frac"):
+            assert vname in ds.data_vars
+            assert np.all(np.isfinite(ds[vname].values))
