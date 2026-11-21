@@ -135,6 +135,166 @@ def fetch_latest_knmi_file_url(api_key: str) -> Tuple[Optional[str], Optional[st
         return None, None
 
 
+def _extract_1d_float(ds: nc.Dataset, var_name: str, n_stn: int) -> np.ndarray:
+    var = ds.variables.get(var_name)
+    if var is None:
+        return np.full(n_stn, np.nan, dtype=np.float64)
+    arr = np.ma.asarray(var[:], dtype=np.float64)
+    filled = np.asarray(np.ma.filled(arr, np.nan), dtype=np.float64)
+    if filled.ndim > 1:
+        filled = filled.reshape(n_stn, -1)[:, 0]
+    filled = np.where(np.isfinite(filled) & (np.abs(filled) < 1e6), filled, np.nan)
+    return filled
+
+
+def decode_knmi_netcdf_to_wx1(nc_path: Path | str, out_dir: Path | str) -> int:
+    """Decode a KNMI 10-minute observation NetCDF into validated SI-unit WX-1 containers."""
+    out_p = Path(out_dir)
+    out_p.mkdir(parents=True, exist_ok=True)
+    with nc.Dataset(Path(nc_path)) as ds:
+        stn = ds.variables.get("station")
+        n_stn = len(stn) if stn is not None else 0
+        if n_stn == 0:
+            return 0
+
+        raw_lat = _extract_1d_float(ds, "lat", n_stn)
+        raw_lon = _extract_1d_float(ds, "lon", n_stn)
+        raw_hgt = _extract_1d_float(ds, "height", n_stn)
+        if np.all(np.isnan(raw_hgt)):
+            raw_hgt = _extract_1d_float(ds, "elevation", n_stn)
+
+        ta_arr = _extract_1d_float(ds, "ta", n_stn)
+        pp_arr = _extract_1d_float(ds, "pp", n_stn)
+        ff_arr = _extract_1d_float(ds, "ff", n_stn)
+        dd_arr = _extract_1d_float(ds, "dd", n_stn)
+
+        now_utc = datetime.datetime.now(datetime.timezone.utc)
+        knmi_obs_ts = now_utc.timestamp()
+        time_var = ds.variables.get("time")
+        if time_var is not None and len(time_var) > 0:
+            try:
+                t_raw = float(np.ma.filled(np.ma.asarray(time_var[0], dtype=np.float64), np.nan))
+                if np.isfinite(t_raw):
+                    epoch_1950 = datetime.datetime(1950, 1, 1, tzinfo=datetime.timezone.utc)
+                    knmi_obs_ts = (epoch_1950 + datetime.timedelta(seconds=t_raw)).timestamp()
+            except Exception:
+                pass
+
+        lats_list: list[float] = []
+        lons_list: list[float] = []
+        elev_list: list[float] = []
+        pres_list: list[float] = []
+        temp_list: list[float] = []
+        u_list: list[float] = []
+        v_list: list[float] = []
+        time_list: list[float] = []
+
+        for i in range(n_stn):
+            raw_id = stn[i]
+            if isinstance(raw_id, (bytes, np.bytes_)):
+                stn_id = raw_id.decode("utf-8", errors="ignore").strip()
+            else:
+                stn_id = str(raw_id).strip()
+
+            lat = float(raw_lat[i])
+            lon = float(raw_lon[i])
+            elev = float(raw_hgt[i])
+            if not (np.isfinite(lat) and np.isfinite(lon) and -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+                if stn_id in KNMI_STATIONS:
+                    lat, lon, fb_elev, _ = KNMI_STATIONS[stn_id]
+                    if not np.isfinite(elev):
+                        elev = fb_elev
+                else:
+                    continue
+            if not np.isfinite(elev) or not (-20.0 <= elev <= 4000.0):
+                elev = float(KNMI_STATIONS[stn_id][2]) if stn_id in KNMI_STATIONS else 0.0
+
+            t_val = float(ta_arr[i])
+            if np.isfinite(t_val):
+                if t_val < 100.0:
+                    t_val += 273.15
+                if not (223.15 <= t_val <= 328.15):
+                    t_val = float("nan")
+
+            p_val = float(pp_arr[i])
+            if np.isfinite(p_val):
+                if p_val < 2000.0:
+                    p_val *= 100.0
+                if not (87_000.0 <= p_val <= 107_000.0):
+                    p_val = float("nan")
+
+            ws = float(ff_arr[i])
+            wd = float(dd_arr[i])
+            u_val, v_val = float("nan"), float("nan")
+            if np.isfinite(ws) and np.isfinite(wd) and 0.0 <= ws <= 75.0 and 0.0 <= wd <= 360.0:
+                rad = np.radians(wd)
+                u_val = float(-ws * np.sin(rad))
+                v_val = float(-ws * np.cos(rad))
+
+            if np.isnan(t_val) and np.isnan(p_val) and np.isnan(u_val):
+                continue
+
+            lats_list.append(lat)
+            lons_list.append(lon)
+            elev_list.append(elev)
+            pres_list.append(p_val)
+            temp_list.append(t_val)
+            u_list.append(u_val)
+            v_list.append(v_val)
+            time_list.append(knmi_obs_ts)
+
+    n_obs = len(pres_list)
+    if n_obs == 0:
+        return 0
+
+    pressures = np.array(pres_list, dtype=np.float32)
+    temps = np.array(temp_list, dtype=np.float32)
+    u_winds = np.array(u_list, dtype=np.float32)
+    v_winds = np.array(v_list, dtype=np.float32)
+    lats = np.array(lats_list, dtype=np.float32)
+    lons = np.array(lons_list, dtype=np.float32)
+    elevs = np.array(elev_list, dtype=np.float32)
+    times = np.array(time_list, dtype=np.float64)
+
+    p_main = out_p / "knmi_insitu_obs.wx1"
+    wx1.write_array(
+        p_main,
+        pressures,
+        dataset_id="knmi_insitu_obs",
+        variable_path="pressure",
+        dimensions=["station_id"],
+        profile="output",
+        codec="zstd_shuffle",
+        attributes={
+            "source": "KNMI Open Data Platform (10-minute in-situ)",
+            "n_stations": str(n_obs),
+            "units": "Pa",
+        },
+    )
+    for name, arr, unit in [
+        ("lat", lats, "degrees_north"),
+        ("lon", lons, "degrees_east"),
+        ("elev", elevs, "m"),
+        ("temp", temps, "K"),
+        ("u_wind", u_winds, "m/s"),
+        ("v_wind", v_winds, "m/s"),
+        ("time", times, "seconds_since_epoch"),
+    ]:
+        v_path = out_p / f"knmi_insitu_obs_{name}.wx1"
+        wx1.write_array(
+            v_path,
+            arr,
+            dataset_id=f"knmi_insitu_{name}",
+            variable_path=name,
+            dimensions=["station_id"],
+            profile="output",
+            codec="zstd_shuffle",
+            attributes={"units": unit},
+        )
+    logger.info("Saved %d verified KNMI 10-minute observations to WX-1: %s", n_obs, p_main)
+    return n_obs
+
+
 def ingest_knmi_observations(
     out_dir: Path,
     api_key: Optional[str] = None,
@@ -167,120 +327,8 @@ def ingest_knmi_observations(
             with open(dest_nc, "wb") as f:
                 f.write(resp.read())
 
-    # Decode NetCDF
     try:
-        ds = nc.Dataset(dest_nc)
-        stn = ds.variables.get("station")
-        ta = ds.variables.get("ta")   # air temperature [deg C or K]
-        pp = ds.variables.get("pp")   # air pressure [hPa or Pa]
-        ff = ds.variables.get("ff")   # wind speed [m/s]
-        dd = ds.variables.get("dd")   # wind direction [degrees]
-
-        lats_list: list[float] = []
-        lons_list: list[float] = []
-        elev_list: list[float] = []
-        pres_list: list[float] = []
-        temp_list: list[float] = []
-        u_list: list[float] = []
-        v_list: list[float] = []
-        time_list: list[float] = []
-
-        now_utc = datetime.datetime.now(datetime.timezone.utc)
-        n_stn = len(stn) if stn is not None else 0
-
-        # Extract authentic KNMI observation timestamp from dataset time variable if available
-        knmi_obs_ts = now_utc.timestamp()
-        time_var = ds.variables.get("time")
-        if time_var is not None and len(time_var) > 0:
-            try:
-                t_raw = float(time_var[0])
-                epoch_1950 = datetime.datetime(1950, 1, 1, tzinfo=datetime.timezone.utc)
-                knmi_obs_ts = (epoch_1950 + datetime.timedelta(seconds=t_raw)).timestamp()
-            except Exception:
-                pass
-
-        for i in range(n_stn):
-            stn_id = str(stn[i]).strip()
-            if stn_id in KNMI_STATIONS:
-                lat, lon, elev, name = KNMI_STATIONS[stn_id]
-            else:
-                lat, lon, elev = 52.1, 5.2, 0.0
-
-            t_val = float(ta[i]) if ta is not None else np.nan
-            if not np.isnan(t_val) and t_val < 100.0:
-                t_val += 273.15  # C -> K
-
-            p_val = float(pp[i]) if pp is not None else np.nan
-            if not np.isnan(p_val) and p_val < 2000.0:
-                p_val *= 100.0  # hPa -> Pa
-
-            ws = float(ff[i]) if ff is not None else np.nan
-            wd = float(dd[i]) if dd is not None else np.nan
-            u_val, v_val = np.nan, np.nan
-            if not np.isnan(ws) and not np.isnan(wd):
-                rad = np.radians(wd)
-                u_val = -ws * np.sin(rad)
-                v_val = -ws * np.cos(rad)
-
-            lats_list.append(lat)
-            lons_list.append(lon)
-            elev_list.append(elev)
-            pres_list.append(p_val)
-            temp_list.append(t_val)
-            u_list.append(u_val)
-            v_list.append(v_val)
-            time_list.append(knmi_obs_ts)
-
-        ds.close()
-
-        n_obs = len(pres_list)
-        if n_obs > 0:
-            pressures = np.array(pres_list, dtype=np.float32)
-            temps = np.array(temp_list, dtype=np.float32)
-            u_winds = np.array(u_list, dtype=np.float32)
-            v_winds = np.array(v_list, dtype=np.float32)
-            lats = np.array(lats_list, dtype=np.float32)
-            lons = np.array(lons_list, dtype=np.float32)
-            elevs = np.array(elev_list, dtype=np.float32)
-            times = np.array(time_list, dtype=np.float64)
-
-            p_main = out_dir / "knmi_insitu_obs.wx1"
-            wx1.write_array(
-                p_main,
-                pressures,
-                dataset_id="knmi_insitu_obs",
-                variable_path="pressure",
-                dimensions=["station_id"],
-                profile="output",
-                codec="zstd_shuffle",
-                attributes={
-                    "source": "KNMI Open Data Platform (10-minute in-situ)",
-                    "n_stations": str(n_obs),
-                    "units": "Pa",
-                },
-            )
-            for name, arr, unit in [
-                ("lat", lats, "degrees_north"),
-                ("lon", lons, "degrees_east"),
-                ("elev", elevs, "m"),
-                ("temp", temps, "K"),
-                ("u_wind", u_winds, "m/s"),
-                ("v_wind", v_winds, "m/s"),
-                ("time", times, "seconds_since_epoch"),
-            ]:
-                v_path = out_dir / f"knmi_insitu_obs_{name}.wx1"
-                wx1.write_array(
-                    v_path,
-                    arr,
-                    dataset_id=f"knmi_insitu_{name}",
-                    variable_path=name,
-                    dimensions=["station_id"],
-                    profile="output",
-                    codec="zstd_shuffle",
-                    attributes={"units": unit},
-                )
-            logger.info("Saved %d verified KNMI 10-minute observations to WX-1: %s", n_obs, p_main)
-            return n_obs
+        return decode_knmi_netcdf_to_wx1(dest_nc, out_dir)
     except Exception as e:
         logger.error("Error decoding KNMI NetCDF: %s", e)
 

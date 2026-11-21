@@ -6,6 +6,7 @@ Strictly 100% deterministic classical data assimilation & verification (0% AI / 
 from __future__ import annotations
 
 import datetime
+import logging
 import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -27,6 +28,9 @@ from tempest_v2.da.var3d import (
 )
 from tempest_v2.ic_builder import stagger_uv, unstagger_uv
 from tempest_v2.projection import GRAVITY_M_S2, KAPPA, P0_PA, R_D, DomainSpec, VerticalGrid
+from tempest_v2.titan_qc import run_titan_buddy_check
+
+logger = logging.getLogger("tempest_v2.verification")
 
 
 def compute_mslp_pa(
@@ -153,6 +157,7 @@ def load_station_obs_wx1(
     theta_sfc_ref: float = 288.15,
     p_sfc_ref: float = 101_325.0,
     n_ref_hz: float = 0.01,
+    enable_titan_qc: bool = True,
 ) -> Tuple[List[VarObservation], List[Dict[str, Any]]]:
     """Load QC-filtered surface, upper-air, GNSS ZTD, satellite wind, and marine WX-1 observations inside `spec`.
 
@@ -509,6 +514,56 @@ def load_station_obs_wx1(
                     error_variance=2.5**2,
                     time_offset_sec=t_off,
                 )
+            )
+
+    # 5. Spatial TITAN Buddy Check QC on surface stations (t2m, ps/mslp, wind u/v)
+    if enable_titan_qc and len(stn_rows) >= 4:
+        lats_qc = np.array([r["lat"] for r in stn_rows], dtype=np.float64)
+        lons_qc = np.array([r["lon"] for r in stn_rows], dtype=np.float64)
+        elev_qc = np.array([r["elev_m"] for r in stn_rows], dtype=np.float64)
+        sid_by_row = [r["station_id"] for r in stn_rows]
+        rejected_pairs: set[Tuple[str, str]] = set()
+        total_rejected = 0
+
+        t2m_vals = np.array([r["t2m_k"] for r in stn_rows], dtype=np.float64)
+        if np.count_nonzero(np.isfinite(t2m_vals)) >= 4:
+            p_t, st_t = run_titan_buddy_check(lats_qc, lons_qc, elev_qc, t2m_vals, var_type="t2m")
+            for idx_r, row in enumerate(stn_rows):
+                if np.isfinite(t2m_vals[idx_r]) and not p_t[idx_r]:
+                    rejected_pairs.add((sid_by_row[idx_r], "t2m"))
+                    row["t2m_k"] = float("nan")
+            total_rejected += int(st_t.get("rejected", 0))
+
+        mslp_vals = np.array([r["mslp_pa"] for r in stn_rows], dtype=np.float64)
+        if np.count_nonzero(np.isfinite(mslp_vals)) >= 4:
+            p_p, st_p = run_titan_buddy_check(
+                lats_qc, lons_qc, np.zeros_like(elev_qc), mslp_vals, var_type="psfc"
+            )
+            for idx_r, row in enumerate(stn_rows):
+                if np.isfinite(mslp_vals[idx_r]) and not p_p[idx_r]:
+                    rejected_pairs.add((sid_by_row[idx_r], "ps"))
+                    row["mslp_pa"] = float("nan")
+            total_rejected += int(st_p.get("rejected", 0))
+
+        u_vals = np.array([r["u10_ms"] for r in stn_rows], dtype=np.float64)
+        v_vals = np.array([r["v10_ms"] for r in stn_rows], dtype=np.float64)
+        if np.count_nonzero(np.isfinite(u_vals) & np.isfinite(v_vals)) >= 4:
+            p_u, st_u = run_titan_buddy_check(lats_qc, lons_qc, elev_qc, u_vals, var_type="u10m")
+            p_v, st_v = run_titan_buddy_check(lats_qc, lons_qc, elev_qc, v_vals, var_type="v10m")
+            for idx_r, row in enumerate(stn_rows):
+                if np.isfinite(u_vals[idx_r]) and (not p_u[idx_r] or not p_v[idx_r]):
+                    rejected_pairs.add((sid_by_row[idx_r], "u_geo"))
+                    rejected_pairs.add((sid_by_row[idx_r], "v_geo"))
+                    row["u10_ms"] = float("nan")
+                    row["v10_ms"] = float("nan")
+            total_rejected += max(int(st_u.get("rejected", 0)), int(st_v.get("rejected", 0)))
+
+        if rejected_pairs:
+            obs_list = [o for o in obs_list if (o.station_id, o.var_type) not in rejected_pairs]
+            logger.info(
+                "TITAN spatial QC filtered %d surface station-variable pairs across %d surface stations",
+                total_rejected,
+                len(stn_rows),
             )
 
     return obs_list, stn_rows

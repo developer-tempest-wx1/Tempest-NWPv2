@@ -26,7 +26,7 @@ from pathlib import Path
 import sys
 import os
 import time
-from typing import Dict, Tuple
+from typing import Dict, Optional, Tuple
 
 # Ensure package is on path
 pkg_root = str(Path(__file__).resolve().parent.parent)
@@ -54,6 +54,7 @@ def download_all_observations(
     zulu_time: Optional[str] = None,
     notify_topic: Optional[str] = None,
     include_sondehub: bool = True,
+    spec_for_radar: Optional[object] = None,
 ) -> Path:
     """Top-level pipeline entrypoint: downloads all live observations and returns the run directory."""
     target_base = Path(base_dir) if base_dir is not None else Path("data/observations/runs")
@@ -63,6 +64,7 @@ def download_all_observations(
         zulu_time=zulu_time,
         notify_topic=notify_topic,
         include_sondehub=include_sondehub,
+        spec_for_radar=spec_for_radar,
     )
     return run_dir
 
@@ -73,6 +75,7 @@ def run_observation_ingest_pipeline(
     zulu_time: str = None,
     notify_topic: str = None,
     include_sondehub: bool = True,
+    spec_for_radar: Optional[object] = None,
 ) -> Tuple[Path, Dict[str, int]]:
     """Executes the full observation download into structured Zulu subfolders."""
     if zulu_time is None:
@@ -238,6 +241,16 @@ def run_observation_ingest_pipeline(
     except Exception as e:
         logger.warning("OSI-SAF Sea Ice ingest notice: %s", e)
         counts["osi_saf_sea_ice"] = 0
+
+    if spec_for_radar is not None:
+        try:
+            from tempest_v2.ingest_radar_qpe import ingest_radar_qpe_to_wx1
+            rad_p = ingest_radar_qpe_to_wx1(run_obs_dir, spec_for_radar)  # type: ignore[arg-type]
+            counts["radar_qpe_grid"] = 1 if rad_p is not None else 0
+        except Exception as e:
+            logger.warning("Radar QPE ingest notice: %s", e)
+            counts["radar_qpe_grid"] = 0
+
     os.environ["TEMPEST_OBS_DIR"] = str(run_obs_dir)
 
     elapsed = time.time() - t0
