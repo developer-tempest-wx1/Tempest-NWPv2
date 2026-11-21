@@ -46,7 +46,7 @@ def main() -> None:
     parser.add_argument(
         "--ecmwf",
         action="store_true",
-        help="Select ECMWF output schedule (3-hourly through T+144, then 6-hourly through T+360); physics/dynamics remain 100% Tempest.",
+        help="Select ECMWF output schedule (3-hourly through T+144, then 6-hourly through T+360); physics/dynamics remain 100%% Tempest.",
     )
     parser.add_argument("--ic-source", choices=["ecmwf", "aurora", "restart"], default="ecmwf")
     parser.add_argument("--sfc-grib", type=Path, default=None)
@@ -60,16 +60,23 @@ def main() -> None:
     parser.add_argument("--dt-d2", type=float, default=20.0)
     parser.add_argument("--dt-d3", type=float, default=4.0)
     parser.add_argument("--outdir", type=Path, default=PROJECT_ROOT / "data" / "forecasts")
+    parser.add_argument("--runs-root", type=Path, default=None, help="Isolated per-cycle runs root (YYYYMMDD_HHZ/...)")
+    parser.add_argument("--cycle-restart-hours", type=str, default="6.0", help="Comma-separated cycle restart leads [h]")
+    parser.add_argument("--ensemble-members", type=int, default=0, help="0=CF only, 51=CF + 50 perturbed members")
+    parser.add_argument("--ensemble-hours", type=float, default=None, help="Ensemble forecast length [h]")
+    parser.add_argument("--ensemble-seed", type=int, default=None)
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    cyc_rst_hours = tuple(float(h.strip()) for h in args.cycle_restart_hours.split(",") if h.strip())
 
     sfc_grib = args.sfc_grib
     pl_grib = args.pl_grib
     if args.download_live:
         if args.ic_source == "ecmwf" and (sfc_grib is None or pl_grib is None):
+            raw_dir = (args.runs_root / "raw_ecmwf") if args.runs_root is not None else (args.outdir / "raw_ecmwf")
             sfc_grib, pl_grib, _ = download_ecmwf_cold_start(
-                step=0, prefer_0p1=False, output_dir=args.outdir / "raw_ecmwf"
+                step=0, prefer_0p1=False, output_dir=raw_dir
             )
         if args.enable_da:
             args.obs_dir.mkdir(parents=True, exist_ok=True)
@@ -87,6 +94,11 @@ def main() -> None:
             restart_path=args.restart_in,
             obs_dir=args.obs_dir if args.enable_da else None,
             outdir=args.outdir,
+            runs_root=args.runs_root,
+            cycle_restart_hours=cyc_rst_hours,
+            ensemble_members=args.ensemble_members,
+            ensemble_lead_hours=args.ensemble_hours,
+            ensemble_seed=args.ensemble_seed,
             ecmwf_schedule=args.ecmwf,
             enable_da=args.enable_da,
             dt_d2_s=args.dt_d2,
@@ -94,10 +106,13 @@ def main() -> None:
             physics_every=args.physics_every,
         )
         printable = {
+            "run_dir": str(summary.get("run_dir")),
             "d2_elapsed_s": summary["d2"]["elapsed_s"],
             "d3_elapsed_s": summary["d3"]["elapsed_s"],
             "d3_outputs": [str(p) for p in summary["d3"]["output_paths"]],
+            "cycle_restart_paths": [str(p) for p in summary.get("cycle_restart_paths", [])],
             "da": summary["da"],
+            "ensemble": summary.get("ensemble"),
         }
         print(json.dumps(printable, indent=2, default=str))
         return
