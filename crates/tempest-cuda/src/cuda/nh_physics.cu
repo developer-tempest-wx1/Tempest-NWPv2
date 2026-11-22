@@ -2235,46 +2235,60 @@ int32_t nh_cuda_step_physics(NhCudaHandle* h, double dt_s) {
         NH_CUDA_CHECK(cudaMemset(h->d_sfc_drag_coeff, 0, n2 * sizeof(float)));
     }
 
-    // 3. YSU Nonlocal PBL + Shallow EDMFm Mass-Flux + Implicit Vertical Diffusion
-    if (h->pcfg.enable_pbl) {
-        nh_pbl_scalar_kernel<<<grid, block>>>(
-            h->cfg, g, dt_s,
-            h->d_u, h->d_v, h->d_pip,
-            h->d_lsm, h->d_shf, h->d_lhf, h->d_ustar,
-            h->d_thp, h->d_qv, h->d_qc, h->d_qi, h->d_pblh,
-            h->d_div, h->d_q_tmp, h->d_tri_c, h->d_tri_d
-        );
-        NH_CUDA_CHECK(cudaGetLastError());
+    auto run_pbl = [&]() -> int32_t {
+        // 3. YSU Nonlocal PBL + Shallow EDMFm Mass-Flux + Implicit Vertical Diffusion
+        if (h->pcfg.enable_pbl) {
+            nh_pbl_scalar_kernel<<<grid, block>>>(
+                h->cfg, g, dt_s,
+                h->d_u, h->d_v, h->d_pip,
+                h->d_lsm, h->d_shf, h->d_lhf, h->d_ustar,
+                h->d_thp, h->d_qv, h->d_qc, h->d_qi, h->d_pblh,
+                h->d_div, h->d_q_tmp, h->d_tri_c, h->d_tri_d
+            );
+            NH_CUDA_CHECK(cudaGetLastError());
 
-        nh_pbl_momentum_u_kernel<<<grid, block>>>(
-            h->cfg, g, dt_s, 0, h->d_pblh, h->d_ustar, h->d_sfc_drag_coeff,
-            h->d_u, h->d_tri_c, h->d_tri_d
-        );
-        nh_pbl_momentum_u_kernel<<<dim3(1, (h->cfg.ny + 15) / 16), dim3(1, 16)>>>(
-            h->cfg, g, dt_s, 1, h->d_pblh, h->d_ustar, h->d_sfc_drag_coeff,
-            h->d_u, h->d_tri_c, h->d_tri_d
-        );
-        nh_pbl_momentum_v_kernel<<<grid, block>>>(
-            h->cfg, g, dt_s, 0, h->d_pblh, h->d_ustar, h->d_sfc_drag_coeff,
-            h->d_v, h->d_tri_c, h->d_tri_d
-        );
-        nh_pbl_momentum_v_kernel<<<dim3((h->cfg.nx + 15) / 16, 1), dim3(16, 1)>>>(
-            h->cfg, g, dt_s, 1, h->d_pblh, h->d_ustar, h->d_sfc_drag_coeff,
-            h->d_v, h->d_tri_c, h->d_tri_d
-        );
-        NH_CUDA_CHECK(cudaGetLastError());
-    }
+            nh_pbl_momentum_u_kernel<<<grid, block>>>(
+                h->cfg, g, dt_s, 0, h->d_pblh, h->d_ustar, h->d_sfc_drag_coeff,
+                h->d_u, h->d_tri_c, h->d_tri_d
+            );
+            nh_pbl_momentum_u_kernel<<<dim3(1, (h->cfg.ny + 15) / 16), dim3(1, 16)>>>(
+                h->cfg, g, dt_s, 1, h->d_pblh, h->d_ustar, h->d_sfc_drag_coeff,
+                h->d_u, h->d_tri_c, h->d_tri_d
+            );
+            nh_pbl_momentum_v_kernel<<<grid, block>>>(
+                h->cfg, g, dt_s, 0, h->d_pblh, h->d_ustar, h->d_sfc_drag_coeff,
+                h->d_v, h->d_tri_c, h->d_tri_d
+            );
+            nh_pbl_momentum_v_kernel<<<dim3((h->cfg.nx + 15) / 16, 1), dim3(16, 1)>>>(
+                h->cfg, g, dt_s, 1, h->d_pblh, h->d_ustar, h->d_sfc_drag_coeff,
+                h->d_v, h->d_tri_c, h->d_tri_d
+            );
+            NH_CUDA_CHECK(cudaGetLastError());
+        }
+        return 0;
+    };
 
-    // 4. 6-Class Mixed-Phase Microphysics + SLW Preservation + Subcycled Fallout
-    if (h->pcfg.enable_microphysics && h->cfg.has_moist) {
-        nh_microphysics_kernel<<<grid, block>>>(
-            h->cfg, h->pcfg, g, dt_s, h->d_lsm,
-            h->d_thp, h->d_pip, h->d_qv, h->d_qc, h->d_qr, h->d_qi, h->d_qs, h->d_qg,
-            h->d_rain_acc, h->d_snow_acc, h->d_graupel_acc,
-            h->d_precip_liq_rate, h->d_precip_ice_rate,
-            h->d_div, h->d_tri_c, h->d_tri_d
-        );
-        NH_CUDA_CHECK(cudaGetLastError());
+    auto run_microphysics = [&]() -> int32_t {
+        // 4. 6-Class Mixed-Phase Microphysics + SLW Preservation + Subcycled Fallout
+        if (h->pcfg.enable_microphysics && h->cfg.has_moist) {
+            nh_microphysics_kernel<<<grid, block>>>(
+                h->cfg, h->pcfg, g, dt_s, h->d_lsm,
+                h->d_thp, h->d_pip, h->d_qv, h->d_qc, h->d_qr, h->d_qi, h->d_qs, h->d_qg,
+                h->d_rain_acc, h->d_snow_acc, h->d_graupel_acc,
+                h->d_precip_liq_rate, h->d_precip_ice_rate,
+                h->d_div, h->d_tri_c, h->d_tri_d
+            );
+            NH_CUDA_CHECK(cudaGetLastError());
+        }
+        return 0;
+    };
+
+    if (h->pcfg.pbl_last != 0) {
+        if (run_microphysics() != 0) return -1;
+        if (run_pbl() != 0) return -1;
+    } else {
+        if (run_pbl() != 0) return -1;
+        if (run_microphysics() != 0) return -1;
     }
 
     // Advance solar UTC clock continuously across diurnal physics steps

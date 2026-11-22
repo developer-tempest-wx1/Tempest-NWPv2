@@ -569,3 +569,54 @@ def test_rtx3060_nz137_720x720_full_physics_tiled_smoke() -> None:
         )
     finally:
         solver.close()
+
+
+def test_pbl_last_order_stability_and_default_unchanged() -> None:
+    """Verify opt-in IFS-50r1 PBL-last ordering runs cleanly and leaves default pbl_last=0 unchanged."""
+    nz, ny, nx = 24, 4, 4
+    vgrid = VerticalGrid(nz=nz, z_top_m=12_000.0, stretch_power=1.2)
+    hs = np.zeros((ny, nx), dtype=np.float64)
+    solver = NonHydrostaticGPUSolver(
+        vgrid,
+        dx_m=7500.0,
+        dy_m=7500.0,
+        hs_m=hs,
+        has_moist=True,
+        has_physics=True,
+    )
+    try:
+        _, z_s, _ = vgrid.heights_3d(hs)
+        ref = VerticalGrid.reference_state(z_s)
+        base_state = solver.empty_state()
+        base_state["u"][:] = 6.0
+        base_state["theta_p"][0:5] = -2.0
+        p_0 = ref["p_bar"][:6]
+        t_0 = (ref["theta_bar"][:6] - 2.0) * ref["pi_bar"][:6]
+        base_state["qv"][:6] = (_qsat_water_np(t_0, p_0) + 1.0e-3).astype(np.float32)
+
+        sstatic = solver.default_surface_static()
+        base_surf = solver.empty_surface_state()
+
+        outs = []
+        for kw in ({}, {"pbl_last": 0}, {"pbl_last": 1}):
+            solver.upload_state(base_state)
+            solver.set_surface_static(sstatic)
+            solver.upload_surface(base_surf)
+            solver.set_physics_config(
+                enable_microphysics=1,
+                enable_pbl=1,
+                enable_radiation=0,
+                enable_surface=1,
+                **kw,
+            )
+            solver.step_physics(dt_s=40.0, n_steps=10)
+            outs.append(solver.download_state())
+
+        for sp in solver.SPECIES:
+            np.testing.assert_array_equal(outs[0][sp], outs[1][sp])
+            assert np.all(np.isfinite(outs[2][sp]))
+            assert float(outs[2][sp].min()) >= 0.0
+        np.testing.assert_array_equal(outs[0]["theta_p"], outs[1]["theta_p"])
+        assert np.max(np.abs(outs[2]["qv"] - outs[0]["qv"])) > 1e-7
+    finally:
+        solver.close()

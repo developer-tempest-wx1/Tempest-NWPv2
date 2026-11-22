@@ -102,6 +102,12 @@ def main() -> None:
         help="Suppress per-step CLI log lines (keep phase/output logs and tqdm bar)",
     )
     parser.add_argument(
+        "--pbl-last",
+        action="store_true",
+        default=False,
+        help="IFS 50r1 physics ordering: execute vertical diffusion/PBL after moist microphysics",
+    )
+    parser.add_argument(
         "--mem-profile-every",
         type=int,
         default=0,
@@ -175,6 +181,7 @@ def main() -> None:
             show_progress=show_progress,
             log_steps=log_steps,
             mem_profile_every=args.mem_profile_every,
+            pbl_last=args.pbl_last,
         )
         printable = {
             "run_dir": str(summary.get("run_dir")),
@@ -223,6 +230,7 @@ def main() -> None:
             show_progress=show_progress,
             log_steps=log_steps,
             mem_profile_every=args.mem_profile_every,
+            pbl_last=args.pbl_last,
         )
         printable = {
             "run_dir": str(summary.get("run_dir")),
@@ -307,6 +315,7 @@ def main() -> None:
         show_progress=show_progress,
         log_steps=log_steps,
         mem_profile_every=args.mem_profile_every,
+        pbl_last=args.pbl_last,
     )
     print(
         json.dumps(

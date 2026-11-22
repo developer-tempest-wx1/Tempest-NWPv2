@@ -92,6 +92,7 @@ pub struct NhPhysicsConfig {
     pub julian_day: f64,
     pub utc_seconds: f64,
     pub co2_ppm: f64,
+    pub pbl_last: i32,
 }
 
 impl Default for NhPhysicsConfig {
@@ -107,6 +108,7 @@ impl Default for NhPhysicsConfig {
             julian_day: 172.0,
             utc_seconds: 43_200.0,
             co2_ppm: 425.0,
+            pbl_last: 0,
         }
     }
 }

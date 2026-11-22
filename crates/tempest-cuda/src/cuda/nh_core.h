@@ -103,6 +103,7 @@ typedef struct NhPhysicsConfig {
     double julian_day;           /* Day-of-year in [1, 366] */
     double utc_seconds;          /* UTC seconds since 00:00Z [s] */
     double co2_ppm;              /* CO2 volume mixing ratio [ppm], e.g. 425.0 */
+    int32_t pbl_last;            /* 0 = default (PBL before microphysics), 1 = IFS 50r1 order (PBL last) */
 } NhPhysicsConfig;
 
 /**
