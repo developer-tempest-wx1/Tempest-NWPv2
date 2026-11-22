@@ -228,7 +228,7 @@ def run_single_cycle(
 
     d1_name = d1_spec.name if d1_spec is not None else "d1_global_0p25"
     d2_name = d2_spec.name if d2_spec is not None else "d2_eu_lcc"
-    d3_name = d3_spec.name if d3_spec is not None else "d3_benelux_de_2p5km"
+    d3_name = d3_spec.name if d3_spec is not None else "d3_nl_2p5km"
     d1_shape = (int(d1_spec.nz), int(d1_spec.ny), int(d1_spec.nx)) if d1_spec is not None else None
     d2_shape = (int(d2_spec.nz), int(d2_spec.ny), int(d2_spec.nx)) if d2_spec is not None else None
     d3_shape = (int(d3_spec.nz), int(d3_spec.ny), int(d3_spec.nx)) if d3_spec is not None else None

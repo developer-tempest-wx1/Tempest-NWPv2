@@ -177,27 +177,35 @@ def test_multi_tile_matches_untiled_with_qv_lbc() -> None:
 
 
 def test_d3_default_2p5km_1tile_vram_fit() -> None:
-    """Verify default 'd3' domain is 2.5 km (432x432) fitting 1x1 GPU tile at nz=137 while keeping d3_1p5km."""
+    """Verify default 'd3' domain is compact NL+buffer 2.5 km (216x216, 1-tile <1.5 GiB) while keeping benelux_2p5km & d3_1p5km."""
     from tempest_v2.cuda_bridge import DEFAULT_MAX_VRAM_BYTES, plan_horizontal_tiling
     from tempest_v2.projection import get_domain_spec
 
     d3 = get_domain_spec("d3", nz=137)
-    assert d3.name == "d3_benelux_de_2p5km"
-    assert (d3.nz, d3.ny, d3.nx) == (137, 432, 432)
+    assert d3.name == "d3_nl_2p5km"
+    assert (d3.nz, d3.ny, d3.nx) == (137, 216, 216)
     assert d3.dx_m == 2500.0
     assert d3.dy_m == 2500.0
+    assert float(d3.lat2d.min()) < 50.0 and float(d3.lat2d.max()) > 54.0
+    assert float(d3.lon2d.min()) < 2.0 and float(d3.lon2d.max()) > 8.5
 
     nt_y, nt_x, est = plan_horizontal_tiling(
         137,
-        432,
-        432,
+        216,
+        216,
         moist=True,
         has_lbc=True,
         has_iau=True,
         has_physics=True,
         max_vram_bytes=DEFAULT_MAX_VRAM_BYTES,
     )
-    assert (nt_y, nt_x) == (1, 1), f"Expected 1x1 tile for D3 2.5km x137, got {nt_y}x{nt_x} ({est/1048576:.0f} MiB)"
+    assert (nt_y, nt_x) == (1, 1), f"Expected 1x1 tile for d3_nl_2p5km x137, got {nt_y}x{nt_x} ({est/1048576:.0f} MiB)"
+    assert est < int(1.5 * 1024**3), f"Expected < 1.5 GiB VRAM for 216x216x137, got {est/1048576:.0f} MiB"
+
+    d3_ben = get_domain_spec("d3_benelux_2p5km", nz=137)
+    assert d3_ben.name == "d3_benelux_de_2p5km"
+    assert (d3_ben.nz, d3_ben.ny, d3_ben.nx) == (137, 432, 432)
+    assert d3_ben.dx_m == 2500.0
 
     d3_1p5 = get_domain_spec("d3_1p5km", nz=137)
     assert d3_1p5.name == "d3_benelux_de_1p5km"

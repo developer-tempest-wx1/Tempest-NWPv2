@@ -299,16 +299,18 @@ def test_multisource_da_radiosonde_ztd_marine_lhn_and_fgat(tmp_path: Path) -> No
     from tempest_v2.projection import get_domain_spec
 
     d3_base = get_domain_spec("d3", nz=12, z_top_m=18_000.0)
+    cy, cx = d3_base.ny // 2, d3_base.nx // 2
+    sy, sx = slice(cy - 8, cy + 8), slice(cx - 8, cx + 8)
     spec = replace(
         d3_base,
         ny=16,
         nx=16,
-        x_m=d3_base.x_m[200:216].copy(),
-        y_m=d3_base.y_m[200:216].copy(),
-        lat2d=d3_base.lat2d[200:216, 200:216].copy(),
-        lon2d=d3_base.lon2d[200:216, 200:216].copy(),
-        map_factor=d3_base.map_factor[200:216, 200:216].copy(),
-        coriolis_f=d3_base.coriolis_f[200:216, 200:216].copy(),
+        x_m=d3_base.x_m[sx].copy(),
+        y_m=d3_base.y_m[sy].copy(),
+        lat2d=d3_base.lat2d[sy, sx].copy(),
+        lon2d=d3_base.lon2d[sy, sx].copy(),
+        map_factor=d3_base.map_factor[sy, sx].copy(),
+        coriolis_f=d3_base.coriolis_f[sy, sx].copy(),
     )
     hs = np.zeros((16, 16), dtype=np.float64)
     lsm = np.ones((16, 16), dtype=np.float32)

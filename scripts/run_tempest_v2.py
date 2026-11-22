@@ -64,7 +64,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Tempest-NWP v2 — Classical GPU Non-Hydrostatic NWP (0% AI / 0% ML)"
     )
-    parser.add_argument("--mode", choices=["d1_to_d2_to_d3", "d2_to_d3", "d3", "d3_1p5km", "d2", "d1"], default="d2_to_d3")
+    parser.add_argument("--mode", choices=["d1_to_d2_to_d3", "d2_to_d3", "d3", "d3_benelux_2p5km", "d3_1p5km", "d2", "d1"], default="d2_to_d3")
     parser.add_argument("--nz", type=int, choices=[65, 90, 137], default=65)
     parser.add_argument("--hours", type=float, default=6.0)
     parser.add_argument("--d1-hours", type=float, default=None, help="Optional global D1 forecast length [h]")
@@ -302,6 +302,7 @@ def main() -> None:
         "d1": args.dt_d1,
         "d2": args.dt_d2,
         "d3": args.dt_d3,
+        "d3_benelux_2p5km": args.dt_d3,
         "d3_1p5km": 4.0 if ("--dt-d3" not in sys.argv) else args.dt_d3,
     }[args.mode]
     sched = forecast_output_schedule_hours(args.hours, ecmwf_schedule=args.ecmwf, hourly=True)

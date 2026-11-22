@@ -35,7 +35,7 @@ def get_benelux_grid_coords(resolution_m: int | None = None) -> Tuple[np.ndarray
     if resolution_m is None:
         resolution_m = int(os.environ.get("TEMPEST_D3_RESOLUTION_M", "2500"))
     if resolution_m == 2500:
-        spec = get_domain_spec("d3_benelux_de_2p5km")
+        spec = get_domain_spec("d3")
         return spec.lat2d[:, spec.nx // 2].astype(np.float32), spec.lon2d[spec.ny // 2, :].astype(np.float32)
     if resolution_m == 1500:
         spec = get_domain_spec("d3_benelux_de_1p5km")

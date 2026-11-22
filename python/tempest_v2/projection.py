@@ -283,13 +283,26 @@ def get_domain_spec(
     z_top_m: Optional[float] = None,
     stretch_power: float = 1.5,
 ) -> DomainSpec:
-    """Return canonical DomainSpec for D1 Global, D2 Europe LCC (7.5 km), or D3 Benelux+DE LCC (2.5 km default, 1.5 km optional via 'd3_1p5km')."""
+    """Return canonical DomainSpec for D1 Global, D2 Europe LCC (7.5 km), or D3 Netherlands+buffer LCC (2.5 km default, 216x216; optional 'd3_benelux_2p5km' 432x432 or 'd3_1p5km' 720x720)."""
     key = name.strip().lower().replace("-", "_")
     if z_top_m is None:
         z_top_m = 31_000.0 if nz >= 90 else 22_000.0
     vgrid = VerticalGrid(nz=nz, z_top_m=z_top_m, stretch_power=stretch_power)
 
-    if key in ("d3", "d3_2p5km", "d3_benelux_de_2p5km", "d3_benelux_2p5km", "benelux_de_2p5km", "benelux_2p5km"):
+    if key in ("d3", "d3_nl", "d3_nl_2p5km", "nl_2p5km"):
+        proj = LCCProjection(lat1_deg=50.5, lat2_deg=53.8, lat0_deg=52.15, lon0_deg=5.30)
+        return _make_lcc_domain(
+            "d3_nl_2p5km",
+            ny=216,
+            nx=216,
+            dx_m=2500.0,
+            projection=proj,
+            vertical=vgrid,
+            center_lat_deg=52.15,
+            center_lon_deg=5.30,
+        )
+
+    if key in ("d3_2p5km", "d3_benelux_de_2p5km", "d3_benelux_2p5km", "benelux_de_2p5km", "benelux_2p5km"):
         proj = LCCProjection(lat1_deg=48.0, lat2_deg=54.0, lat0_deg=51.0, lon0_deg=8.5)
         return _make_lcc_domain(
             "d3_benelux_de_2p5km",
