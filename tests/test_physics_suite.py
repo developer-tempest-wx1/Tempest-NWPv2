@@ -490,8 +490,8 @@ def test_coupled_moist_convective_bubble_precipitation() -> None:
 
 
 def test_rtx3060_nz137_720x720_full_physics_tiled_smoke() -> None:
-    """Verify full-size operational D3 (720x720x137) coupled dynamics+physics fits 2x2 tiled VRAM."""
-    spec = get_domain_spec("d3", nz=137, z_top_m=31_000.0, stretch_power=1.5)
+    """Verify full-size operational D3 1.5 km (720x720x137) coupled dynamics+physics fits 2x2 tiled VRAM."""
+    spec = get_domain_spec("d3_benelux_de_1p5km", nz=137, z_top_m=31_000.0, stretch_power=1.5)
     ny, nx, nz = spec.ny, spec.nx, spec.nz
 
     # Mild Ardennes terrain in SE, flat NL, North Sea NW corner, Lake IJsselmeer patch

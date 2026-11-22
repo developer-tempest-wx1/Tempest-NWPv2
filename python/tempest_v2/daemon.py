@@ -51,7 +51,7 @@ class DaemonConfig:
     nz: int = 65
     dt_d1_s: float = 60.0
     dt_d2_s: float = 20.0
-    dt_d3_s: float = 4.0
+    dt_d3_s: float = 6.0
     physics_every: int = 5
     enable_d1: bool = False
     enable_ocean_si3: bool = True
@@ -228,7 +228,7 @@ def run_single_cycle(
 
     d1_name = d1_spec.name if d1_spec is not None else "d1_global_0p25"
     d2_name = d2_spec.name if d2_spec is not None else "d2_eu_lcc"
-    d3_name = d3_spec.name if d3_spec is not None else "d3_benelux_de_1p5km"
+    d3_name = d3_spec.name if d3_spec is not None else "d3_benelux_de_2p5km"
     d1_shape = (int(d1_spec.nz), int(d1_spec.ny), int(d1_spec.nx)) if d1_spec is not None else None
     d2_shape = (int(d2_spec.nz), int(d2_spec.ny), int(d2_spec.nx)) if d2_spec is not None else None
     d3_shape = (int(d3_spec.nz), int(d3_spec.ny), int(d3_spec.nx)) if d3_spec is not None else None

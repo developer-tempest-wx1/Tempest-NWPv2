@@ -64,7 +64,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Tempest-NWP v2 — Classical GPU Non-Hydrostatic NWP (0% AI / 0% ML)"
     )
-    parser.add_argument("--mode", choices=["d1_to_d2_to_d3", "d2_to_d3", "d3", "d2", "d1"], default="d2_to_d3")
+    parser.add_argument("--mode", choices=["d1_to_d2_to_d3", "d2_to_d3", "d3", "d3_1p5km", "d2", "d1"], default="d2_to_d3")
     parser.add_argument("--nz", type=int, choices=[65, 90, 137], default=65)
     parser.add_argument("--hours", type=float, default=6.0)
     parser.add_argument("--d1-hours", type=float, default=None, help="Optional global D1 forecast length [h]")
@@ -88,7 +88,7 @@ def main() -> None:
     parser.add_argument("--physics-every", type=int, default=5, help="Substep physics cadence every N dynamics steps")
     parser.add_argument("--dt-d1", type=float, default=60.0)
     parser.add_argument("--dt-d2", type=float, default=20.0)
-    parser.add_argument("--dt-d3", type=float, default=4.0)
+    parser.add_argument("--dt-d3", type=float, default=6.0, help="D3 dynamics step [s] (default: 6.0 for 2.5 km D3; use 4.0 for d3_1p5km)")
     parser.add_argument("--outdir", type=Path, default=PROJECT_ROOT / "data" / "forecasts")
     parser.add_argument("--runs-root", type=Path, default=None, help="Isolated per-cycle runs root (YYYYMMDD_HHZ/...)")
     parser.add_argument("--cycle-restart-hours", type=str, default="6.0", help="Comma-separated cycle restart leads [h]")
@@ -298,7 +298,12 @@ def main() -> None:
     clear_cfgrib_cache()
     gc.collect()
 
-    dt_s = {"d1": args.dt_d1, "d2": args.dt_d2, "d3": args.dt_d3}[args.mode]
+    dt_s = {
+        "d1": args.dt_d1,
+        "d2": args.dt_d2,
+        "d3": args.dt_d3,
+        "d3_1p5km": 4.0 if ("--dt-d3" not in sys.argv) else args.dt_d3,
+    }[args.mode]
     sched = forecast_output_schedule_hours(args.hours, ecmwf_schedule=args.ecmwf, hourly=True)
     res = run_domain_forecast(
         spec,

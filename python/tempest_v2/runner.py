@@ -1198,7 +1198,7 @@ def run_two_nest_pipeline(
     ecmwf_schedule: bool = False,
     enable_da: bool = True,
     dt_d2_s: float = 20.0,
-    dt_d3_s: float = 4.0,
+    dt_d3_s: float = 6.0,
     physics_every: int = 5,
     lbc_interval_s: float = 1800.0,
     enable_ocean_si3: bool = False,
@@ -1216,7 +1216,7 @@ def run_two_nest_pipeline(
     pbl_last: bool = False,
     cy46_physics: bool = False,
 ) -> Dict[str, Any]:
-    """Run operational D2 (7.5 km Europe) -> WX-1 LBC -> D3 (1.5 km Benelux+DE) pipeline."""
+    """Run operational D2 (7.5 km Europe) -> WX-1 LBC -> D3 (2.5 km Benelux+DE default) pipeline."""
     t0_pipe = time.perf_counter()
     logger.info("=== Tempest-NWP v2 Pipeline [D2 -> D3] | nz=%d | hours=%.2fh ===", int(nz), float(forecast_hours))
     d2_spec = d2_spec if d2_spec is not None else get_domain_spec("d2", nz=nz)
@@ -1470,7 +1470,7 @@ def run_three_nest_pipeline(
     enable_da: bool = True,
     dt_d1_s: float = 60.0,
     dt_d2_s: float = 20.0,
-    dt_d3_s: float = 4.0,
+    dt_d3_s: float = 6.0,
     physics_every: int = 5,
     d1_lbc_interval_s: float = 3600.0,
     lbc_interval_s: float = 1800.0,
@@ -1491,7 +1491,7 @@ def run_three_nest_pipeline(
     pbl_last: bool = False,
     cy46_physics: bool = False,
 ) -> Dict[str, Any]:
-    """Run coupled global D1 (0.25 deg) -> regional D2 (7.5 km) -> D3 (1.5 km) pipeline with NEMO+SI3 & 3D diagnostics."""
+    """Run coupled global D1 (0.25 deg) -> regional D2 (7.5 km) -> D3 (2.5 km Benelux+DE default) pipeline with NEMO+SI3 & 3D diagnostics."""
     t0_pipe = time.perf_counter()
     d1_hrs = max(float(forecast_hours), float(d1_forecast_hours)) if d1_forecast_hours is not None else float(forecast_hours)
     logger.info(

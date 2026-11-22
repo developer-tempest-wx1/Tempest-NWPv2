@@ -33,9 +33,12 @@ STATIC_DIR = PROJECT_ROOT / "data" / "static"
 def get_benelux_grid_coords(resolution_m: int | None = None) -> Tuple[np.ndarray, np.ndarray]:
     """Compatibility helper returning (lats, lons) 1D bounds or D3 Benelux grid axes."""
     if resolution_m is None:
-        resolution_m = int(os.environ.get("TEMPEST_D3_RESOLUTION_M", "1500"))
-    spec = get_domain_spec("d3_benelux_de_1p5km")
+        resolution_m = int(os.environ.get("TEMPEST_D3_RESOLUTION_M", "2500"))
+    if resolution_m == 2500:
+        spec = get_domain_spec("d3_benelux_de_2p5km")
+        return spec.lat2d[:, spec.nx // 2].astype(np.float32), spec.lon2d[spec.ny // 2, :].astype(np.float32)
     if resolution_m == 1500:
+        spec = get_domain_spec("d3_benelux_de_1p5km")
         return spec.lat2d[:, spec.nx // 2].astype(np.float32), spec.lon2d[spec.ny // 2, :].astype(np.float32)
     scale = 2500.0 / float(resolution_m)
     ny = int(round(420 * scale))
@@ -47,7 +50,7 @@ def get_benelux_grid_coords(resolution_m: int | None = None) -> Tuple[np.ndarray
 
 
 def benelux_grid_tag() -> str:
-    metres = int(os.environ.get("TEMPEST_D3_RESOLUTION_M", "1500"))
+    metres = int(os.environ.get("TEMPEST_D3_RESOLUTION_M", "2500"))
     return {2500: "2p5km", 1500: "1p5km", 500: "500m"}.get(metres, f"{metres}m")
 
 
