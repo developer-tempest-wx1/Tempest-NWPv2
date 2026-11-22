@@ -554,6 +554,7 @@ class NonHydrostaticGPUSolver:
         self._handle: Optional[int] = None
         self._tile_handles: List[int] = []
         self._shared_tile_handle: Optional[int] = None
+        self._shape_tile_handles: Dict[Tuple[int, int], int] = {}
         self._tile_phys_caches: List[Dict[str, Any]] = []
         self._phys_accum_steps: int = 0
         self._state_host: Optional[Dict[str, np.ndarray]] = None
@@ -578,11 +579,21 @@ class NonHydrostaticGPUSolver:
                 for t in self._tiles:
                     self._tile_handles.append(self._create_tile_handle(t))
             else:
-                # Out-of-core tiling (e.g. 720x720x137 on 6 GiB GPU): allocate ONE persistent reusable handle
-                t0 = self._tiles[0]
-                t0_shape = (t0.pj1 - t0.pj0, t0.pi1 - t0.pi0)
-                if all((t.pj1 - t.pj0, t.pi1 - t.pi0) == t0_shape for t in self._tiles):
-                    self._shared_tile_handle = self._create_tile_handle(t0)
+                # Out-of-core tiling (e.g. 720x720x137 or 721x1440x137 on 6 GiB GPU):
+                # allocate ONE persistent reusable handle per distinct tile shape (or fallback per-tile if > 1 shape doesn't fit)
+                unique_shapes: List[Tuple[int, _TileBox]] = []
+                seen_shapes: set[Tuple[int, int]] = set()
+                for idx_t, t in enumerate(self._tiles):
+                    sh = (t.pj1 - t.pj0, t.pi1 - t.pi0)
+                    if sh not in seen_shapes:
+                        seen_shapes.add(sh)
+                        unique_shapes.append((idx_t, t))
+                if len(unique_shapes) == 1 or len(unique_shapes) * self.estimated_tile_vram_bytes <= resident_budget:
+                    for _idx_t, t in unique_shapes:
+                        sh = (t.pj1 - t.pj0, t.pi1 - t.pi0)
+                        self._shape_tile_handles[sh] = self._create_tile_handle(t)
+                    if len(self._shape_tile_handles) == 1:
+                        self._shared_tile_handle = next(iter(self._shape_tile_handles.values()))
                 for t in self._tiles:
                     tny, tnx = t.pj1 - t.pj0, t.pi1 - t.pi0
                     self._tile_phys_caches.append(
@@ -601,6 +612,42 @@ class NonHydrostaticGPUSolver:
     def num_tiles(self) -> int:
         return len(self._tiles)
 
+    @staticmethod
+    def _uniform_padded_splits(n: int, nt: int, halo: int) -> List[Tuple[int, int, int, int]]:
+        if nt <= 1:
+            return [(0, n, 0, n)]
+        if n > 2 * halo + nt and nt >= 2:
+            rem = n - 2 * halo
+            base = rem // nt
+            extra = rem % nt
+            widths = [
+                base + (1 if t < extra else 0) + (halo if (t == 0 or t == nt - 1) else 0)
+                for t in range(nt)
+            ]
+            splits = [0]
+            for w in widths:
+                splits.append(splits[-1] + w)
+            p_target = base + 2 * halo + (1 if extra > 0 else 0)
+        else:
+            splits = [int(v) for v in np.linspace(0, n, nt + 1, dtype=int)]
+            p_target = max(
+                min(n, int(splits[t + 1]) + halo) - max(0, int(splits[t]) - halo)
+                for t in range(nt)
+            )
+
+        out: List[Tuple[int, int, int, int]] = []
+        for t in range(nt):
+            j0, j1 = int(splits[t]), int(splits[t + 1])
+            pj0 = max(0, j0 - halo)
+            pj1 = min(n, j1 + halo)
+            if (pj1 - pj0) == p_target - 1:
+                if pj1 + 1 < n:
+                    pj1 += 1
+                elif pj0 - 1 > 0:
+                    pj0 -= 1
+            out.append((j0, j1, pj0, pj1))
+        return out
+
     def _build_tiles(self) -> List[_TileBox]:
         if self.nt_y == 1 and self.nt_x == 1:
             edges = (1 if self.bc_x == 2 else 0) | (2 if self.bc_x == 2 else 0) | (
@@ -608,17 +655,11 @@ class NonHydrostaticGPUSolver:
             ) | (8 if self.bc_y == 2 else 0)
             return [_TileBox(0, self.ny, 0, self.nx, 0, self.ny, 0, self.nx, edges)]
 
-        y_splits = np.linspace(0, self.ny, self.nt_y + 1, dtype=int)
-        x_splits = np.linspace(0, self.nx, self.nt_x + 1, dtype=int)
+        y_boxes = self._uniform_padded_splits(self.ny, self.nt_y, self.halo)
+        x_boxes = self._uniform_padded_splits(self.nx, self.nt_x, self.halo)
         tiles: List[_TileBox] = []
-        for ty in range(self.nt_y):
-            j0, j1 = int(y_splits[ty]), int(y_splits[ty + 1])
-            pj0 = max(0, j0 - self.halo)
-            pj1 = min(self.ny, j1 + self.halo)
-            for tx in range(self.nt_x):
-                i0, i1 = int(x_splits[tx]), int(x_splits[tx + 1])
-                pi0 = max(0, i0 - self.halo)
-                pi1 = min(self.nx, i1 + self.halo)
+        for j0, j1, pj0, pj1 in y_boxes:
+            for i0, i1, pi0, pi1 in x_boxes:
                 edges = 0
                 if self.bc_x == 2 and pi0 == 0:
                     edges |= 1
@@ -748,13 +789,20 @@ class NonHydrostaticGPUSolver:
         lv_end = lj1 + (1 if tile.j1 == self.ny else 0)
         dst["v"][:, tile.j0 : v_end, tile.i0 : tile.i1] = tile_state["v"][:, lj0:lv_end, li0:li1]
 
-    def upload_state(self, state: Dict[str, np.ndarray]) -> None:
+    def upload_state(self, state: Dict[str, np.ndarray], *, copy: bool = True) -> None:
         if len(self._tiles) == 1:
             ptrs, kept = _pack_state_ptrs(state, self.has_moist)
             self._raise_if_err(self.lib.nh_cuda_upload_state(self._handle, ctypes.byref(ptrs)), "upload_state")
             del kept
         else:
-            self._state_host = {k: np.ascontiguousarray(v, dtype=np.float32).copy() for k, v in state.items()}
+            if copy:
+                self._state_host = {k: np.ascontiguousarray(v, dtype=np.float32).copy() for k, v in state.items()}
+            else:
+                self._state_host = {
+                    k: v if (isinstance(v, np.ndarray) and v.dtype == np.float32 and v.flags.c_contiguous)
+                    else np.ascontiguousarray(v, dtype=np.float32)
+                    for k, v in state.items()
+                }
             if self._tile_handles:
                 for h, tile in zip(self._tile_handles, self._tiles):
                     t_state = self._slice_tile_state(self._state_host, tile)
@@ -957,24 +1005,39 @@ class NonHydrostaticGPUSolver:
                 self._pcfg.julian_day -= 365.0
 
     def _estimate_host_cs_u32(self) -> int:
-        """Compute exact IEEE-754 uint32 bit pattern of domain-max `cs * msf` matching `nh_estimate_cs_max_kernel`."""
+        """Compute exact IEEE-754 uint32 bit pattern of domain-max `cs * msf` in 64-row chunks (zero 3D float64 cache)."""
         assert self._state_host is not None
-        if not hasattr(self, "_ref_th_pi"):
-            _, z_s, _ = self.vgrid.heights_3d(self.hs_m)
-            ref = VerticalGrid.reference_state(
-                z_s, theta_sfc_k=self.theta_sfc_k, p_sfc_pa=self.p_sfc_pa, brunt_vaisala_hz=self.n_ref_s
-            )
-            self._ref_th_pi = (ref["theta_bar"], ref["pi_bar"])
-        thb, pib = self._ref_th_pi
-        th_tot = thb + self._state_host["theta_p"].astype(np.float64)
-        pi_tot = np.maximum(1e-4, pib + self._state_host["pi_p"].astype(np.float64))
-        t_tot = np.maximum(50.0, th_tot * pi_tot)
+        zeta_s = self.vgrid.zeta_s[:, None, None].astype(np.float64)
+        b_s = self.vgrid.B_s[:, None, None].astype(np.float64)
+        n2 = float(self.n_ref_s) * float(self.n_ref_s)
+        g = 9.80665
+        cp = 1004.5
+        rd = 287.058
+        kappa = rd / cp
+        gamma_rd = (cp / (cp - rd)) * rd
+        pi_sfc = (float(self.p_sfc_pa) / 100_000.0) ** kappa
+        g2_cp = (g * g) / (cp * float(self.theta_sfc_k) * max(n2, 1e-12))
+
         msf_eff = self.msf
         if self.is_spherical and 0.0 < self.polar_filter_lat_deg < 89.9:
             cos_crit = max(math.cos(math.radians(self.polar_filter_lat_deg)), 1e-3)
             msf_eff = np.minimum(self.msf, 1.0 / cos_crit)
-        cs_msf = (np.sqrt((1004.5 / (1004.5 - 287.058)) * 287.058 * t_tot) * msf_eff[None, :, :]).astype(np.float32)
-        cs_max_f32 = np.float32(np.max(cs_msf))
+
+        cs_max_f32 = np.float32(0.0)
+        chunk_ny = 64
+        th_p_all = self._state_host["theta_p"]
+        pi_p_all = self._state_host["pi_p"]
+        for j0 in range(0, self.ny, chunk_ny):
+            j1 = min(self.ny, j0 + chunk_ny)
+            z_c = zeta_s + b_s * self.hs_m[None, j0:j1, :]
+            exp_f = np.exp((n2 / g) * z_c)
+            th_tot = float(self.theta_sfc_k) * exp_f + th_p_all[:, j0:j1, :].astype(np.float64)
+            pi_tot = np.maximum(1e-4, pi_sfc - g2_cp * (1.0 - 1.0 / exp_f) + pi_p_all[:, j0:j1, :].astype(np.float64))
+            t_tot = np.maximum(50.0, th_tot * pi_tot)
+            cs_c = (np.sqrt(gamma_rd * t_tot) * msf_eff[None, j0:j1, :]).astype(np.float32)
+            m_c = np.float32(np.max(cs_c))
+            if m_c > cs_max_f32:
+                cs_max_f32 = m_c
         return int(cs_max_f32.view(np.uint32))
 
     def _run_multi_tile(
@@ -1041,7 +1104,10 @@ class NonHydrostaticGPUSolver:
                     self._advance_host_clock(dt_p)
             return
 
-        # Path B: Out-of-core tiling (reusing persistent self._shared_tile_handle with 0 cudaMalloc/cudaFree)
+        # Path B: Out-of-core tiling (reusing persistent shape handles with 0 cudaMalloc/cudaFree)
+        inplace_1d = self.nt_x == 1 and all(
+            self._tiles[idx + 1].pj0 >= self._tiles[idx].j0 for idx in range(len(self._tiles) - 1)
+        )
         for _ in range(n_steps):
             eff_substeps = int(n_substeps)
             if run_dyn and eff_substeps <= 0:
@@ -1049,16 +1115,23 @@ class NonHydrostaticGPUSolver:
                 if cs_u32 > 0:
                     eff_substeps = -cs_u32
 
-            next_state = {k: np.empty_like(v) for k, v in self._state_host.items()}
+            next_state = self._state_host if inplace_1d else {k: np.empty_like(v) for k, v in self._state_host.items()}
             next_surf = (
                 {k: np.empty_like(v) for k, v in self._surface_state_host.items()}
                 if run_phys and self._surface_state_host is not None
                 else None
             )
+            lookahead_t_state = (
+                self._slice_tile_state(self._state_host, self._tiles[0])
+                if inplace_1d and len(self._tiles) > 0
+                else None
+            )
             for t_idx, tile in enumerate(self._tiles):
-                reused = self._shared_tile_handle is not None
+                t_shape = (tile.pj1 - tile.pj0, tile.pi1 - tile.pi0)
+                sh_h = self._shape_tile_handles.get(t_shape, self._shared_tile_handle)
+                reused = sh_h is not None
                 if reused:
-                    h = int(self._shared_tile_handle)
+                    h = int(sh_h)
                     cfg = self._make_cfg(tile)
                     hs_sub = np.ascontiguousarray(self.hs_m[tile.pj0 : tile.pj1, tile.pi0 : tile.pi1], dtype=np.float64)
                     msf_sub = np.ascontiguousarray(self.msf[tile.pj0 : tile.pj1, tile.pi0 : tile.pi1], dtype=np.float64)
@@ -1076,7 +1149,11 @@ class NonHydrostaticGPUSolver:
                 else:
                     h = self._create_tile_handle(tile)
                 try:
-                    t_state = self._slice_tile_state(self._state_host, tile)
+                    t_state = (
+                        lookahead_t_state
+                        if (inplace_1d and lookahead_t_state is not None)
+                        else self._slice_tile_state(self._state_host, tile)
+                    )
                     ptrs, kept = _pack_state_ptrs(t_state, self.has_moist)
                     self._raise_if_err(self.lib.nh_cuda_upload_state(h, ctypes.byref(ptrs)), "tile upload")
                     del kept
@@ -1153,7 +1230,13 @@ class NonHydrostaticGPUSolver:
                     dst_ptrs, kept_d = _pack_state_ptrs(t_state, self.has_moist)
                     self._raise_if_err(self.lib.nh_cuda_download_state(h, ctypes.byref(dst_ptrs)), "tile download")
                     del kept_d
+                    if inplace_1d:
+                        if t_idx + 1 < len(self._tiles):
+                            lookahead_t_state = self._slice_tile_state(self._state_host, self._tiles[t_idx + 1])
+                        else:
+                            lookahead_t_state = None
                     self._write_tile_interior(next_state, t_state, tile)
+                    del t_state
                 finally:
                     if not reused:
                         self.lib.nh_cuda_destroy(h)
@@ -1227,7 +1310,7 @@ class NonHydrostaticGPUSolver:
             if due:
                 self._phys_accum_steps = 0
 
-    def download_state(self) -> Dict[str, np.ndarray]:
+    def download_state(self, *, copy: bool = True) -> Dict[str, np.ndarray]:
         if len(self._tiles) == 1:
             out = self.empty_state()
             ptrs, kept = _pack_state_ptrs(out, self.has_moist)
@@ -1236,6 +1319,8 @@ class NonHydrostaticGPUSolver:
             return out
         if self._state_host is None:
             raise RuntimeError("No uploaded state to download")
+        if not copy:
+            return self._state_host
         return {k: v.copy() for k, v in self._state_host.items()}
 
     def tracer_mass(self, q: np.ndarray) -> float:
@@ -1261,7 +1346,15 @@ class NonHydrostaticGPUSolver:
                 if h:
                     self.lib.nh_cuda_destroy(h)
             self._tile_handles = []
-        if getattr(self, "_shared_tile_handle", None):
+        if getattr(self, "_shape_tile_handles", None):
+            destroyed = set()
+            for h in self._shape_tile_handles.values():
+                if h and h not in destroyed:
+                    self.lib.nh_cuda_destroy(h)
+                    destroyed.add(h)
+            self._shape_tile_handles = {}
+            self._shared_tile_handle = None
+        elif getattr(self, "_shared_tile_handle", None):
             self.lib.nh_cuda_destroy(self._shared_tile_handle)
             self._shared_tile_handle = None
 

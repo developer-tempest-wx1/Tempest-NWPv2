@@ -273,22 +273,35 @@ def _regrid_latlon_field(
     return out
 
 
+_CFGRIB_CACHE: Dict[Tuple[str, float], Dict[str, Tuple[xr.DataArray, np.ndarray, np.ndarray]]] = {}
+
+
 def _read_cfgrib_var_map(grib_path: Path) -> Dict[str, Tuple[xr.DataArray, np.ndarray, np.ndarray]]:
+    import warnings
     import cfgrib
 
+    key = (str(grib_path.resolve()), grib_path.stat().st_mtime if grib_path.exists() else 0.0)
+    if key in _CFGRIB_CACHE:
+        return _CFGRIB_CACHE[key]
+    if len(_CFGRIB_CACHE) >= 4:
+        _CFGRIB_CACHE.pop(next(iter(_CFGRIB_CACHE)))
+
     found: Dict[str, Tuple[xr.DataArray, np.ndarray, np.ndarray]] = {}
-    for ds in cfgrib.open_datasets(str(grib_path), backend_kwargs={"indexpath": ""}):
-        lat_name = next((c for c in ("latitude", "lat") if c in ds.coords), None)
-        lon_name = next((c for c in ("longitude", "lon") if c in ds.coords), None)
-        if lat_name is None or lon_name is None:
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", category=FutureWarning)
+        for ds in cfgrib.open_datasets(str(grib_path), backend_kwargs={"indexpath": ""}):
+            lat_name = next((c for c in ("latitude", "lat") if c in ds.coords), None)
+            lon_name = next((c for c in ("longitude", "lon") if c in ds.coords), None)
+            if lat_name is None or lon_name is None:
+                ds.close()
+                continue
+            lats = np.asarray(ds.coords[lat_name].values, dtype=np.float64)
+            lons = np.asarray(ds.coords[lon_name].values, dtype=np.float64)
+            for vname in ds.data_vars:
+                da = ds[vname].load()
+                found[str(vname)] = (da, lats, lons)
             ds.close()
-            continue
-        lats = np.asarray(ds.coords[lat_name].values, dtype=np.float64)
-        lons = np.asarray(ds.coords[lon_name].values, dtype=np.float64)
-        for vname in ds.data_vars:
-            da = ds[vname].load()
-            found[str(vname)] = (da, lats, lons)
-        ds.close()
+    _CFGRIB_CACHE[key] = found
     return found
 
 
@@ -307,7 +320,7 @@ def _vertical_map_isobaric_to_klemp(
     p_sfc_ref: float,
     n_ref_hz: float,
 ) -> Dict[str, np.ndarray]:
-    """Interpolate isobaric fields onto Klemp coordinates with C-grid winds and hydrostatic Exner balance."""
+    """Interpolate isobaric fields onto Klemp coordinates with C-grid winds and hydrostatic Exner balance (row-batched float32)."""
     nz, ny, nx = spec.nz, spec.ny, spec.nx
     if z_h[-1, 0, 0] < z_h[0, 0, 0]:
         p_levels_pa = p_levels_pa[::-1]
@@ -324,55 +337,78 @@ def _vertical_map_isobaric_to_klemp(
 
     exner_lvl = (p_levels_pa / P0_PA) ** KAPPA
     theta_h = t_h / exner_lvl[:, None, None]
-
-    _, z_child_s, _ = spec.vertical.heights_3d(hs_m)
-    ref = VerticalGrid.reference_state(
-        z_child_s, theta_sfc_k=theta_sfc_ref, p_sfc_pa=p_sfc_ref, brunt_vaisala_hz=n_ref_hz
-    )
-
     nlev = len(p_levels_pa)
     ln_p = np.log(p_levels_pa)
-    z_flat = z_h.reshape(nlev, ny * nx)
-    zc_flat = z_child_s.reshape(nz, ny * nx)
-    th_flat = theta_h.reshape(nlev, ny * nx)
-    u_flat = u_grid_h.reshape(nlev, ny * nx)
-    v_flat = v_grid_h.reshape(nlev, ny * nx)
-    q_flat = q_h.reshape(nlev, ny * nx)
 
-    th_out = np.empty((nz, ny * nx), dtype=np.float64)
-    u_out = np.empty((nz, ny * nx), dtype=np.float64)
-    v_out = np.empty((nz, ny * nx), dtype=np.float64)
-    q_out = np.empty((nz, ny * nx), dtype=np.float64)
-    p_out = np.empty((nz, ny * nx), dtype=np.float64)
+    theta_p_out = np.empty((nz, ny, nx), dtype=np.float32)
+    pi_p_out = np.empty((nz, ny, nx), dtype=np.float32)
+    qv_out = np.empty((nz, ny, nx), dtype=np.float32)
+    u_c_out = np.empty((nz, ny, nx), dtype=np.float32)
+    v_c_out = np.empty((nz, ny, nx), dtype=np.float32)
 
-    for col in range(ny * nx):
-        zs_c = z_flat[:, col]
-        zt_c = zc_flat[:, col]
-        th_out[:, col] = np.interp(zt_c, zs_c, th_flat[:, col])
-        u_out[:, col] = np.interp(zt_c, zs_c, u_flat[:, col])
-        v_out[:, col] = np.interp(zt_c, zs_c, v_flat[:, col])
-        q_out[:, col] = np.interp(zt_c, zs_c, q_flat[:, col])
-        p_out[:, col] = np.exp(np.interp(zt_c, zs_c, ln_p))
-        above = zt_c > zs_c[-1]
+    zeta_s = spec.vertical.zeta_s[:, None, None].astype(np.float64)
+    b_s = spec.vertical.B_s[:, None, None].astype(np.float64)
+    hs_2d = np.asarray(hs_m, dtype=np.float64)
+    n2 = float(n_ref_hz) * float(n_ref_hz)
+    g2_cp = (GRAVITY_M_S2 * GRAVITY_M_S2) / (1004.64 * float(theta_sfc_ref) * max(n2, 1e-12))
+    pi_sfc = (float(p_sfc_ref) / P0_PA) ** KAPPA
+
+    chunk_ny = 64
+    for j0 in range(0, ny, chunk_ny):
+        j1 = min(ny, j0 + chunk_ny)
+        ny_c = j1 - j0
+        n_col = ny_c * nx
+        z_chunk = zeta_s + b_s * hs_2d[None, j0:j1, :]
+        exp_fac = np.exp((n2 / GRAVITY_M_S2) * z_chunk)
+        theta_bar_c = float(theta_sfc_ref) * exp_fac
+        pi_bar_c = np.maximum(1e-4, pi_sfc - g2_cp * (1.0 - 1.0 / exp_fac))
+
+        zs_b = z_h[:, j0:j1, :].reshape(nlev, n_col)
+        zt_b = z_chunk.reshape(nz, n_col)
+        th_b = theta_h[:, j0:j1, :].reshape(nlev, n_col)
+        u_b = u_grid_h[:, j0:j1, :].reshape(nlev, n_col)
+        v_b = v_grid_h[:, j0:j1, :].reshape(nlev, n_col)
+        q_b = q_h[:, j0:j1, :].reshape(nlev, n_col)
+
+        # Vectorized vertical bracket index across all columns in chunk
+        k_hi = np.clip(np.sum(zs_b[:, None, :] < zt_b[None, :, :], axis=0), 1, nlev - 1)
+        k_lo = k_hi - 1
+        col_idx = np.arange(n_col)[None, :]
+        z_lo = zs_b[k_lo, col_idx]
+        z_hi = zs_b[k_hi, col_idx]
+        wt = np.clip((zt_b - z_lo) / np.maximum(z_hi - z_lo, 1e-6), 0.0, 1.0)
+
+        th_i = (1.0 - wt) * th_b[k_lo, col_idx] + wt * th_b[k_hi, col_idx]
+        u_i = (1.0 - wt) * u_b[k_lo, col_idx] + wt * u_b[k_hi, col_idx]
+        v_i = (1.0 - wt) * v_b[k_lo, col_idx] + wt * v_b[k_hi, col_idx]
+        q_i = (1.0 - wt) * q_b[k_lo, col_idx] + wt * q_b[k_hi, col_idx]
+        p_i = np.exp((1.0 - wt) * ln_p[k_lo] + wt * ln_p[k_hi])
+
+        above = zt_b > zs_b[-1:, :]
         if np.any(above):
-            t_top = th_flat[-1, col] * ((p_levels_pa[-1] / P0_PA) ** KAPPA)
-            p_out[above, col] = p_levels_pa[-1] * np.exp(
-                -GRAVITY_M_S2 * (zt_c[above] - zs_c[-1]) / (R_D * max(180.0, t_top))
-            )
-            th_out[above, col] = t_top / ((np.maximum(p_out[above, col], 1.0) / P0_PA) ** KAPPA)
+            t_top = np.maximum(180.0, th_b[-1:, :] * ((p_levels_pa[-1] / P0_PA) ** KAPPA))
+            p_abv = p_levels_pa[-1] * np.exp(-GRAVITY_M_S2 * (zt_b - zs_b[-1:, :]) / (R_D * t_top))
+            th_abv = t_top / ((np.maximum(p_abv, 1.0) / P0_PA) ** KAPPA)
+            p_i = np.where(above, p_abv, p_i)
+            th_i = np.where(above, th_abv, th_i)
 
-    theta_3d = th_out.reshape(nz, ny, nx)
-    p_3d = p_out.reshape(nz, ny, nx)
-    pi_3d = np.power(np.maximum(p_3d, 10.0) / P0_PA, KAPPA)
-    u_st, v_st = stagger_uv(u_out.reshape(nz, ny, nx), v_out.reshape(nz, ny, nx), periodic_x=spec.is_periodic_lon)
+        pi_i = np.power(np.maximum(p_i, 10.0) / P0_PA, KAPPA)
+        theta_p_out[:, j0:j1, :] = (th_i.reshape(nz, ny_c, nx) - theta_bar_c).astype(np.float32)
+        pi_p_out[:, j0:j1, :] = (pi_i.reshape(nz, ny_c, nx) - pi_bar_c).astype(np.float32)
+        qv_out[:, j0:j1, :] = np.clip(q_i.reshape(nz, ny_c, nx), 1e-7, 0.04).astype(np.float32)
+        u_c_out[:, j0:j1, :] = u_i.reshape(nz, ny_c, nx).astype(np.float32)
+        v_c_out[:, j0:j1, :] = v_i.reshape(nz, ny_c, nx).astype(np.float32)
+
+    u_st, v_st = stagger_uv(u_c_out, v_c_out, periodic_x=spec.is_periodic_lon)
+    del u_c_out, v_c_out
 
     out: Dict[str, np.ndarray] = {
         "u": u_st,
         "v": v_st,
         "w": np.zeros((nz + 1, ny, nx), dtype=np.float32),
-        "theta_p": (theta_3d - ref["theta_bar"]).astype(np.float32),
-        "pi_p": (pi_3d - ref["pi_bar"]).astype(np.float32),
-        "qv": np.clip(q_out.reshape(nz, ny, nx), 1e-7, 0.04).astype(np.float32),
+        "theta_p": theta_p_out,
+        "pi_p": pi_p_out,
+        "qv": qv_out,
     }
     for sp in ("qc", "qr", "qi", "qs", "qg"):
         out[sp] = np.zeros((nz, ny, nx), dtype=np.float32)

@@ -706,22 +706,24 @@ def apply_analysis_increments_with_bounds(
     background: Dict[str, np.ndarray],
     increments: Dict[str, np.ndarray],
 ) -> Dict[str, np.ndarray]:
-    """Add analysis increments with strict physical positivity and stability bounds."""
+    """Add analysis increments with strict physical positivity and stability bounds (float32-preserving)."""
     out = {}
     for k, v in background.items():
         inc = increments.get(k)
-        val = v.astype(np.float64, copy=True) + (inc if inc is not None else 0.0)
+        val = np.asarray(v, dtype=np.float32).copy()
+        if inc is not None:
+            val += np.asarray(inc, dtype=np.float32)
         if k == "ps":
-            val = np.maximum(50_000.0, val)
+            np.maximum(val, 50_000.0, out=val)
         elif k == "qv":
-            val = np.clip(val, 1e-8, 0.04)
+            np.clip(val, 1e-8, 0.04, out=val)
         elif k in ("u", "v"):
-            val = np.clip(val, -150.0, 150.0)
+            np.clip(val, -150.0, 150.0, out=val)
         elif k == "soil_m":
-            val = np.clip(val, 0.02, 0.55)
+            np.clip(val, 0.02, 0.55, out=val)
         elif k == "soil_t":
-            val = np.clip(val, 200.0, 340.0)
-        out[k] = val.astype(np.float32)
+            np.clip(val, 200.0, 340.0, out=val)
+        out[k] = val
     return out
 
 
@@ -730,8 +732,8 @@ def compute_iau_tendencies(
     tau_sec: float = 1800.0,
 ) -> Dict[str, np.ndarray]:
     """Compute constant IAU forcing tendencies dx / tau_sec for smooth GPU time injection."""
-    inv_tau = 1.0 / max(1.0, float(tau_sec))
+    inv_tau = np.float32(1.0 / max(1.0, float(tau_sec)))
     return {
-        k: (np.asarray(v, dtype=np.float64) * inv_tau).astype(np.float32)
+        k: (np.asarray(v, dtype=np.float32) * inv_tau)
         for k, v in increments.items()
     }

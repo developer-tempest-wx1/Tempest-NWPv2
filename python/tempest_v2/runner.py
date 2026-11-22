@@ -201,7 +201,7 @@ def write_forecast_wx1(
     if u10_r is not None and v10_r is not None and float(np.max(np.abs(u10_r)) + np.max(np.abs(v10_r))) > 1e-3:
         u_grid, v_grid = u10_r.astype(np.float64), v10_r.astype(np.float64)
     else:
-        uc, vc = unstagger_uv(state_3d["u"], state_3d["v"])
+        uc, vc = unstagger_uv(state_3d["u"][:1], state_3d["v"][:1])
         u_grid, v_grid = uc[0].astype(np.float64), vc[0].astype(np.float64)
 
     if spec.is_projected and spec.projection is not None:
@@ -506,7 +506,8 @@ def run_domain_forecast(
             ocean_solver.upload_state(cur_oce_state)
             cur_surf = ocean_solver.couple_to_surface_state(cur_oce_state, cur_surf)
 
-        solver.upload_state(cur_state)
+        use_zero_copy = (spec.nz * spec.ny * spec.nx >= 20_000_000) and len(solver._tiles) > 1
+        solver.upload_state(cur_state, copy=not use_zero_copy)
         solver.set_surface_static(eff_static)
         solver.upload_surface(cur_surf)
         solver.set_physics_config(
@@ -602,7 +603,7 @@ def run_domain_forecast(
                 or step_idx in cpl_step_set
                 or step_idx == total_steps
             ):
-                cur_state = solver.download_state()
+                cur_state = solver.download_state(copy=not use_zero_copy)
                 cur_surf = solver.download_surface()
 
             if (
@@ -731,7 +732,7 @@ def run_domain_forecast(
             _handle_step_events(s1)
 
         if total_steps == 0:
-            cur_state = solver.download_state()
+            cur_state = solver.download_state(copy=not use_zero_copy)
             cur_surf = solver.download_surface()
 
         end_dt = init_dt + datetime.timedelta(seconds=total_steps * float(dt_s))
@@ -854,8 +855,9 @@ def _run_d3_da(
         obs_list, stn_rows = load_station_obs_wx1(obs_dir, d3_spec, valid_time_utc=init_dt)
         if obs_list:
             da_metrics["verify_bg"] = verify_against_stations(d3_spec, st_d3, sf_d3, hs_d3, stn_rows)
+            use_iau = not (d3_spec.is_spherical and d3_spec.nz * d3_spec.ny * d3_spec.nx >= 50_000_000)
             st_d3, sf_d3, iau_d3, var_res = run_domain_3dvar(
-                d3_spec, st_d3, sf_d3, hs_d3, ss_d3["lsm"], obs_list, obs_dir=obs_dir
+                d3_spec, st_d3, sf_d3, hs_d3, ss_d3["lsm"], obs_list, obs_dir=obs_dir, compute_iau=use_iau
             )
             da_metrics["var3d"] = {
                 "j0": var_res.initial_cost_j0,
@@ -1209,6 +1211,9 @@ def run_three_nest_pipeline(
     d3_static: Optional[Tuple[np.ndarray, Dict[str, np.ndarray]]] = None,
 ) -> Dict[str, Any]:
     """Run coupled global D1 (0.25 deg) -> regional D2 (7.5 km) -> D3 (1.5 km) pipeline with NEMO+SI3 & 3D diagnostics."""
+    import gc
+    from tempest_v2.ic_builder import _CFGRIB_CACHE
+
     t0_pipe = time.perf_counter()
     d1_spec = d1_spec if d1_spec is not None else get_domain_spec("d1", nz=nz)
     d2_spec = d2_spec if d2_spec is not None else get_domain_spec("d2", nz=nz)
@@ -1217,29 +1222,8 @@ def run_three_nest_pipeline(
     hs_d2, ss_d2 = _resolve_static(d2_spec, d2_static)
     hs_d3, ss_d3 = _resolve_static(d3_spec, d3_static)
 
-    st_d3, sf_d3, init_dt = _load_domain_ic(
-        d3_spec,
-        hs_d3,
-        ss_d3,
-        ic_source=ic_source,
-        restart_path=restart_path,
-        sfc_grib=sfc_grib,
-        pl_grib=pl_grib,
-        aurora_wx1_path=aurora_wx1_path,
-    )
-    assert init_dt is not None
-    st_d2, sf_d2, _ = _load_domain_ic(
-        d2_spec,
-        hs_d2,
-        ss_d2,
-        ic_source=ic_source,
-        restart_path=d2_restart_path,
-        sfc_grib=sfc_grib,
-        pl_grib=pl_grib,
-        aurora_wx1_path=aurora_wx1_path,
-        allow_zero_restart_fallback=True,
-    )
-    st_d1, sf_d1, _ = _load_domain_ic(
+    # Load D1 first (sequential domain lifecycle so D1, D2, D3 137-layer states never coexist in RAM)
+    st_d1, sf_d1, init_dt = _load_domain_ic(
         d1_spec,
         hs_d1,
         ss_d1,
@@ -1250,6 +1234,10 @@ def run_three_nest_pipeline(
         aurora_wx1_path=aurora_wx1_path,
         allow_zero_restart_fallback=True,
     )
+    if init_dt is None and restart_path is not None:
+        with wx1.open_dataset(restart_path) as rds:
+            init_dt = datetime.datetime.fromisoformat(str(rds.attrs["valid_time_utc"]).replace("Z", "+00:00"))
+    assert init_dt is not None
 
     if run_dir is not None:
         layout = _ensure_run_layout_dirs(Path(run_dir))
@@ -1269,6 +1257,7 @@ def run_three_nest_pipeline(
     d1_hrs = max(float(forecast_hours), float(d1_forecast_hours)) if d1_forecast_hours is not None else float(forecast_hours)
     sched_d1 = forecast_output_schedule_hours(d1_hrs, ecmwf_schedule=ecmwf_schedule, hourly=True)
     sched = forecast_output_schedule_hours(forecast_hours, ecmwf_schedule=ecmwf_schedule, hourly=True)
+    ens_dom_key = ensemble_domain.strip().lower()
 
     # 1. Global D1 -> balanced 3D-Var/4D-FGAT + coupled NEMO+SI3 -> LBCs for Europe D2
     st_d1, sf_d1, iau_d1, da_d1 = _run_d3_da(
@@ -1301,8 +1290,26 @@ def run_three_nest_pipeline(
         ocean_restart_out=d1_ocean_out,
         include_3d_diagnostics=include_3d_diagnostics,
     )
+    del iau_d1
+    if not (int(ensemble_members) > 0 and ens_dom_key == "d1"):
+        st_d1, sf_d1 = {}, {}
+        if d1_spec.nz * d1_spec.ny * d1_spec.nx >= 10_000_000:
+            res_d1["state_3d"] = {}
+            res_d1["ocean_state"] = None
+        gc.collect()
 
     # 2. Regional Europe D2 driven by D1 LBCs + balanced 3D-Var/4D-FGAT -> LBCs for Benelux+DE D3
+    st_d2, sf_d2, _ = _load_domain_ic(
+        d2_spec,
+        hs_d2,
+        ss_d2,
+        ic_source=ic_source,
+        restart_path=d2_restart_path,
+        sfc_grib=sfc_grib,
+        pl_grib=pl_grib,
+        aurora_wx1_path=aurora_wx1_path,
+        allow_zero_restart_fallback=True,
+    )
     st_d2, sf_d2, iau_d2, da_d2 = _run_d3_da(
         d2_spec, st_d2, sf_d2, hs_d2, ss_d2, init_dt, obs_dir, enable_da
     )
@@ -1335,8 +1342,28 @@ def run_three_nest_pipeline(
         ocean_restart_out=d2_ocean_out,
         include_3d_diagnostics=include_3d_diagnostics,
     )
+    del iau_d2
+    if not (int(ensemble_members) > 0 and ens_dom_key == "d2"):
+        st_d2, sf_d2 = {}, {}
+        if d2_spec.nz * d2_spec.ny * d2_spec.nx >= 10_000_000:
+            res_d2["state_3d"] = {}
+            res_d2["ocean_state"] = None
+        gc.collect()
 
     # 3. Balanced 3D-Var/4D-FGAT + Radar LHN + IAU on 1.5 km D3
+    st_d3, sf_d3, _ = _load_domain_ic(
+        d3_spec,
+        hs_d3,
+        ss_d3,
+        ic_source=ic_source,
+        restart_path=restart_path,
+        sfc_grib=sfc_grib,
+        pl_grib=pl_grib,
+        aurora_wx1_path=aurora_wx1_path,
+    )
+    _CFGRIB_CACHE.clear()
+    gc.collect()
+
     st_d3, sf_d3, iau_d3, da_metrics = _run_d3_da(
         d3_spec, st_d3, sf_d3, hs_d3, ss_d3, init_dt, obs_dir, enable_da
     )

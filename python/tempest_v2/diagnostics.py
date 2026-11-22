@@ -44,13 +44,43 @@ def _eval_ref_3d(
     p_sfc_ref: float = 101_325.0,
     n_ref_hz: float = 0.01,
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
-    """Return `(z_s, dz_s, theta_bar, pi_bar)` with shape `(nz, ny, nx)`."""
-    z_w, z_s, _g_s = spec.vertical.heights_3d(hs_m)
+    """Return `(z_s, dz_s, theta_bar, pi_bar)` with shape `(nz, ny, nx)` without allocating unused 3D reference arrays."""
+    hs_2d = np.asarray(hs_m, dtype=np.float64)[None, :, :]
+    z_w = spec.vertical.zeta_w[:, None, None] + spec.vertical.B_w[:, None, None] * hs_2d
+    z_s = spec.vertical.zeta_s[:, None, None] + spec.vertical.B_s[:, None, None] * hs_2d
     dz_s = np.maximum(np.diff(z_w, axis=0), 1.0)
-    ref = VerticalGrid.reference_state(
-        z_s, theta_sfc_k=theta_sfc_ref, p_sfc_pa=p_sfc_ref, brunt_vaisala_hz=n_ref_hz
+    del z_w
+    n2 = float(n_ref_hz) * float(n_ref_hz)
+    exp_fac = np.exp((n2 / GRAVITY_M_S2) * z_s)
+    theta_bar = float(theta_sfc_ref) * exp_fac
+    pi_sfc = (float(p_sfc_ref) / P0_PA) ** KAPPA
+    g2_cp = (GRAVITY_M_S2 * GRAVITY_M_S2) / (CP_D * float(theta_sfc_ref) * max(n2, 1e-12))
+    pi_bar = np.maximum(1e-4, pi_sfc - g2_cp * (1.0 - 1.0 / exp_fac))
+    return z_s, dz_s, theta_bar, pi_bar
+
+
+def _slice_spec_y(spec: DomainSpec, j0: int, j1: int) -> DomainSpec:
+    from dataclasses import replace
+
+    return replace(
+        spec,
+        ny=j1 - j0,
+        y_m=spec.y_m[j0:j1],
+        lat2d=spec.lat2d[j0:j1, :],
+        lon2d=spec.lon2d[j0:j1, :],
+        map_factor=spec.map_factor[j0:j1, :],
+        coriolis_f=spec.coriolis_f[j0:j1, :],
     )
-    return z_s, dz_s, ref["theta_bar"], ref["pi_bar"]
+
+
+def _slice_state_y(state_3d: Dict[str, np.ndarray], j0: int, j1: int) -> Dict[str, np.ndarray]:
+    out: Dict[str, np.ndarray] = {}
+    for k, arr in state_3d.items():
+        if k == "v":
+            out[k] = arr[:, j0 : j1 + 1, :]
+        else:
+            out[k] = arr[:, j0:j1, :]
+    return out
 
 
 def _es_water_pa(temp_k: np.ndarray) -> np.ndarray:
@@ -78,15 +108,13 @@ def _bolton_theta_e_and_lcl(temp_k: np.ndarray, qv: np.ndarray, p_pa: np.ndarray
 
 
 def _moist_adiabat_t_from_theta_e(theta_e: np.ndarray, p_pa: np.ndarray) -> np.ndarray:
-    """Invert Bolton theta_e along a saturated moist adiabat at pressure p_pa via 4 Newton iterations."""
+    """Invert Bolton theta_e along a saturated moist adiabat at pressure p_pa via 2 analytical-derivative Newton steps."""
     t_est = np.clip(theta_e * ((np.maximum(p_pa, 1000.0) / P0_PA) ** KAPPA), 150.0, 340.0)
-    for _ in range(4):
+    for _ in range(2):
         qs = _qsat_water(t_est, p_pa)
         te_cur, _ = _bolton_theta_e_and_lcl(t_est, qs, p_pa)
-        # Approximate d(theta_e)/dT along saturation > 1
-        dt_eps = 0.25
-        te_hi, _ = _bolton_theta_e_and_lcl(t_est + dt_eps, _qsat_water(t_est + dt_eps, p_pa), p_pa)
-        d_te_dt = np.maximum((te_hi - te_cur) / dt_eps, 0.5)
+        t_safe = np.maximum(t_est, 150.0)
+        d_te_dt = np.maximum(te_cur * (1.0 / t_safe + (_LV0 * _LV0 * qs) / (CP_D * 461.5 * (t_safe**3))), 0.8)
         t_est = np.clip(t_est + (theta_e - te_cur) / d_te_dt, 140.0, 340.0)
     return t_est
 
@@ -103,6 +131,39 @@ def compute_pressure_level_fields(
 ) -> Dict[str, np.ndarray]:
     """Interpolate 3D prognostic state to standard isobaric pressure levels (`t_pl, gh_pl, q_pl, rh_pl, u_pl, v_pl, w_pl`)."""
     p_targets = np.asarray(plev_pa, dtype=np.float64)
+    if spec.nz * spec.ny * spec.nx > 12_000_000 and spec.ny > 96:
+        chunk_ny = 96
+        np_out = len(p_targets)
+        out_full: Optional[Dict[str, np.ndarray]] = None
+        for j0 in range(0, spec.ny, chunk_ny):
+            j1 = min(spec.ny, j0 + chunk_ny)
+            sub = compute_pressure_level_fields(
+                _slice_spec_y(spec, j0, j1),
+                hs_m[j0:j1, :],
+                _slice_state_y(state_3d, j0, j1),
+                plev_pa=p_targets,
+                theta_sfc_ref=theta_sfc_ref,
+                p_sfc_ref=p_sfc_ref,
+                n_ref_hz=n_ref_hz,
+            )
+            if out_full is None:
+                out_full = {k: np.empty((np_out, spec.ny, spec.nx), dtype=np.float32) for k in sub}
+            for k, arr in sub.items():
+                out_full[k][:, j0:j1, :] = arr
+        assert out_full is not None
+        if spec.nx >= 2 and spec.ny >= 2:
+            dx_eff = np.maximum(float(spec.dx_m) / np.maximum(spec.map_factor, 0.05), 1.0).astype(np.float32)
+            dy_eff = float(spec.dy_m)
+            for ip in range(np_out):
+                u_i = out_full["u_pl"][ip]
+                v_i = out_full["v_pl"][ip]
+                du_dx = np.gradient(u_i, axis=1) / dx_eff
+                dv_dx = np.gradient(v_i, axis=1) / dx_eff
+                du_dy = np.gradient(u_i, dy_eff, axis=0)
+                dv_dy = np.gradient(v_i, dy_eff, axis=0)
+                out_full["vo_pl"][ip] = (dv_dx - du_dy).astype(np.float32)
+                out_full["div_pl"][ip] = (du_dx + dv_dy).astype(np.float32)
+        return out_full
     z_s, _dz_s, theta_bar, pi_bar = _eval_ref_3d(
         spec, hs_m, theta_sfc_ref=theta_sfc_ref, p_sfc_ref=p_sfc_ref, n_ref_hz=n_ref_hz
     )
@@ -299,23 +360,33 @@ def _parcel_cape_cin(
     seen_pos = np.zeros((ny, nx), dtype=bool)
     neg_accum = np.zeros((ny, nx), dtype=np.float64)
 
-    for k in range(nz):
+    k = 0
+    while k < nz:
+        if float(np.min(z_s[k])) > 16_000.0:
+            break
+        step_k = 2 if (nz >= 60 and k >= 16 and k + 1 < nz) else 1
+        dz_k = (dz_s[k] + dz_s[k + 1]) if step_k == 2 else dz_s[k]
         active = k > k_start
-        p_k = p_env[k]
-        below_lcl = p_k >= p_lcl0
-        t_dry = theta_dry0 * ((p_k / P0_PA) ** KAPPA)
-        t_moist = _moist_adiabat_t_from_theta_e(theta_e0, p_k)
-        t_par = np.where(below_lcl, t_dry, t_moist)
-        q_par = np.where(below_lcl, q_p0, _qsat_water(t_moist, p_k))
-        tv_par = t_par * (1.0 + 0.608 * q_par)
-        b_k = GRAVITY_M_S2 * (tv_par - tv_env[k]) / np.maximum(tv_env[k], 150.0) * dz_s[k]
+        if np.any(active):
+            p_k = p_env[k]
+            below_lcl = p_k >= p_lcl0
+            t_dry = theta_dry0 * ((p_k / P0_PA) ** KAPPA)
+            if np.all(below_lcl):
+                t_par = t_dry
+                q_par = q_p0
+            else:
+                t_moist = _moist_adiabat_t_from_theta_e(theta_e0, p_k)
+                t_par = np.where(below_lcl, t_dry, t_moist)
+                q_par = np.where(below_lcl, q_p0, _qsat_water(t_moist, p_k))
+            tv_par = t_par * (1.0 + 0.608 * q_par)
+            b_k = GRAVITY_M_S2 * (tv_par - tv_env[k]) / np.maximum(tv_env[k], 150.0) * dz_k
 
-        pos = active & (b_k > 0.0)
-        cape = np.where(pos, cape + b_k, cape)
-        # Accumulate CIN below first LFC (negative buoyancy prior to CAPE accumulation)
-        neg_pre = active & (b_k < 0.0) & (~seen_pos)
-        neg_accum = np.where(neg_pre, neg_accum - b_k, neg_accum)
-        seen_pos = seen_pos | pos
+            pos = active & (b_k > 0.0)
+            cape = np.where(pos, cape + b_k, cape)
+            neg_pre = active & (b_k < 0.0) & (~seen_pos)
+            neg_accum = np.where(neg_pre, neg_accum - b_k, neg_accum)
+            seen_pos = seen_pos | pos
+        k += step_k
 
     cin = np.where(cape > 1.0, neg_accum, 0.0)
     return cape.astype(np.float32), cin.astype(np.float32)
@@ -334,6 +405,34 @@ def compute_synoptic_convective_2d(
     interval_s: float = 0.0,
 ) -> Dict[str, np.ndarray]:
     """Compute classical 2D synoptic, thermodynamic, cloud, severe-convective & visibility diagnostics."""
+    if spec.nz * spec.ny * spec.nx > 12_000_000 and spec.ny > 96:
+        chunk_ny = 96
+        out_full: Optional[Dict[str, np.ndarray]] = None
+        for j0 in range(0, spec.ny, chunk_ny):
+            j1 = min(spec.ny, j0 + chunk_ny)
+            sub_surf = {
+                k: (v[:, j0:j1, :] if np.asarray(v).ndim == 3 else np.asarray(v)[j0:j1, :])
+                for k, v in surf_state.items()
+            }
+            sub_prev = prev_precip_total[j0:j1, :] if prev_precip_total is not None else None
+            sub = compute_synoptic_convective_2d(
+                _slice_spec_y(spec, j0, j1),
+                hs_m[j0:j1, :],
+                _slice_state_y(state_3d, j0, j1),
+                sub_surf,
+                theta_sfc_ref=theta_sfc_ref,
+                p_sfc_ref=p_sfc_ref,
+                n_ref_hz=n_ref_hz,
+                prev_precip_total=sub_prev,
+                interval_s=interval_s,
+            )
+            if out_full is None:
+                out_full = {k: np.empty((spec.ny, spec.nx), dtype=np.float32) for k in sub}
+            for k, arr in sub.items():
+                out_full[k][j0:j1, :] = arr
+        assert out_full is not None
+        return out_full
+
     z_s, dz_s, theta_bar, pi_bar = _eval_ref_3d(
         spec, hs_m, theta_sfc_ref=theta_sfc_ref, p_sfc_ref=p_sfc_ref, n_ref_hz=n_ref_hz
     )

@@ -83,20 +83,31 @@ def _vertical_interp_columnwise(
     dst_z: np.ndarray,
     clamp_non_negative: bool = False,
 ) -> np.ndarray:
-    """Linearly interpolate 3D [nz_src, ny, nx] in height src_z onto dst_z [nz_dst, ny, nx]."""
+    """Linearly interpolate 3D [nz_src, ny, nx] in height src_z onto dst_z [nz_dst, ny, nx] (row-batched float32)."""
     nz_src, ny, nx = src_vals.shape
     nz_dst = dst_z.shape[0]
-    src_f = src_vals.reshape(nz_src, ny * nx)
-    zs_f = src_z.reshape(nz_src, ny * nx)
-    zd_f = dst_z.reshape(nz_dst, ny * nx)
-    out = np.empty((nz_dst, ny * nx), dtype=np.float32)
+    out = np.empty((nz_dst, ny, nx), dtype=np.float32)
 
-    for col in range(ny * nx):
-        out[:, col] = np.interp(zd_f[:, col], zs_f[:, col], src_f[:, col]).astype(np.float32)
-    res = out.reshape(nz_dst, ny, nx)
+    chunk_ny = 32
+    for j0 in range(0, ny, chunk_ny):
+        j1 = min(ny, j0 + chunk_ny)
+        n_col = (j1 - j0) * nx
+        sf = np.asarray(src_vals[:, j0:j1, :], dtype=np.float32).reshape(nz_src, n_col)
+        zs = np.asarray(src_z[:, j0:j1, :], dtype=np.float32).reshape(nz_src, n_col)
+        zd = np.asarray(dst_z[:, j0:j1, :], dtype=np.float32).reshape(nz_dst, n_col)
+
+        k_hi = np.clip(np.sum(zs[:, None, :] < zd[None, :, :], axis=0), 1, max(1, nz_src - 1))
+        k_lo = k_hi - 1
+        c_idx = np.arange(n_col)[None, :]
+        z_lo = zs[k_lo, c_idx]
+        z_hi = zs[k_hi, c_idx]
+        w = np.clip((zd - z_lo) / np.maximum(z_hi - z_lo, 1e-5), 0.0, 1.0).astype(np.float32)
+        val = (1.0 - w) * sf[k_lo, c_idx] + w * sf[k_hi, c_idx]
+        out[:, j0:j1, :] = val.reshape(nz_dst, j1 - j0, nx)
+
     if clamp_non_negative:
-        res = np.maximum(res, 0.0)
-    return res
+        np.maximum(out, 0.0, out=out)
+    return out
 
 
 def export_child_lbc_step(
@@ -117,15 +128,17 @@ def export_child_lbc_step(
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"lbc_{child_spec.name}_step_{step_index:04d}.wx1"
 
-    u_src = np.asarray(parent_state["u"], dtype=np.float64)
-    v_src = np.asarray(parent_state["v"], dtype=np.float64)
+    u_src = np.asarray(parent_state["u"], dtype=np.float32)
+    v_src = np.asarray(parent_state["v"], dtype=np.float32)
     if u_src.shape[2] == parent_spec.nx + 1:
         u_src = 0.5 * (u_src[:, :, :-1] + u_src[:, :, 1:])
     if v_src.shape[1] == parent_spec.ny + 1:
         v_src = 0.5 * (v_src[:, :-1, :] + v_src[:, 1:, :])
 
     if parent_spec.is_projected and parent_spec.projection is not None:
-        u_geo, v_geo = parent_spec.projection.grid_to_geo_wind(u_src, v_src, parent_spec.lon2d[None, :, :])
+        u_geo, v_geo = parent_spec.projection.grid_to_geo_wind(
+            u_src.astype(np.float64), v_src.astype(np.float64), parent_spec.lon2d[None, :, :]
+        )
     else:
         u_geo, v_geo = u_src, v_src
 
@@ -133,7 +146,6 @@ def export_child_lbc_step(
     if w_src.shape[0] == parent_spec.nz + 1:
         w_src = 0.5 * (w_src[:-1] + w_src[1:])
 
-    _, z_parent_on_parent, _ = parent_spec.vertical.heights_3d(parent_hs_m)
     hs_parent_on_child = _horizontal_regrid_3d_to_child(parent_hs_m[None, :, :], parent_spec, child_spec)[0]
     _, z_parent_col, _ = parent_spec.vertical.heights_3d(hs_parent_on_child)
     z_child_w, z_child_s, _ = child_spec.vertical.heights_3d(child_hs_m)

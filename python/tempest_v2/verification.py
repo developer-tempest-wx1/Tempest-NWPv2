@@ -252,7 +252,8 @@ def load_station_obs_wx1(
         ssts = np.asarray(data.get("sst", np.full(n, np.nan)), dtype=np.float64)
         times = np.asarray(data.get("time", np.full(n, np.nan)), dtype=np.float64)
 
-        for idx in range(n):
+        step_sfc = max(1, n // 1500) if provider in ("metar", "global_sfc") and not spec.is_projected else 1
+        for idx in range(0, n, step_sfc):
             lat = float(lats[idx])
             lon = float(lons[idx])
             chk = _in_domain_and_window(lat, lon, float(times[idx]))
@@ -377,7 +378,9 @@ def load_station_obs_wx1(
         v_ws = np.asarray(data.get("v_wind", np.full(n, np.nan)), dtype=np.float64)
         times = np.asarray(data.get("time", np.full(n, np.nan)), dtype=np.float64)
 
-        for idx in range(n):
+        step_rad = max(1, n // 3000)
+        n2_g = (float(n_ref_hz) * float(n_ref_hz)) / GRAVITY_M_S2
+        for idx in range(0, n, step_rad):
             lat, lon, p_pa = float(lats[idx]), float(lons[idx]), float(press[idx])
             if not (math.isfinite(p_pa) and 5_000.0 <= p_pa <= 105_000.0):
                 continue
@@ -387,15 +390,9 @@ def load_station_obs_wx1(
             _, _, t_off = chk
             sid = f"{provider}_{idx:05d}"
 
-            # Estimate standard-atmosphere height for reference theta_bar(z)
+            # Analytical Brunt-Vaisala reference theta_bar(z) without allocating a dict per level
             z_approx = max(0.0, -7400.0 * math.log(max(p_pa / p_sfc_ref, 1e-4)))
-            ref_z = VerticalGrid.reference_state(
-                np.array([z_approx], dtype=np.float64),
-                theta_sfc_k=theta_sfc_ref,
-                p_sfc_pa=p_sfc_ref,
-                brunt_vaisala_hz=n_ref_hz,
-            )
-            th_bar_lvl = float(ref_z["theta_bar"][0])
+            th_bar_lvl = float(theta_sfc_ref) * math.exp(n2_g * z_approx)
 
             t_val = float(temps[idx])
             if math.isfinite(t_val) and 180.0 <= t_val <= 330.0:
@@ -512,7 +509,8 @@ def load_station_obs_wx1(
         u_ws = np.asarray(data.get("u_wind", np.full(n, np.nan)), dtype=np.float64)
         v_ws = np.asarray(data.get("v_wind", np.full(n, np.nan)), dtype=np.float64)
         times = np.asarray(data.get("time", np.full(n, np.nan)), dtype=np.float64)
-        for idx in range(n):
+        step_sat = max(1, n // 2000)
+        for idx in range(0, n, step_sat):
             lat, lon = float(lats[idx]), float(lons[idx])
             chk = _in_domain_and_window(lat, lon, float(times[idx]))
             if chk is None:
@@ -650,60 +648,106 @@ def run_domain_3dvar(
     radar_rain_rate_mm_h: Optional[np.ndarray] = None,
     model_rain_rate_mm_h: Optional[np.ndarray] = None,
     dtheta_dt_mp: Optional[np.ndarray] = None,
-) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], Dict[str, np.ndarray], Var3DResult]:
+    compute_iau: bool = True,
+) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], Optional[Dict[str, np.ndarray]], Var3DResult]:
     """Run balanced 3D-Var / 4D-FGAT + Radar LHN + OSI-SAF cryosphere update and return analysis + IAU forcing."""
     hs = np.asarray(hs_m, dtype=np.float64)
-    u_c, v_c = unstagger_uv(state_3d["u"], state_3d["v"])
 
-    _, z_s, _ = spec.vertical.heights_3d(hs)
+    z_0 = float(spec.vertical.zeta_s[0]) + float(spec.vertical.B_s[0]) * hs
     ref0 = VerticalGrid.reference_state(
-        z_s[:1], theta_sfc_k=theta_sfc_ref, p_sfc_pa=p_sfc_ref, brunt_vaisala_hz=n_ref_hz
+        z_0[None, :, :], theta_sfc_k=theta_sfc_ref, p_sfc_pa=p_sfc_ref, brunt_vaisala_hz=n_ref_hz
     )
     th0 = ref0["theta_bar"][0] + np.asarray(state_3d["theta_p"][0], dtype=np.float64)
     pi0 = np.maximum(1e-4, ref0["pi_bar"][0] + np.asarray(state_3d["pi_p"][0], dtype=np.float64))
     p0 = P0_PA * np.power(pi0, 1.0 / KAPPA)
     tv0 = np.maximum(160.0, th0 * pi0 * (1.0 + 0.608 * np.maximum(0.0, np.asarray(state_3d["qv"][0], dtype=np.float64))))
-    dz_sfc = np.maximum(0.0, z_s[0] - hs)
+    dz_sfc = np.maximum(0.0, z_0 - hs)
     ps_bg = p0 * np.exp((GRAVITY_M_S2 * dz_sfc) / (R_D * tv0))
-
-    bg_centered: Dict[str, np.ndarray] = {
-        "u": u_c,
-        "v": v_c,
-        "theta_p": np.asarray(state_3d["theta_p"], dtype=np.float32),
-        "pi_p": np.asarray(state_3d["pi_p"], dtype=np.float32),
-        "qv": np.asarray(state_3d["qv"], dtype=np.float32),
-        "ps": ps_bg.astype(np.float32),
-    }
-    if "sst_bulk" in surf_state:
-        bg_centered["sst"] = np.asarray(surf_state["sst_bulk"], dtype=np.float32)
 
     dz_avg = float(spec.vertical.z_top_m) / max(1, spec.nz)
 
-    # Courtier et al. (1994) Multi-Incremental 3D-Var inner loop when horizontal grid >= 250k columns
-    if spec.nx * spec.ny >= 250_000 and trajectory is None and spec.nx % 4 == 0 and spec.ny % 4 == 0:
-        from dataclasses import replace
-        from scipy.interpolate import RegularGridInterpolator
+    def _build_fgat_trajectory(
+        dom_spec: DomainSpec, bg_dict: Dict[str, np.ndarray], obs_seq: List[VarObservation]
+    ) -> Optional[Dict[float, Dict[str, np.ndarray]]]:
+        if not any(abs(float(o.time_offset_sec)) > 60.0 for o in obs_seq) or dom_spec.nx < 3 or dom_spec.ny < 3:
+            return None
+        t_offs = [float(o.time_offset_sec) for o in obs_seq]
+        t_lo = min(-900.0, min(t_offs))
+        t_hi = max(900.0, max(t_offs))
+        dx_eff = np.maximum(float(dom_spec.dx_m) / np.maximum(dom_spec.map_factor, 0.05), 100.0)
+        dy_eff = max(float(dom_spec.dy_m), 100.0)
+        u_b = np.asarray(bg_dict["u"], dtype=np.float64)
+        v_b = np.asarray(bg_dict["v"], dtype=np.float64)
 
-        stride = 4
+        def _advect_state(dt_sec: float) -> Dict[str, np.ndarray]:
+            if abs(dt_sec) < 1.0:
+                return bg_dict
+            out_t: Dict[str, np.ndarray] = {}
+            for k_f, arr_f in bg_dict.items():
+                a64 = np.asarray(arr_f, dtype=np.float64)
+                if a64.ndim == 3:
+                    dadx = np.gradient(a64, axis=2) / dx_eff[None, :, :]
+                    dady = np.gradient(a64, dy_eff, axis=1)
+                    cap = 0.25 * float(np.std(a64)) + 1e-4
+                    adv = np.clip(-dt_sec * (u_b * dadx + v_b * dady), -cap, cap)
+                    out_t[k_f] = (a64 + adv).astype(np.float32)
+                elif a64.ndim == 2 and k_f == "ps":
+                    dadx = np.gradient(a64, axis=1) / dx_eff
+                    dady = np.gradient(a64, dy_eff, axis=0)
+                    adv = np.clip(-dt_sec * (u_b[0] * dadx + v_b[0] * dady), -400.0, 400.0)
+                    out_t[k_f] = (a64 + adv).astype(np.float32)
+                else:
+                    out_t[k_f] = arr_f
+            return out_t
+
+        return {t_lo: _advect_state(t_lo), 0.0: bg_dict, t_hi: _advect_state(t_hi)}
+
+    # Courtier et al. (1994) Multi-Incremental 3D-Var / 4D-FGAT inner loop when horizontal grid >= 25k columns
+    if spec.nx * spec.ny >= 25_000 and trajectory is None:
+        from dataclasses import replace
+
+        stride = max(2, int(round(math.sqrt((spec.nx * spec.ny) / 18_000.0))))
+        y_idx = np.arange(0, spec.ny, stride, dtype=np.int64)
+        x_idx = np.arange(0, spec.nx, stride, dtype=np.int64)
         c_spec = replace(
             spec,
-            ny=spec.ny // stride,
-            nx=spec.nx // stride,
+            ny=len(y_idx),
+            nx=len(x_idx),
             dx_m=spec.dx_m * stride,
             dy_m=spec.dy_m * stride,
-            x_m=spec.x_m[::stride].copy(),
-            y_m=spec.y_m[::stride].copy(),
-            lat2d=spec.lat2d[::stride, ::stride].copy(),
-            lon2d=spec.lon2d[::stride, ::stride].copy(),
-            map_factor=spec.map_factor[::stride, ::stride].copy(),
-            coriolis_f=spec.coriolis_f[::stride, ::stride].copy(),
+            x_m=spec.x_m[x_idx].copy(),
+            y_m=spec.y_m[y_idx].copy(),
+            lat2d=spec.lat2d[np.ix_(y_idx, x_idx)].copy(),
+            lon2d=spec.lon2d[np.ix_(y_idx, x_idx)].copy(),
+            map_factor=spec.map_factor[np.ix_(y_idx, x_idx)].copy(),
+            coriolis_f=spec.coriolis_f[np.ix_(y_idx, x_idx)].copy(),
         )
-        c_hs = hs[::stride, ::stride].copy()
-        c_lsm = np.asarray(lsm)[::stride, ::stride] >= 0.5
-        c_bg = {
-            k: (v[:, ::stride, ::stride].copy() if v.ndim == 3 else v[::stride, ::stride].copy())
-            for k, v in bg_centered.items()
+        c_hs = hs[np.ix_(y_idx, x_idx)].copy()
+        c_lsm = np.asarray(lsm)[np.ix_(y_idx, x_idx)] >= 0.5
+        u_st_in = np.asarray(state_3d["u"], dtype=np.float32)
+        v_st_in = np.asarray(state_3d["v"], dtype=np.float32)
+        u_c_sub = (
+            0.5 * (u_st_in[:, y_idx, :][:, :, x_idx] + u_st_in[:, y_idx, :][:, :, np.minimum(x_idx + 1, u_st_in.shape[2] - 1)])
+            if u_st_in.shape[2] == spec.nx + 1
+            else u_st_in[:, y_idx, :][:, :, x_idx].copy()
+        )
+        v_c_sub = (
+            0.5 * (v_st_in[:, y_idx, :][:, :, x_idx] + v_st_in[:, np.minimum(y_idx + 1, v_st_in.shape[1] - 1), :][:, :, x_idx])
+            if v_st_in.shape[1] == spec.ny + 1
+            else v_st_in[:, y_idx, :][:, :, x_idx].copy()
+        )
+        c_bg: Dict[str, np.ndarray] = {
+            "u": u_c_sub,
+            "v": v_c_sub,
+            "theta_p": np.asarray(state_3d["theta_p"], dtype=np.float32)[:, y_idx, :][:, :, x_idx].copy(),
+            "pi_p": np.asarray(state_3d["pi_p"], dtype=np.float32)[:, y_idx, :][:, :, x_idx].copy(),
+            "qv": np.asarray(state_3d["qv"], dtype=np.float32)[:, y_idx, :][:, :, x_idx].copy(),
+            "ps": ps_bg[np.ix_(y_idx, x_idx)].astype(np.float32),
         }
+        if "sst_bulk" in surf_state:
+            c_bg["sst"] = np.asarray(surf_state["sst_bulk"], dtype=np.float32)[np.ix_(y_idx, x_idx)].copy()
+
+        c_traj = _build_fgat_trajectory(c_spec, c_bg, obs_list)
         c_hop = VarObservationOperator(
             c_spec, c_hs, c_bg, theta_sfc_ref=theta_sfc_ref, p_sfc_ref=p_sfc_ref, n_ref_hz=n_ref_hz
         )
@@ -714,69 +758,105 @@ def run_domain_3dvar(
             c_spec, c_hs, theta_sfc_ref=theta_sfc_ref, p_sfc_ref=p_sfc_ref, n_ref_hz=n_ref_hz
         )
         cfg = Var3DConfig(max_iterations=max_iterations, use_balance=True, iau_window_sec=iau_tau_sec)
-        c_res = solve_3dvar_pcg(c_bg, obs_list, c_hop, c_filter, cfg, balance_op=c_bal, land_mask=c_lsm)
+        c_res = solve_3dvar_pcg(c_bg, obs_list, c_hop, c_filter, cfg, balance_op=c_bal, land_mask=c_lsm, trajectory=c_traj)
 
-        # Bilinear prolongation of smooth L_h=45km inner-loop increments onto 1.5km outer grid
-        yy_f, xx_f = np.meshgrid(spec.y_m, spec.x_m, indexing="ij")
-        pts_f = np.column_stack([yy_f.ravel(), xx_f.ravel()])
-        fine_inc: Dict[str, np.ndarray] = {}
-        for k, arr_c in c_res.analysis_increments.items():
-            if not np.any(arr_c):
-                fine_inc[k] = np.zeros_like(bg_centered[k], dtype=np.float64)
-                continue
-            if arr_c.ndim == 2:
-                itp = RegularGridInterpolator((c_spec.y_m, c_spec.x_m), arr_c, method="linear", bounds_error=False, fill_value=None)
-                fine_inc[k] = itp(pts_f).reshape(spec.ny, spec.nx)
-            else:
-                out_3d = np.zeros((arr_c.shape[0], spec.ny, spec.nx), dtype=np.float64)
-                for kz in range(arr_c.shape[0]):
-                    if np.any(arr_c[kz]):
-                        itp = RegularGridInterpolator((c_spec.y_m, c_spec.x_m), arr_c[kz], method="linear", bounds_error=False, fill_value=None)
-                        out_3d[kz] = itp(pts_f).reshape(spec.ny, spec.nx)
-                fine_inc[k] = out_3d
-        res = Var3DResult(
-            analysis_increments=fine_inc,
-            initial_cost_j0=c_res.initial_cost_j0,
-            final_cost_j=c_res.final_cost_j,
-            cost_j_b=c_res.cost_j_b,
-            cost_j_o=c_res.cost_j_o,
-            iterations=c_res.iterations,
-            converged=c_res.converged,
-        )
-    else:
-        eff_traj = trajectory
-        if eff_traj is None and any(abs(float(o.time_offset_sec)) > 60.0 for o in obs_list) and spec.nx >= 3 and spec.ny >= 3:
-            # 4D-FGAT kinematic first-guess trajectory x_b(t) = x_b(0) - t * (u_b * d/dx + v_b * d/dy) x_b
-            t_offs = [float(o.time_offset_sec) for o in obs_list]
-            t_lo = min(-900.0, min(t_offs))
-            t_hi = max(900.0, max(t_offs))
-            dx_eff = np.maximum(float(spec.dx_m) / np.maximum(spec.map_factor, 0.05), 100.0)
-            dy_eff = max(float(spec.dy_m), 100.0)
-            u_b = np.asarray(bg_centered["u"], dtype=np.float64)
-            v_b = np.asarray(bg_centered["v"], dtype=np.float64)
+        # Memory-frugal separable 1D float32 prolongation one variable at a time (no simultaneous 5-var fine_inc/updated_c copies)
+        fy = np.clip(np.arange(spec.ny, dtype=np.float32) / float(stride), 0.0, float(c_spec.ny - 1.00001))
+        fx = np.clip(np.arange(spec.nx, dtype=np.float32) / float(stride), 0.0, float(c_spec.nx - 1.00001))
+        j0_p = np.floor(fy).astype(np.int64)
+        j1_p = np.minimum(j0_p + 1, c_spec.ny - 1)
+        wy_p = (fy - j0_p).astype(np.float32)
+        i0_p = np.floor(fx).astype(np.int64)
+        i1_p = np.minimum(i0_p + 1, c_spec.nx - 1)
+        wx_p = (fx - i0_p).astype(np.float32)
 
-            def _advect_state(dt_sec: float) -> Dict[str, np.ndarray]:
-                if abs(dt_sec) < 1.0:
-                    return bg_centered
-                out_t: Dict[str, np.ndarray] = {}
-                for k_f, arr_f in bg_centered.items():
-                    a64 = np.asarray(arr_f, dtype=np.float64)
-                    if a64.ndim == 3:
-                        dadx = np.gradient(a64, axis=2) / dx_eff[None, :, :]
-                        dady = np.gradient(a64, dy_eff, axis=1)
-                        adv = np.clip(-dt_sec * (u_b * dadx + v_b * dady), -0.25 * np.std(a64) - 1e-4, 0.25 * np.std(a64) + 1e-4)
-                        out_t[k_f] = (a64 + adv).astype(np.float32)
-                    elif a64.ndim == 2 and k_f == "ps":
-                        dadx = np.gradient(a64, axis=1) / dx_eff
-                        dady = np.gradient(a64, dy_eff, axis=0)
-                        adv = np.clip(-dt_sec * (u_b[0] * dadx + v_b[0] * dady), -400.0, 400.0)
-                        out_t[k_f] = (a64 + adv).astype(np.float32)
+        def _prolong_field(arr_c: np.ndarray) -> np.ndarray:
+            af = np.asarray(arr_c, dtype=np.float32)
+            if af.ndim == 2:
+                r = (1.0 - wy_p)[:, None] * af[j0_p, :] + wy_p[:, None] * af[j1_p, :]
+                return ((1.0 - wx_p)[None, :] * r[:, i0_p] + wx_p[None, :] * r[:, i1_p]).astype(np.float32)
+            r = (1.0 - wy_p)[None, :, None] * af[:, j0_p, :] + wy_p[None, :, None] * af[:, j1_p, :]
+            return ((1.0 - wx_p)[None, None, :] * r[:, :, i0_p] + wx_p[None, None, :] * r[:, :, i1_p]).astype(np.float32)
+
+        ana_state = dict(state_3d)
+        inv_tau = np.float32(1.0 / max(1.0, float(iau_tau_sec)))
+        iau_forcing: Optional[Dict[str, np.ndarray]] = {} if compute_iau else None
+
+        # u & v staggered update
+        for wkey, axis_s in (("u", 2), ("v", 1)):
+            inc_c_w = c_res.analysis_increments.get(wkey)
+            if inc_c_w is not None and np.any(inc_c_w):
+                inc_f = _prolong_field(inc_c_w)
+                if axis_s == 2 and ana_state["u"].shape[2] == spec.nx + 1:
+                    inc_st = np.empty_like(ana_state["u"], dtype=np.float32)
+                    inc_st[:, :, 1:-1] = 0.5 * (inc_f[:, :, :-1] + inc_f[:, :, 1:])
+                    inc_st[:, :, 0] = 0.5 * (inc_f[:, :, -1] + inc_f[:, :, 0]) if spec.is_periodic_lon else inc_f[:, :, 0]
+                    inc_st[:, :, -1] = inc_st[:, :, 0] if spec.is_periodic_lon else inc_f[:, :, -1]
+                elif axis_s == 1 and ana_state["v"].shape[1] == spec.ny + 1:
+                    inc_st = np.empty_like(ana_state["v"], dtype=np.float32)
+                    inc_st[:, 1:-1, :] = 0.5 * (inc_f[:, :-1, :] + inc_f[:, 1:, :])
+                    inc_st[:, 0, :] = inc_f[:, 0, :]
+                    inc_st[:, -1, :] = inc_f[:, -1, :]
+                else:
+                    inc_st = inc_f
+                del inc_f
+                if not compute_iau:
+                    ana_state[wkey] += inc_st
+                    np.clip(ana_state[wkey], -150.0, 150.0, out=ana_state[wkey])
+                    del inc_st
+                else:
+                    ana_state[wkey] = np.clip(ana_state[wkey] + inc_st, -150.0, 150.0).astype(np.float32)
+                    if iau_forcing is not None:
+                        inc_st *= inv_tau
+                        iau_forcing[wkey] = inc_st
+            elif iau_forcing is not None:
+                iau_forcing[wkey] = np.zeros_like(ana_state[wkey], dtype=np.float32)
+
+        for skey in ("theta_p", "pi_p", "qv"):
+            inc_c_s = c_res.analysis_increments.get(skey)
+            if inc_c_s is not None and np.any(inc_c_s):
+                inc_f = _prolong_field(inc_c_s)
+                if skey == "qv":
+                    if not compute_iau:
+                        ana_state["qv"] += inc_f
+                        np.clip(ana_state["qv"], 1e-8, 0.04, out=ana_state["qv"])
+                        del inc_f
                     else:
-                        out_t[k_f] = arr_f
-                return out_t
+                        ana_state["qv"] = np.clip(ana_state["qv"] + inc_f, 1e-8, 0.04).astype(np.float32)
+                else:
+                    if not compute_iau:
+                        ana_state[skey] += inc_f
+                        del inc_f
+                    else:
+                        ana_state[skey] = (ana_state[skey] + inc_f).astype(np.float32)
+                        if iau_forcing is not None:
+                            inc_f *= inv_tau
+                            iau_forcing[skey] = inc_f
+            elif iau_forcing is not None and skey in ("theta_p", "pi_p"):
+                iau_forcing[skey] = np.zeros_like(ana_state[skey], dtype=np.float32)
 
-            eff_traj = {t_lo: _advect_state(t_lo), 0.0: bg_centered, t_hi: _advect_state(t_hi)}
+        if iau_forcing is not None:
+            iau_forcing["w"] = np.zeros_like(ana_state["w"], dtype=np.float32)
 
+        sst_updated: Optional[np.ndarray] = None
+        if "sst" in c_res.analysis_increments and "sst_bulk" in surf_state and np.any(c_res.analysis_increments["sst"]):
+            sst_updated = (np.asarray(surf_state["sst_bulk"], dtype=np.float32) + _prolong_field(c_res.analysis_increments["sst"])).astype(np.float32)
+
+        res = c_res
+    else:
+        u_c, v_c = unstagger_uv(state_3d["u"], state_3d["v"])
+        bg_centered: Dict[str, np.ndarray] = {
+            "u": u_c,
+            "v": v_c,
+            "theta_p": np.asarray(state_3d["theta_p"], dtype=np.float32),
+            "pi_p": np.asarray(state_3d["pi_p"], dtype=np.float32),
+            "qv": np.asarray(state_3d["qv"], dtype=np.float32),
+            "ps": ps_bg.astype(np.float32),
+        }
+        if "sst_bulk" in surf_state:
+            bg_centered["sst"] = np.asarray(surf_state["sst_bulk"], dtype=np.float32)
+
+        eff_traj = trajectory if trajectory is not None else _build_fgat_trajectory(spec, bg_centered, obs_list)
         hop = VarObservationOperator(
             spec, hs, bg_centered, theta_sfc_ref=theta_sfc_ref, p_sfc_ref=p_sfc_ref, n_ref_hz=n_ref_hz
         )
@@ -797,16 +877,33 @@ def run_domain_3dvar(
             land_mask=(np.asarray(lsm) >= 0.5),
             trajectory=eff_traj,
         )
-
-    updated_c = apply_analysis_increments_with_bounds(bg_centered, res.analysis_increments)
-    u_st, v_st = stagger_uv(updated_c["u"], updated_c["v"])
-
-    ana_state = {k: v.copy() for k, v in state_3d.items()}
-    ana_state["u"] = u_st
-    ana_state["v"] = v_st
-    ana_state["theta_p"] = updated_c["theta_p"]
-    ana_state["pi_p"] = updated_c["pi_p"]
-    ana_state["qv"] = updated_c["qv"]
+        updated_c = apply_analysis_increments_with_bounds(bg_centered, res.analysis_increments)
+        u_st, v_st = stagger_uv(updated_c["u"], updated_c["v"])
+        ana_state = {k: v.copy() for k, v in state_3d.items()}
+        ana_state["u"] = u_st
+        ana_state["v"] = v_st
+        ana_state["theta_p"] = updated_c["theta_p"]
+        ana_state["pi_p"] = updated_c["pi_p"]
+        ana_state["qv"] = updated_c["qv"]
+        sst_updated = updated_c.get("sst")
+        if compute_iau:
+            inc_c = {
+                "u": res.analysis_increments.get("u", np.zeros_like(u_c)),
+                "v": res.analysis_increments.get("v", np.zeros_like(v_c)),
+                "theta_p": res.analysis_increments.get("theta_p", np.zeros_like(ana_state["theta_p"])),
+                "pi_p": res.analysis_increments.get("pi_p", np.zeros_like(ana_state["pi_p"])),
+            }
+            iau_raw = compute_iau_tendencies(inc_c, tau_sec=iau_tau_sec)
+            iau_u_st, iau_v_st = stagger_uv(iau_raw["u"], iau_raw["v"])
+            iau_forcing = {
+                "u": iau_u_st,
+                "v": iau_v_st,
+                "w": np.zeros_like(ana_state["w"]),
+                "theta_p": iau_raw["theta_p"],
+                "pi_p": iau_raw["pi_p"],
+            }
+        else:
+            iau_forcing = None
 
     # Adjust 2m temperature, skin temperature, and SST consistently with 3D-Var increments
     th0_ana = ref0["theta_bar"][0] + np.asarray(ana_state["theta_p"][0], dtype=np.float64)
@@ -819,8 +916,8 @@ def run_domain_3dvar(
     if "t_skin" in ana_surf:
         is_land = np.asarray(lsm) >= 0.5
         ana_surf["t_skin"] = np.where(is_land, ana_surf["t_skin"] + 0.5 * dt0, ana_surf["t_skin"]).astype(np.float32)
-    if "sst" in updated_c and "sst_bulk" in ana_surf:
-        ana_surf["sst_bulk"] = updated_c["sst"].astype(np.float32)
+    if sst_updated is not None and "sst_bulk" in ana_surf:
+        ana_surf["sst_bulk"] = sst_updated.astype(np.float32)
 
     # Apply OSI-SAF cryosphere sea-ice concentration / thickness on both projected (D2/D3) and global spherical (D1) grids
     if obs_dir is not None:
@@ -861,14 +958,6 @@ def run_domain_3dvar(
                         if "sea_ice_albedo" in ana_surf:
                             ana_surf["sea_ice_albedo"][j_pt, i_pt] = np.float32(0.72)
 
-    inc_c = {
-        "u": res.analysis_increments.get("u", np.zeros_like(u_c)),
-        "v": res.analysis_increments.get("v", np.zeros_like(v_c)),
-        "theta_p": res.analysis_increments.get("theta_p", np.zeros_like(ana_state["theta_p"])),
-        "pi_p": res.analysis_increments.get("pi_p", np.zeros_like(ana_state["pi_p"])),
-    }
-    iau_raw = compute_iau_tendencies(inc_c, tau_sec=iau_tau_sec)
-
     # Radar Latent Heat Nudging (LHN) via compute_lhn_tendencies
     if radar_rain_rate_mm_h is None and obs_dir is not None:
         for cand_d in _expand_obs_search_dirs(Path(obs_dir)):
@@ -883,6 +972,7 @@ def run_domain_3dvar(
                             break
 
     if radar_rain_rate_mm_h is not None:
+        _, z_s, _ = spec.vertical.heights_3d(hs)
         mod_rr_mm_h = (
             np.asarray(model_rain_rate_mm_h, dtype=np.float64)
             if model_rain_rate_mm_h is not None
@@ -903,17 +993,10 @@ def run_domain_3dvar(
             qc=ana_state.get("qc"),
             tau_lhn_sec=iau_tau_sec,
         )
-        iau_raw["theta_p"] = (iau_raw["theta_p"] + dth_lhn).astype(np.float32)
+        if iau_forcing is not None:
+            iau_forcing["theta_p"] = (iau_forcing["theta_p"] + dth_lhn).astype(np.float32)
         ana_state["qv"] = np.clip(ana_state["qv"] + dqv_lhn * float(iau_tau_sec), 0.0, 0.045).astype(np.float32)
 
-    iau_u_st, iau_v_st = stagger_uv(iau_raw["u"], iau_raw["v"])
-    iau_forcing = {
-        "u": iau_u_st,
-        "v": iau_v_st,
-        "w": np.zeros_like(ana_state["w"]),
-        "theta_p": iau_raw["theta_p"],
-        "pi_p": iau_raw["pi_p"],
-    }
     return ana_state, ana_surf, iau_forcing, res
 
 
@@ -979,7 +1062,7 @@ def verify_against_stations(
     t2m_grid = th0 * pi0
     mslp_grid = compute_mslp_pa(spec, hs, state_3d, theta_sfc_ref=theta_sfc_ref, p_sfc_ref=p_sfc_ref, n_ref_hz=n_ref_hz).astype(np.float64)
 
-    uc, vc = unstagger_uv(state_3d["u"], state_3d["v"])
+    uc, vc = unstagger_uv(state_3d["u"][:1], state_3d["v"][:1])
     u_grid, v_grid = uc[0].astype(np.float64), vc[0].astype(np.float64)
     if spec.is_projected and spec.projection is not None:
         u_geo_grid, v_geo_grid = spec.projection.grid_to_geo_wind(u_grid, v_grid, spec.lon2d)
