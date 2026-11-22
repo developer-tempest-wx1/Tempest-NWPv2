@@ -293,3 +293,33 @@ Direct gemeten op hetzelfde echte D2-vochtige dataset (`4` 3D-velden `65×400×5
 
 **Conclusie (conform `AGENTS.md` Regel 2):** Vervang **WX-1 niet** als interne backbone. Voor prognostische checkpoints, LBC's en model-I/O scoort WX-1 het best over de hele linie: één enkel compact bestand, even groot als NetCDF4 (`-24%` kleiner dan standaard Zarr v3), sneller bij zowel horizontale kaarten (`3,52 ms`) als verticale soundings (`4,57 ms`) en 100% verliesvrij (`max_err = 0.0`) — iets waar 16-bit GRIB2 afvalt door kwantisatieverlies en gebrek aan kolom-chunking. `NetCDF4` of `GRIB2` heeft uitsluitend nut als *optionele eind-export* voor externe tools (Metview, Panoply, QGIS, CDO).
 
+---
+
+### 7.6 Compact Nederland-D3 (`d3_nl_2p5km`, `216×216`, `2,5 km`) timing & 6-uurs verificatie
+
+1. **Reden om `432×432×137` Benelux+DE af te breken (`14b9be5`):** Tijdens de geneste 6-uurs test liep de stapduur op `432×432×137` bij aanhoudende thermische throttling (`88,4 °C / 787–855 MHz / thr=0x20`) op naar **`3,69–3,77 s/stap`** (~`35 min` per forecast-uur, oftewel ~`3,5 uur` alleen voor D3 bovenop `28,6 min` voor D2). Daarom is standaard `d3` ingericht als **compact Nederland + ~120 km buffer (`d3_nl_2p5km`: `216×216`, `540×540 km`, `lat 49.67..54.57°N, lon 1.14..9.46°E`, `4×` minder cellen)** in [`projection.py`](file:///home/j_ord/AI/Tempest/Tempest-NWPv2-kopie/python/tempest_v2/projection.py#L280) (`2f089b7`), met behoud van `d3_benelux_2p5km` (`432×432`) en `d3_1p5km` (`720×720`).
+
+2. **Gemeten `d3_nl_2p5km` (`216×216`, `2,5 km`, `dt = 6,0 s`, 1 tile, `--pbl-last --cy46-physics`) prestaties:**
+
+| Lagen (`nz`) | Schatting VRAM (met IAU) | Gemeten live VRAM | Tiles | 10-staps snelheid (koel) | Geschatte 6u (3600 st.) |
+|---|---|---|---|---|---|
+| `nz = 65` | `565 MiB` | `1436 MiB` (`1521 MiB` met NEMO+SI3) | `1×1` | **`0,151 s/stap`** | `9,1 min` koel · **`18,26 min` gemeten thermisch (`88.6°C / 472–900 MHz`)** |
+| `nz = 90` | `729 MiB` | `1630 MiB` | `1×1` | **`0,255 s/stap`** | `15,3 min` koel *(~`30 min` thermisch)* |
+| `nz = 137` | `1039 MiB` | `1894 MiB` | `1×1` | **`0,410 s/stap`** | `24,6 min` koel *(~`45–50 min` thermisch)* |
+
+3. **Volledige 6-uurs `d3_nl_2p5km` run (`65×216×216`, `dt=6,0 s`, 3600 stappen, `2026-11-22 00Z → 06Z`, standalone met vaste `00Z`-LBC's):**
+   - Looptijd: **`1095,49 s` (`18,26 min`)**, **`num_tiles = 1`**, `RSS = 1817,4 MB` (stabiel), `Swap = 0,0 MB`, `VRAM = 1521/6143 MiB` (vlak van stap 900 t/m 3600).
+   - Outputbestanden: `runs/20261122_00Z_d3_nl_2p5km/forecast_d3_nl_2p5km_T+000h.wx1`, `T+003h.wx1`, `T+006h.wx1`.
+
+| Referentie (`d3_nl_2p5km`, binnengebied `n=30.976`) | `T+00h` Bias / RMSE (`r`) | `T+06h` Bias / RMSE (`r`) | Duiding |
+|---|---|---|---|
+| **ECMWF MSLP** `[hPa]` | **`-0.016` / `0.061` (`0.9970`)** | `+2.440` / `2.626` (`0.4733`) | `00Z→06Z` daalt EC over NL (`1015.47 → 1012.84`); vaste `00Z`-LBC houdt domein op `1015.28 hPa` |
+| **ECMWF T2m** (int / land / sea) `[K]` | `0.000 / 0.000` (`1.0000`) | **`+0.263 / 1.052` (`0.9671`)** · land `+0.361/1.222` · zee `+0.104/0.691` | Sterk thermisch profiel ondanks vaste LBC's |
+| **ECMWF Td2m** `[K]` | **`+0.002` / `0.004` (`1.0000`)** | **`+0.116 / 1.052` (`0.8634`)** | Vocht-IC en dauwpunt zeer zuiver |
+| **ECMWF W10** (land / sea) `[m/s]` | `+1.782/2.141` · `+0.536/0.862` | `+0.796/1.603` · `-1.662/2.598` | Vaste `00Z`-LBC's blokkeren aantrekkende zeewind in klein domein |
+| **ECMWF Westrand-TCWV** `i=[0,1,5,10,20,40]` | `[9.06..8.49]` vs `[8.20..7.44]` | **`[9.06, 9.04, 8.89, 8.52, 8.40, 8.23]`** *(EC `[8.64..7.50]`)* | Geen droge rand dankzij `d_lbc_qv` |
+| **HARMONIE Cy46 (`2,5 km`) MSLP** `[hPa]` | — | `+2.897` / `3.108` (`0.3879`) *(mod `1015.28` vs `1012.39`)* | Zelfde synoptische `00Z`-LBC oorzaak (`--mode d2_to_d3` lost dit op via tijdvariërende D2-LBC's) |
+| **HARMONIE Cy46 (`2,5 km`) T2m / Td2m** `[K]` | — | **`+0.534 / 1.430` (`0.9472`)** *(zee `+0.149/0.858`)* · Td2m **`+0.116 / 1.413`** | Goed 2,5 km thermisch en vochtgedrag |
+| **HARMONIE Cy46 (`2,5 km`) W10** (land / zee) `[m/s]` | — | land `+0.988/1.697` · zee `-2.804/3.575` | Zelfde `00Z`-LBC zeewindblokkade bij standalone run zonder D2-koppeling |
+
+
