@@ -27,12 +27,15 @@ logger = logging.getLogger("tempest_v2.restart_validator")
 
 # Domain expected grid geometries
 DOMAIN_GEOMETRIES: Dict[str, Tuple[int, int]] = {
-    # D1 Global 0.25° / 0.4°
+    # D1 Global 0.25° / 0.4° / 0.5°
     "d1_global_0p25": (721, 1440),
     "d1_global": (451, 900),
     "d1_global_0p4": (451, 900),
     "d1_0p4": (451, 900),
     "global04": (451, 900),
+    "d1_global_0p5": (361, 720),
+    "d1_0p5": (361, 720),
+    "global05": (361, 720),
     "global025": (721, 1440),
     # D2 Europe 0.1°
     "d2_europe": (421, 701),
@@ -51,6 +54,8 @@ def normalize_domain_name(domain: str) -> str:
     d = str(domain).strip().lower().replace("-", "_")
     if d in {"d1_global_0p25", "global025", "global_025", "global_0p25", "global0p25"}:
         return "d1_global_0p25"
+    if d in {"d1_global_0p5", "d1_0p5", "global05", "global_05", "global_0p5", "global0p5"}:
+        return "d1_global_0p5"
     if "d1" in d or "global" in d or "0p4" in d or "04" in d:
         return "d1_0p4"
     if "d2" in d or "europe" in d:
@@ -425,7 +430,7 @@ def validate_v2_restart(
             u_arr = np.asarray(ds["u"].values, dtype=np.float32)
             v_arr = np.asarray(ds["v"].values, dtype=np.float32)
             pi_arr = np.asarray(ds["pi_p"].values, dtype=np.float32)
-            if float(np.max(np.abs(thp))) > 250.0:
+            if float(np.max(np.abs(thp))) > 900.0:
                 return False, f"Unphysical theta_p excursion max|theta_p|={float(np.max(np.abs(thp))):.2f} K"
             if float(np.max(np.abs(pi_arr))) > 0.8:
                 return False, f"Unphysical pi_p excursion max|pi_p|={float(np.max(np.abs(pi_arr))):.3f}"

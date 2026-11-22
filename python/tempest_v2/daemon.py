@@ -53,7 +53,11 @@ class DaemonConfig:
     dt_d2_s: float = 20.0
     dt_d3_s: float = 6.0
     physics_every: int = 5
+    d1_domain: str = "d1_global_0p25"
     enable_d1: bool = False
+    ecmwf_schedule: bool = False
+    pbl_last: bool = False
+    cy46_physics: bool = False
     enable_ocean_si3: bool = True
     include_3d_diagnostics: bool = True
     cycle_restart_hours: Tuple[float, ...] = (6.0,)
@@ -226,10 +230,13 @@ def run_single_cycle(
     run_dir = layout["run_dir"]
     run_id = run_dir.name
 
-    d1_name = d1_spec.name if d1_spec is not None else "d1_global_0p25"
+    d1_spec_eff = d1_spec if d1_spec is not None else (
+        get_domain_spec(cfg.d1_domain, nz=cfg.nz) if (cfg.enable_d1 and pipeline_fn is None) else None
+    )
+    d1_name = d1_spec_eff.name if d1_spec_eff is not None else cfg.d1_domain
     d2_name = d2_spec.name if d2_spec is not None else "d2_eu_lcc"
     d3_name = d3_spec.name if d3_spec is not None else "d3_nl_2p5km"
-    d1_shape = (int(d1_spec.nz), int(d1_spec.ny), int(d1_spec.nx)) if d1_spec is not None else None
+    d1_shape = (int(d1_spec_eff.nz), int(d1_spec_eff.ny), int(d1_spec_eff.nx)) if d1_spec_eff is not None else None
     d2_shape = (int(d2_spec.nz), int(d2_spec.ny), int(d2_spec.nx)) if d2_spec is not None else None
     d3_shape = (int(d3_spec.nz), int(d3_spec.ny), int(d3_spec.nx)) if d3_spec is not None else None
 
@@ -263,7 +270,10 @@ def run_single_cycle(
 
     sfc_grib: Optional[Path] = None
     pl_grib: Optional[Path] = None
-    if d3_restart is not None:
+    warm_ok = (d3_restart is not None) and (
+        pipeline_fn is not None or (d2_restart is not None and ((not cfg.enable_d1) or (d1_restart is not None)))
+    )
+    if warm_ok:
         ic_source = "restart"
         logger.info("[%s] Warm-starting cycle from %s (d2=%s, d1=%s)", run_id, d3_restart, d2_restart, d1_restart)
     else:
@@ -339,6 +349,9 @@ def run_single_cycle(
         "ensemble_seed": cfg.ensemble_seed,
         "d2_spec": d2_spec,
         "d3_spec": d3_spec,
+        "ecmwf_schedule": cfg.ecmwf_schedule,
+        "pbl_last": cfg.pbl_last,
+        "cy46_physics": cfg.cy46_physics,
         "enable_da": cfg.enable_da,
         "dt_d2_s": cfg.dt_d2_s,
         "dt_d3_s": cfg.dt_d3_s,
@@ -350,7 +363,7 @@ def run_single_cycle(
         pipe_res = run_three_nest_pipeline(
             **common_kwargs,
             d1_forecast_hours=cfg.d1_lead_hours,
-            d1_spec=d1_spec,
+            d1_spec=d1_spec_eff,
             d1_restart_path=d1_restart,
             dt_d1_s=cfg.dt_d1_s,
             enable_ocean_si3=cfg.enable_ocean_si3,

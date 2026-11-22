@@ -16,6 +16,7 @@ if str(PY_ROOT) not in sys.path:
     sys.path.insert(0, str(PY_ROOT))
 
 from tempest_v2.daemon import DaemonConfig, latest_ready_cycle_time_utc, run_daemon_loop, run_single_cycle  # noqa: E402
+from tempest_v2.projection import D1_DOMAIN_DEFAULT_DT_S  # noqa: E402
 
 
 def _parse_iso_utc(raw: str) -> datetime.datetime:
@@ -38,8 +39,36 @@ def main() -> None:
     parser.add_argument("--d1-hours", type=float, default=24.0)
     parser.add_argument("--d2-hours", type=float, default=24.0)
     parser.add_argument("--d3-hours", type=float, default=24.0)
-    parser.add_argument("--dt-d1", type=float, default=60.0)
-    parser.add_argument("--enable-d1", action="store_true", help="Enable global 0.25 deg D1 -> D2 -> D3 3-nest pipeline")
+    parser.add_argument(
+        "--d1-domain",
+        choices=list(D1_DOMAIN_DEFAULT_DT_S),
+        default="d1_global_0p25",
+        help="Global D1 grid resolution (0p4=44.5km 1-tile@nz65 / 2-tile@nz137)",
+    )
+    parser.add_argument(
+        "--dt-d1",
+        type=float,
+        default=None,
+        help="Global D1 dynamics step [s] (default: auto 60/90/120s for 0p25/0p4/0p5)",
+    )
+    parser.add_argument("--enable-d1", action="store_true", help="Enable global D1 -> D2 -> D3 3-nest pipeline")
+    parser.add_argument(
+        "--ecmwf",
+        action="store_true",
+        help="Use ECMWF 3-hourly/6-hourly output schedule (physics remain 100%% Tempest)",
+    )
+    parser.add_argument(
+        "--pbl-last",
+        action="store_true",
+        default=False,
+        help="IFS 50r1 physics ordering: vertical diffusion/PBL last",
+    )
+    parser.add_argument(
+        "--cy46-physics",
+        action="store_true",
+        default=False,
+        help="HARMONIE-AROME Cy46 physics package",
+    )
     parser.add_argument("--no-ocean-si3", action="store_true", help="Disable coupled NEMO 5.0.2 + SI3 GPU ocean/sea-ice")
     parser.add_argument("--no-3d-diagnostics", action="store_true", help="Disable 3D pressure-level & CAPE/synoptic WX-1 diagnostics")
     parser.add_argument("--nz", type=int, choices=[65, 90, 137], default=65)
@@ -58,6 +87,7 @@ def main() -> None:
 
     cycle_hours = tuple(int(h.strip()) for h in args.cycle_hours.split(",") if h.strip())
     cyc_rst_hrs = tuple(float(h.strip()) for h in args.cycle_restart_hours.split(",") if h.strip())
+    dt_d1_eff = float(args.dt_d1) if args.dt_d1 is not None else D1_DOMAIN_DEFAULT_DT_S[args.d1_domain]
 
     cfg = DaemonConfig(
         runs_root=args.runs_root,
@@ -67,8 +97,12 @@ def main() -> None:
         d1_lead_hours=args.d1_hours,
         d2_lead_hours=args.d2_hours,
         d3_lead_hours=args.d3_hours,
-        dt_d1_s=args.dt_d1,
+        d1_domain=args.d1_domain,
+        dt_d1_s=dt_d1_eff,
         enable_d1=args.enable_d1,
+        ecmwf_schedule=args.ecmwf,
+        pbl_last=args.pbl_last,
+        cy46_physics=args.cy46_physics,
         enable_ocean_si3=not args.no_ocean_si3,
         include_3d_diagnostics=not args.no_3d_diagnostics,
         nz=args.nz,

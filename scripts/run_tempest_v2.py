@@ -46,7 +46,7 @@ from tempest_v2.ic_builder import (  # noqa: E402
 from tempest_v2.ingest_dwd_poi import ingest_dwd_poi_observations  # noqa: E402
 from tempest_v2.ingest_ecmwf import download_ecmwf_cold_start  # noqa: E402
 from tempest_v2.ingest_knmi_observations import ingest_knmi_observations  # noqa: E402
-from tempest_v2.projection import get_domain_spec  # noqa: E402
+from tempest_v2.projection import D1_DOMAIN_DEFAULT_DT_S, get_domain_spec  # noqa: E402
 from tempest_v2.runner import (  # noqa: E402
     forecast_output_schedule_hours,
     run_domain_forecast,
@@ -65,6 +65,12 @@ def main() -> None:
         description="Tempest-NWP v2 — Classical GPU Non-Hydrostatic NWP (0% AI / 0% ML)"
     )
     parser.add_argument("--mode", choices=["d1_to_d2_to_d3", "d2_to_d3", "d3", "d3_benelux_2p5km", "d3_1p5km", "d2", "d1"], default="d2_to_d3")
+    parser.add_argument(
+        "--d1-domain",
+        choices=list(D1_DOMAIN_DEFAULT_DT_S),
+        default="d1_global_0p25",
+        help="Global D1 grid resolution (0p4=44.5km 1-tile@nz65 / 2-tile@nz137)",
+    )
     parser.add_argument("--nz", type=int, choices=[65, 90, 137], default=65)
     parser.add_argument("--hours", type=float, default=6.0)
     parser.add_argument("--d1-hours", type=float, default=None, help="Optional global D1 forecast length [h]")
@@ -78,6 +84,8 @@ def main() -> None:
     parser.add_argument("--pl-grib", type=Path, default=None)
     parser.add_argument("--aurora-ic", type=Path, default=None)
     parser.add_argument("--restart-in", type=Path, default=None)
+    parser.add_argument("--d1-restart-in", type=Path, default=None, help="Optional D1 WX-1 restart file for warm-start cycling")
+    parser.add_argument("--d2-restart-in", type=Path, default=None, help="Optional D2 WX-1 restart file for warm-start cycling")
     parser.add_argument("--osisaf-wx1", type=Path, default=None, help="Optional OSI-SAF sea-ice WX-1 observation file")
     parser.add_argument("--obs-dir", type=Path, default=PROJECT_ROOT / "data" / "observations")
     parser.add_argument("--download-live", action="store_true", help="Fetch live ECMWF/KNMI/DWD feeds before running")
@@ -86,7 +94,7 @@ def main() -> None:
     parser.add_argument("--no-ocean-si3", action="store_true", help="Disable coupled NEMO+SI3 even in D1 modes")
     parser.add_argument("--no-3d-diagnostics", action="store_true", help="Disable 3D pressure-level & CAPE/synoptic WX-1 diagnostics")
     parser.add_argument("--physics-every", type=int, default=5, help="Substep physics cadence every N dynamics steps")
-    parser.add_argument("--dt-d1", type=float, default=60.0)
+    parser.add_argument("--dt-d1", type=float, default=None, help="D1 dynamics step [s] (default: auto 60/90/120s for 0p25/0p4/0p5)")
     parser.add_argument("--dt-d2", type=float, default=20.0)
     parser.add_argument("--dt-d3", type=float, default=6.0, help="D3 dynamics step [s] (default: 6.0 for 2.5 km D3; use 4.0 for d3_1p5km)")
     parser.add_argument("--outdir", type=Path, default=PROJECT_ROOT / "data" / "forecasts")
@@ -157,6 +165,7 @@ def main() -> None:
         True if (args.enable_ocean_si3 or args.mode in ("d1_to_d2_to_d3", "d1")) else False
     )
     include_3d_diag = not args.no_3d_diagnostics
+    dt_d1_eff = float(args.dt_d1) if args.dt_d1 is not None else D1_DOMAIN_DEFAULT_DT_S[args.d1_domain]
 
     if args.mode == "d1_to_d2_to_d3":
         summary = run_three_nest_pipeline(
@@ -168,6 +177,8 @@ def main() -> None:
             pl_grib=pl_grib,
             aurora_wx1_path=args.aurora_ic,
             restart_path=args.restart_in,
+            d2_restart_path=args.d2_restart_in,
+            d1_restart_path=args.d1_restart_in,
             obs_dir=obs_dir_eff if args.enable_da else None,
             outdir=args.outdir,
             runs_root=args.runs_root,
@@ -175,9 +186,10 @@ def main() -> None:
             ensemble_members=args.ensemble_members,
             ensemble_lead_hours=args.ensemble_hours,
             ensemble_seed=args.ensemble_seed,
+            d1_spec=get_domain_spec(args.d1_domain, nz=args.nz),
             ecmwf_schedule=args.ecmwf,
             enable_da=args.enable_da,
-            dt_d1_s=args.dt_d1,
+            dt_d1_s=dt_d1_eff,
             dt_d2_s=args.dt_d2,
             dt_d3_s=args.dt_d3,
             physics_every=args.physics_every,
@@ -219,6 +231,7 @@ def main() -> None:
             pl_grib=pl_grib,
             aurora_wx1_path=args.aurora_ic,
             restart_path=args.restart_in,
+            d2_restart_path=args.d2_restart_in,
             obs_dir=obs_dir_eff if args.enable_da else None,
             outdir=args.outdir,
             runs_root=args.runs_root,
@@ -254,11 +267,15 @@ def main() -> None:
 
     logger.info("=== Single-Domain Mode [%s] | nz=%d | hours=%.2fh ===", args.mode, args.nz, args.hours)
     t_prep0 = time.perf_counter()
-    spec = get_domain_spec(args.mode, nz=args.nz)
+    spec = get_domain_spec(args.d1_domain if args.mode == "d1" else args.mode, nz=args.nz)
     hs_m, sstatic = build_domain_static_fields(spec)
     logger.info("[%s] Building initial conditions from %s...", spec.name, args.ic_source)
-    if args.ic_source == "restart" and args.restart_in is not None:
-        state_3d, surf_state, meta = load_tempest_restart_wx1(args.restart_in)
+    rst_single = (
+        args.d1_restart_in if (args.mode == "d1" and args.d1_restart_in is not None)
+        else (args.d2_restart_in if (args.mode == "d2" and args.d2_restart_in is not None) else args.restart_in)
+    )
+    if args.ic_source == "restart" and rst_single is not None:
+        state_3d, surf_state, meta = load_tempest_restart_wx1(rst_single)
         init_dt = datetime.datetime.fromisoformat(meta["valid_time_utc"].replace("Z", "+00:00"))
     elif args.ic_source == "aurora" and args.aurora_ic is not None:
         state_3d, surf_state = aurora_wx1_to_ic(args.aurora_ic, spec, hs_m)
@@ -299,7 +316,7 @@ def main() -> None:
     gc.collect()
 
     dt_s = {
-        "d1": args.dt_d1,
+        "d1": dt_d1_eff,
         "d2": args.dt_d2,
         "d3": args.dt_d3,
         "d3_benelux_2p5km": args.dt_d3,

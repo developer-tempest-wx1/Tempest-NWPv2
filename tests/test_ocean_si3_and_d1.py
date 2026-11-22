@@ -944,3 +944,83 @@ def test_three_nest_d1_to_d2_to_d3_coupled_ocean_si3_and_diagnostics(tmp_path: P
     assert oce_meta["kind"] == "tempest_v2_ocean_si3_restart"
     assert float(np.max(oce_st["ice_frac"])) > 0.50
     assert np.all(np.isfinite(oce_st["temp_k"]))
+
+
+def test_d1_coarse_0p4_and_0p5_specs_and_0p4_single_tile_coupled_ocean_smoke() -> None:
+    """Coarse D1 grids (0.4 deg / 0.5 deg) stay distinct in restart validator and 0.4 deg + ocean+SI3 fits 1 tile on 6 GB VRAM."""
+    from tempest_v2.restart_validator import DOMAIN_GEOMETRIES, normalize_domain_name
+
+    s04 = get_domain_spec("d1_global_0p4", nz=65)
+    s05 = get_domain_spec("d1_global_0p5", nz=65)
+    assert s04.name == "d1_global_0p4" and (s04.nz, s04.ny, s04.nx) == (65, 451, 900)
+    assert s05.name == "d1_global_0p5" and (s05.nz, s05.ny, s05.nx) == (65, 361, 720)
+    assert s04.is_spherical and s04.is_periodic_lon
+    assert s05.is_spherical and s05.is_periodic_lon
+
+    assert normalize_domain_name("d1_global_0p25") == "d1_global_0p25"
+    assert normalize_domain_name("d1_global_0p4") == "d1_0p4"
+    assert normalize_domain_name("d1_global_0p5") == "d1_global_0p5"
+    assert DOMAIN_GEOMETRIES["d1_global_0p4"] == (451, 900)
+    assert DOMAIN_GEOMETRIES["d1_global_0p5"] == (361, 720)
+
+    hs = np.zeros((s04.ny, s04.nx), dtype=np.float64)
+    sstatic = {
+        "lat_deg": s04.lat2d.astype(np.float32),
+        "lon_deg": s04.lon2d.astype(np.float32),
+        "lsm": np.zeros((s04.ny, s04.nx), dtype=np.float32),
+        "lake_mask": np.zeros((s04.ny, s04.nx), dtype=np.float32),
+        "soil_type": np.zeros((s04.ny, s04.nx), dtype=np.float32),
+        "bathy_depth_m": np.full((s04.ny, s04.nx), 1500.0, dtype=np.float32),
+        "z0m_base": np.full((s04.ny, s04.nx), 1e-4, dtype=np.float32),
+        "albedo_base": np.full((s04.ny, s04.nx), 0.06, dtype=np.float32),
+        "veg_frac": np.zeros((s04.ny, s04.nx), dtype=np.float32),
+    }
+
+    ocean = NemoSi3GPUSolver(s04, sstatic, nz=8, n_bt_substeps=6, n_evp_substeps=20)
+    solver = None
+    try:
+        solver = NonHydrostaticGPUSolver(
+            s04.vertical,
+            s04.dx_m,
+            s04.dy_m,
+            hs,
+            msf=s04.map_factor,
+            f_cor=s04.coriolis_f,
+            has_moist=True,
+            has_physics=True,
+            bc_x=1,
+            bc_y=0,
+            use_coriolis=True,
+            is_spherical=True,
+            polar_filter_lat_deg=60.0,
+        )
+        assert solver.num_tiles == 1, f"Expected single-tile d1_global_0p4@nz=65, got {solver.num_tiles}"
+
+        st = solver.empty_state()
+        sf = solver.empty_surface_state()
+        sf["sst_bulk"][:] = 285.0
+        oce_st = ocean.init_from_atmosphere_and_osisaf(sf)
+        ocean.upload_state(oce_st)
+        sf = ocean.couple_to_surface_state(oce_st, sf)
+
+        solver.upload_state(st, copy=False)
+        solver.set_surface_static(sstatic)
+        solver.upload_surface(sf)
+        solver.set_physics_config(julian_day=172.0, utc_seconds=43200.0)
+        solver.step_full(dt_s=90.0, n_steps=1, physics_every=1)
+        out_atmo = solver.download_state(copy=False)
+        out_surf = solver.download_surface()
+        forcing = ocean.build_forcing_from_atmosphere(s04, out_atmo, out_surf, dt_interval_s=90.0)
+        ocean.step(forcing, 90.0)
+        oce_out = ocean.download_state()
+
+        assert np.all(np.isfinite(out_atmo["u"])) and np.all(np.isfinite(out_atmo["qv"]))
+        assert np.all(np.isfinite(oce_out["temp_k"]))
+    finally:
+        if solver is not None:
+            solver.close()
+        ocean.close()
+
+    free_after, _ = cuda_vram_info()
+    assert free_after > 3_500_000_000, f"VRAM leak after d1_global_0p4 coupled close: free={free_after}"
+

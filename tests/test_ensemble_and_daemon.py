@@ -509,3 +509,50 @@ def test_knmi_netcdf_real_coords_and_radar_qpe_decoder(tmp_path: Path) -> None:
     )
     assert reproj.shape == (spec.ny, spec.nx)
     assert np.nanmax(reproj) >= 0.0
+
+
+def test_daemon_config_passthrough_and_nz137_stratospheric_restart(tmp_path: Path) -> None:
+    """Verify daemon forwards ecmwf/pbl_last/cy46_physics/d1_domain flags and validate_v2_restart permits nz=137 stratospheric theta_p."""
+    from tempest_v2.daemon import run_single_cycle
+
+    init_00 = datetime.datetime(2026, 11, 22, 0, 0, tzinfo=datetime.timezone.utc)
+    spec, hs, _ss, st, sf = _make_small_domain(name="d1_global_0p4", ny=12, nx=12, nz=137)
+    st_strat = {k: v.copy() for k, v in st.items()}
+    st_strat["theta_p"][-1, :, :] = 580.0  # Real 10 hPa stratospheric departure vs bar (~395 K) at z_top=31 km
+    rst_ok = save_tempest_restart_wx1(tmp_path / "d1_strat_ok.wx1", init_00, spec, hs, st_strat, sf)
+    ok_137, msg_137 = validate_v2_restart(rst_ok, expected_domain_name="d1_global_0p4", expected_shape=(137, 12, 12))
+    assert ok_137, msg_137
+
+    st_bad = {k: v.copy() for k, v in st.items()}
+    st_bad["theta_p"][-1, 0, 0] = 1200.0
+    rst_bad = save_tempest_restart_wx1(tmp_path / "d1_strat_bad.wx1", init_00, spec, hs, st_bad, sf)
+    ok_bad, _ = validate_v2_restart(rst_bad, expected_domain_name="d1_global_0p4", expected_shape=(137, 12, 12))
+    assert not ok_bad
+
+    captured: Dict[str, Any] = {}
+
+    def _capture_pipeline(**kwargs: Any) -> Dict[str, Any]:
+        captured.update(kwargs)
+        return {"da": {}}
+
+    cfg = DaemonConfig(
+        runs_root=tmp_path / "runs",
+        enable_d1=True,
+        d1_domain="d1_global_0p4",
+        ecmwf_schedule=True,
+        pbl_last=True,
+        cy46_physics=True,
+        enable_da=False,
+        enable_radar=False,
+        enable_notifier=False,
+    )
+    run_single_cycle(
+        cfg,
+        init_00,
+        pipeline_fn=_capture_pipeline,
+        ic_fn=lambda _cdir, _dt: (tmp_path / "sfc.grib2", tmp_path / "pl.grib2"),
+    )
+    assert captured["ecmwf_schedule"] is True
+    assert captured["pbl_last"] is True
+    assert captured["cy46_physics"] is True
+
