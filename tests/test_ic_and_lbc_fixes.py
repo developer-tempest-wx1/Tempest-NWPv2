@@ -80,3 +80,98 @@ def test_q_from_dewpoint_pa_roundtrip_and_supersat_clamp() -> None:
     td_rec = 273.15 + (243.5 * ln_e) / (17.67 - ln_e)
     td_expected = np.minimum(d2m, t2m)
     assert float(np.max(np.abs(td_rec - td_expected))) < 0.05
+
+
+def test_moisture_davies_lbc_and_open_tracer_flux() -> None:
+    """Verify bc=2 open tracer fluxes + d_lbc_qv Davies relaxation prevent western dry rim & eastern pileup."""
+    from tempest_v2.cuda_bridge import NonHydrostaticGPUSolver
+
+    nz, ny, nx = 12, 16, 48
+    dx = dy = 2000.0
+    vgrid = VerticalGrid(nz=nz, z_top_m=15_000.0, stretch_power=1.2)
+    hs = np.zeros((ny, nx), dtype=np.float64)
+
+    solver = NonHydrostaticGPUSolver(
+        vgrid,
+        dx,
+        dy,
+        hs,
+        has_moist=True,
+        bc_x=2,
+        bc_y=2,
+        use_coriolis=False,
+        lbc_rim_width=8,
+        lbc_tau_max_s=0.04,
+    )
+    try:
+        st = solver.empty_state()
+        st["u"][:] = 20.0
+        st["qv"][:] = 0.010
+        lbc = {k: st[k].copy() for k in ("u", "v", "w", "theta_p", "pi_p", "qv")}
+        solver.upload_state(st)
+        solver.set_lbc_target(lbc)
+        solver.step_rk3(dt_s=10.0, n_steps=40)
+        out = solver.download_state()
+    finally:
+        solver.close()
+
+    qv_end = out["qv"]
+    assert np.all(np.isfinite(qv_end))
+    assert float(np.min(qv_end)) >= 0.0
+    west_min = float(np.min(qv_end[:, 2:-2, 0:10]))
+    east_max = float(np.max(qv_end[:, 2:-2, -3:]))
+    assert west_min > 0.0095, f"Western rim moisture collapsed: min={west_min:.6f}"
+    assert east_max < 0.0110, f"Eastern outflow tracer pileup: max={east_max:.6f}"
+
+
+def test_multi_tile_matches_untiled_with_qv_lbc() -> None:
+    """Verify 2x2 tiled solver matches 1-tile untiled bit-for-bit when lbc includes qv."""
+    from tempest_v2.cuda_bridge import DEFAULT_MAX_VRAM_BYTES, NonHydrostaticGPUSolver, estimate_vram_bytes
+
+    nz, ny, nx = 12, 56, 56
+    dx = dy = 1500.0
+    vgrid = VerticalGrid(nz=nz, z_top_m=15_000.0, stretch_power=1.2)
+    y = (np.arange(ny, dtype=np.float64) - 0.5 * (ny - 1)) * dy
+    x = (np.arange(nx, dtype=np.float64) - 0.5 * (nx - 1)) * dx
+    yy, xx = np.meshgrid(y, x, indexing="ij")
+    hs = 200.0 * np.exp(-(xx**2 + yy**2) / (15_000.0**2))
+    vram_2x2 = estimate_vram_bytes(nz, ny // 2 + 16, nx // 2 + 16, moist=True, has_lbc=True, has_iau=False, has_physics=False)
+
+    def _run_case(max_vram: int):
+        solver = NonHydrostaticGPUSolver(
+            vgrid,
+            dx,
+            dy,
+            hs,
+            has_moist=True,
+            has_physics=False,
+            bc_x=2,
+            bc_y=2,
+            use_coriolis=False,
+            lbc_rim_width=6,
+            lbc_tau_max_s=0.04,
+            max_vram_bytes=max_vram,
+            halo=16,
+        )
+        try:
+            st = solver.empty_state()
+            st["u"][:] = 12.0
+            st["v"][:] = -3.0
+            st["qv"][:] = 0.009
+            lbc = {k: st[k].copy() for k in ("u", "v", "w", "theta_p", "pi_p", "qv")}
+            lbc["qv"][:, :, :6] = 0.012
+            solver.upload_state(st)
+            solver.set_lbc_target(lbc)
+            solver.step_rk3(dt_s=6.0, n_steps=4)
+            return solver.num_tiles, solver.download_state()
+        finally:
+            solver.close()
+
+    n_untiled, out_untiled = _run_case(DEFAULT_MAX_VRAM_BYTES)
+    n_tiled, out_tiled = _run_case(vram_2x2)
+    assert n_untiled == 1
+    assert n_tiled == 4
+    for key in out_untiled:
+        diff = float(np.max(np.abs(out_tiled[key] - out_untiled[key])))
+        assert diff < 1e-6, f"Tiled 3D field '{key}' diverged with qv LBC: max_abs_diff={diff:.3e}"
+

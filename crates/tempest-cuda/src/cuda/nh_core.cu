@@ -1772,9 +1772,13 @@ __device__ inline float face_flux_x_f(
     const NhGridConfig& cfg, const DeviceStaticGrid& g, float pi_sfc_f,
     const float* u, int32_t k, int32_t j, int32_t i_face
 ) {
-    if (cfg.bc_x != 1 && (i_face <= 0 || i_face >= cfg.nx)) return 0.0f;
-    const int32_t il = (cfg.bc_x == 1) ? wrap_idx(i_face - 1, cfg.nx) : (i_face - 1);
-    const int32_t ir = (cfg.bc_x == 1) ? wrap_idx(i_face, cfg.nx) : i_face;
+    if (cfg.bc_x == 0 && (i_face <= 0 || i_face >= cfg.nx)) return 0.0f;
+    const int32_t il = (cfg.bc_x == 1)
+        ? wrap_idx(i_face - 1, cfg.nx)
+        : ((i_face - 1 < 0) ? 0 : ((i_face - 1 >= cfg.nx) ? (cfg.nx - 1) : (i_face - 1)));
+    const int32_t ir = (cfg.bc_x == 1)
+        ? wrap_idx(i_face, cfg.nx)
+        : ((i_face < 0) ? 0 : ((i_face >= cfg.nx) ? (cfg.nx - 1) : i_face));
     const float hs_u = 0.5f * (static_cast<float>(g.hs[j * cfg.nx + il]) + static_cast<float>(g.hs[j * cfg.nx + ir]));
     const float msf_u = 0.5f * (static_cast<float>(g.msf[j * cfg.nx + il]) + static_cast<float>(g.msf[j * cfg.nx + ir]));
     const float z_u = static_cast<float>(g.zeta_s[k]) + static_cast<float>(g.b_s[k]) * hs_u;
@@ -1792,9 +1796,13 @@ __device__ inline float face_flux_y_f(
     const NhGridConfig& cfg, const DeviceStaticGrid& g, float pi_sfc_f,
     const float* v, int32_t k, int32_t j_face, int32_t i
 ) {
-    if (cfg.bc_y != 1 && (j_face <= 0 || j_face >= cfg.ny)) return 0.0f;
-    const int32_t jl = (cfg.bc_y == 1) ? wrap_idx(j_face - 1, cfg.ny) : (j_face - 1);
-    const int32_t jr = (cfg.bc_y == 1) ? wrap_idx(j_face, cfg.ny) : j_face;
+    if (cfg.bc_y == 0 && (j_face <= 0 || j_face >= cfg.ny)) return 0.0f;
+    const int32_t jl = (cfg.bc_y == 1)
+        ? wrap_idx(j_face - 1, cfg.ny)
+        : ((j_face - 1 < 0) ? 0 : ((j_face - 1 >= cfg.ny) ? (cfg.ny - 1) : (j_face - 1)));
+    const int32_t jr = (cfg.bc_y == 1)
+        ? wrap_idx(j_face, cfg.ny)
+        : ((j_face < 0) ? 0 : ((j_face >= cfg.ny) ? (cfg.ny - 1) : j_face));
     const float hs_v = 0.5f * (static_cast<float>(g.hs[jl * cfg.nx + i]) + static_cast<float>(g.hs[jr * cfg.nx + i]));
     const float msf_v = 0.5f * (static_cast<float>(g.msf[jl * cfg.nx + i]) + static_cast<float>(g.msf[jr * cfg.nx + i]));
     const float z_v = static_cast<float>(g.zeta_s[k]) + static_cast<float>(g.b_s[k]) * hs_v;
@@ -1920,32 +1928,48 @@ __global__ void nh_tracer_fct_pass1_kernel(
     {
         const float ux = face_flux_x_f(cfg, g, pi_sfc_f, u, k, j, i);
         const float q_up = (ux >= 0.0f) ? read_s_f(q, k, j, i - 1, nz, ny, nx, cfg.bc_x, cfg.bc_y) : read_s_f(q, k, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y);
-        const float q_ho = horiz_face_val_x_f(q, k, j, i, ux, nz, ny, nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
         fxl_low = ux * q_up;
-        fxl_hi  = ux * fmaxf(0.0f, q_ho);
+        if (cfg.bc_x != 1 && i == 0) {
+            fxl_hi = fxl_low;
+        } else {
+            const float q_ho = horiz_face_val_x_f(q, k, j, i, ux, nz, ny, nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
+            fxl_hi = ux * fmaxf(0.0f, q_ho);
+        }
     }
     {
         const float vy = face_flux_y_f(cfg, g, pi_sfc_f, v, k, j, i);
         const float q_up = (vy >= 0.0f) ? read_s_f(q, k, j - 1, i, nz, ny, nx, cfg.bc_x, cfg.bc_y) : read_s_f(q, k, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y);
-        const float q_ho = horiz_face_val_y_f(q, k, j, i, vy, nz, ny, nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
         fyl_low = vy * q_up;
-        fyl_hi  = vy * fmaxf(0.0f, q_ho);
+        if (cfg.bc_y != 1 && j == 0) {
+            fyl_hi = fyl_low;
+        } else {
+            const float q_ho = horiz_face_val_y_f(q, k, j, i, vy, nz, ny, nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
+            fyl_hi = vy * fmaxf(0.0f, q_ho);
+        }
     }
 
     float fxr_low, fxr_hi, fyr_low, fyr_hi;
     {
         const float ux = face_flux_x_f(cfg, g, pi_sfc_f, u, k, j, i + 1);
         const float q_up = (ux >= 0.0f) ? read_s_f(q, k, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y) : read_s_f(q, k, j, i + 1, nz, ny, nx, cfg.bc_x, cfg.bc_y);
-        const float q_ho = horiz_face_val_x_f(q, k, j, i + 1, ux, nz, ny, nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
         fxr_low = ux * q_up;
-        fxr_hi  = ux * fmaxf(0.0f, q_ho);
+        if (cfg.bc_x != 1 && i == nx - 1) {
+            fxr_hi = fxr_low;
+        } else {
+            const float q_ho = horiz_face_val_x_f(q, k, j, i + 1, ux, nz, ny, nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
+            fxr_hi = ux * fmaxf(0.0f, q_ho);
+        }
     }
     {
         const float vy = face_flux_y_f(cfg, g, pi_sfc_f, v, k, j + 1, i);
         const float q_up = (vy >= 0.0f) ? read_s_f(q, k, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y) : read_s_f(q, k, j + 1, i, nz, ny, nx, cfg.bc_x, cfg.bc_y);
-        const float q_ho = horiz_face_val_y_f(q, k, j + 1, i, vy, nz, ny, nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
         fyr_low = vy * q_up;
-        fyr_hi  = vy * fmaxf(0.0f, q_ho);
+        if (cfg.bc_y != 1 && j == ny - 1) {
+            fyr_hi = fyr_low;
+        } else {
+            const float q_ho = horiz_face_val_y_f(q, k, j + 1, i, vy, nz, ny, nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
+            fyr_hi = vy * fmaxf(0.0f, q_ho);
+        }
     }
 
     const float q0 = fmaxf(0.0f, q[idx]);
@@ -2197,6 +2221,37 @@ __global__ void nh_estimate_cs_max_kernel(
     if (lane == 0 && cs_msf > 0.0f) {
         atomicMax(max_cfl_u32, __float_as_uint(cs_msf));
     }
+}
+
+__global__ void nh_lbc_relax_qv_kernel(
+    NhGridConfig cfg,
+    float dt_s,
+    const float* lbc_qv,
+    float* qv
+) {
+    const int32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int32_t j = blockIdx.y * blockDim.y + threadIdx.y;
+    const int32_t k = blockIdx.z;
+    if (k >= cfg.nz || j >= cfg.ny || i >= cfg.nx || lbc_qv == nullptr) return;
+    if (cfg.lbc_tau_max_s <= 0.0 || cfg.lbc_rim_width <= 0) return;
+
+    const float tau_max = static_cast<float>(cfg.lbc_tau_max_s);
+    float tau = 0.0f;
+    if (cfg.bc_x == 2) {
+        if (cfg.lbc_edges & 1) tau = fmaxf(tau, davies_weight_f(i, cfg.lbc_rim_width, tau_max));
+        if (cfg.lbc_edges & 2) tau = fmaxf(tau, davies_weight_f(cfg.nx - 1 - i, cfg.lbc_rim_width, tau_max));
+    }
+    if (cfg.bc_y == 2) {
+        if (cfg.lbc_edges & 4) tau = fmaxf(tau, davies_weight_f(j, cfg.lbc_rim_width, tau_max));
+        if (cfg.lbc_edges & 8) tau = fmaxf(tau, davies_weight_f(cfg.ny - 1 - j, cfg.lbc_rim_width, tau_max));
+    }
+    if (tau <= 0.0f) return;
+
+    const size_t idx = static_cast<size_t>(k) * cfg.ny * cfg.nx + static_cast<size_t>(j) * cfg.nx + i;
+    const float q_cur = qv[idx];
+    const float q_tgt = fmaxf(0.0f, lbc_qv[idx]);
+    const float alpha = 1.0f - expf(-tau * dt_s);
+    qv[idx] = fmaxf(0.0f, q_cur + alpha * (q_tgt - q_cur));
 }
 
 inline int32_t advect_one_tracer(
@@ -2566,7 +2621,7 @@ uint64_t nh_cuda_estimate_vram_bytes_ex(
     // Dry core: 5 state + 5 backup + 5 rhs + 2 scratch (div, q_tmp) = 17 float32 + 2 float64 tridiag (4 float eq) = 21 float32 eq
     uint64_t float32_arrays = 21;
     if (has_moist) float32_arrays += 6;
-    if (has_lbc) float32_arrays += 4;
+    if (has_lbc) float32_arrays += (has_moist ? 5 : 4);
     if (has_iau) float32_arrays += 4;
     if (has_physics) float32_arrays += 1; // d_rad_dth_dt
     const uint64_t field_bytes = cells * float32_arrays * 4ULL;
@@ -2683,6 +2738,11 @@ NhCudaHandle* nh_cuda_create(
         CUDA_CHECK_PTR(cudaMemset(h->d_lbc_v, 0, h->n_v * sizeof(float)));
         CUDA_CHECK_PTR(cudaMemset(h->d_lbc_thp, 0, h->n_s * sizeof(float)));
         CUDA_CHECK_PTR(cudaMemset(h->d_lbc_pip, 0, h->n_s * sizeof(float)));
+        if (cfg->has_moist) {
+            CUDA_CHECK_PTR(cudaMalloc(&h->d_lbc_qv, h->n_s * sizeof(float)));
+            CUDA_CHECK_PTR(cudaMemset(h->d_lbc_qv, 0, h->n_s * sizeof(float)));
+        }
+        h->has_lbc_qv = 0;
     }
     if (cfg->has_iau) {
         CUDA_CHECK_PTR(cudaMalloc(&h->d_iau_u, h->n_u * sizeof(float)));
@@ -2714,7 +2774,7 @@ void nh_cuda_destroy(NhCudaHandle* h) {
     cf(h->d_u_n); cf(h->d_v_n); cf(h->d_w_n); cf(h->d_thp_n); cf(h->d_pip_n);
     cf(h->d_ru); cf(h->d_rv); cf(h->d_rw); cf(h->d_rth); cf(h->d_rpi);
     cf(h->d_div); cf(h->d_q_tmp); cf(h->d_tri_c); cf(h->d_tri_d); cf(h->d_max_u32);
-    cf(h->d_lbc_u); cf(h->d_lbc_v); cf(h->d_lbc_thp); cf(h->d_lbc_pip);
+    cf(h->d_lbc_u); cf(h->d_lbc_v); cf(h->d_lbc_thp); cf(h->d_lbc_pip); cf(h->d_lbc_qv);
     cf(h->d_iau_u); cf(h->d_iau_v); cf(h->d_iau_thp); cf(h->d_iau_pip);
     nh_physics_free_buffers(h);
     delete h;
@@ -2776,6 +2836,14 @@ int32_t nh_cuda_set_lbc_target(NhCudaHandle* h, const NhConstStatePtrs* target) 
     if (target->v)       CUDA_CHECK(cudaMemcpy(h->d_lbc_v, target->v, h->n_v * sizeof(float), cudaMemcpyHostToDevice));
     if (target->theta_p) CUDA_CHECK(cudaMemcpy(h->d_lbc_thp, target->theta_p, h->n_s * sizeof(float), cudaMemcpyHostToDevice));
     if (target->pi_p)    CUDA_CHECK(cudaMemcpy(h->d_lbc_pip, target->pi_p, h->n_s * sizeof(float), cudaMemcpyHostToDevice));
+    if (h->d_lbc_qv) {
+        if (target->qv) {
+            CUDA_CHECK(cudaMemcpy(h->d_lbc_qv, target->qv, h->n_s * sizeof(float), cudaMemcpyHostToDevice));
+            h->has_lbc_qv = 1;
+        } else {
+            h->has_lbc_qv = 0;
+        }
+    }
     return 0;
 }
 
@@ -3043,6 +3111,10 @@ int32_t nh_cuda_step_rk3(NhCudaHandle* h, double dt_s, int32_t n_substeps) {
         const float dt_h = static_cast<float>(dt_s / static_cast<double>(n_sub_h));
 
         if (advect_one_tracer(h, h->d_qv, dt_full_f, n_sub_h, dt_h, pi_sfc_f) != 0) return -1;
+        if ((h->cfg.bc_x == 2 || h->cfg.bc_y == 2) && h->d_lbc_qv && h->has_lbc_qv && h->cfg.lbc_tau_max_s > 0.0) {
+            nh_lbc_relax_qv_kernel<<<grid_s, block>>>(h->cfg, dt_full_f, h->d_lbc_qv, h->d_qv);
+            CUDA_CHECK(cudaGetLastError());
+        }
         if (advect_one_tracer(h, h->d_qc, dt_full_f, n_sub_h, dt_h, pi_sfc_f) != 0) return -1;
         if (advect_one_tracer(h, h->d_qr, dt_full_f, n_sub_h, dt_h, pi_sfc_f) != 0) return -1;
         if (advect_one_tracer(h, h->d_qi, dt_full_f, n_sub_h, dt_h, pi_sfc_f) != 0) return -1;

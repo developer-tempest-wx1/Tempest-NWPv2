@@ -369,7 +369,8 @@ struct NhCudaHandle {
     uint32_t *d_max_u32 = nullptr;
 
     // Optional LBC & IAU buffers
-    float *d_lbc_u = nullptr, *d_lbc_v = nullptr, *d_lbc_thp = nullptr, *d_lbc_pip = nullptr;
+    float *d_lbc_u = nullptr, *d_lbc_v = nullptr, *d_lbc_thp = nullptr, *d_lbc_pip = nullptr, *d_lbc_qv = nullptr;
+    int32_t has_lbc_qv = 0;
     float *d_iau_u = nullptr, *d_iau_v = nullptr, *d_iau_thp = nullptr, *d_iau_pip = nullptr;
 
     // Phase B2 GPU physics state & buffers (allocated lazily when physics enabled/uploaded)

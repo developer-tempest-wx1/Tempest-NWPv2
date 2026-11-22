@@ -194,13 +194,16 @@ def _lbc_dict_to_staggered(
         u_st, v_st = stagger_uv(u_raw, v_raw)
     else:
         u_st, v_st = u_raw, v_raw
-    return {
+    out = {
         "u": u_st.astype(np.float32),
         "v": v_st.astype(np.float32),
         "w": np.asarray(lbc_raw["w"], dtype=np.float32),
         "theta_p": np.asarray(lbc_raw["theta_p"], dtype=np.float32),
         "pi_p": np.asarray(lbc_raw["pi_p"], dtype=np.float32),
     }
+    if "qv" in lbc_raw:
+        out["qv"] = np.asarray(lbc_raw["qv"], dtype=np.float32)
+    return out
 
 
 def extract_ocean_surface_diag(oce_state: Dict[str, np.ndarray]) -> Dict[str, np.ndarray]:
@@ -607,7 +610,7 @@ def run_domain_forecast(
             if lbc_interpolator is not None:
                 init_lbc = _lbc_dict_to_staggered(lbc_interpolator.get_lbc_at_time(0.0), state_3d)
             else:
-                init_lbc = {k: state_3d[k].copy() for k in ("u", "v", "w", "theta_p", "pi_p")}
+                init_lbc = {k: state_3d[k].copy() for k in ("u", "v", "w", "theta_p", "pi_p", "qv") if k in state_3d}
             solver.set_lbc_target(init_lbc)
 
         iau_active = iau_forcing is not None and iau_duration_s > 0.0

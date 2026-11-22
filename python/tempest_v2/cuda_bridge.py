@@ -765,7 +765,7 @@ class NonHydrostaticGPUSolver:
         return state
 
     def _slice_tile_state(
-        self, src: Dict[str, np.ndarray], tile: _TileBox, *, moist: Optional[bool] = None
+        self, src: Dict[str, np.ndarray], tile: _TileBox, *, moist: Optional[bool] = None, include_qv: bool = False
     ) -> Dict[str, np.ndarray]:
         use_moist = self.has_moist if moist is None else bool(moist)
         out = {
@@ -778,6 +778,8 @@ class NonHydrostaticGPUSolver:
         if use_moist:
             for sp in self.SPECIES:
                 out[sp] = np.ascontiguousarray(src[sp][:, tile.pj0 : tile.pj1, tile.pi0 : tile.pi1], dtype=np.float32)
+        elif include_qv and "qv" in src:
+            out["qv"] = np.ascontiguousarray(src["qv"][:, tile.pj0 : tile.pj1, tile.pi0 : tile.pi1], dtype=np.float32)
         return out
 
     def _write_tile_interior(self, dst: Dict[str, np.ndarray], tile_state: Dict[str, np.ndarray], tile: _TileBox) -> None:
@@ -827,8 +829,9 @@ class NonHydrostaticGPUSolver:
         else:
             self._lbc_host = {k: np.ascontiguousarray(v, dtype=np.float32).copy() for k, v in target.items()}
             if self._tile_handles and (self.bc_x == 2 or self.bc_y == 2):
+                has_qv = "qv" in self._lbc_host
                 for h, tile in zip(self._tile_handles, self._tiles):
-                    lbc_slice = self._slice_tile_state(self._lbc_host, tile, moist=False)
+                    lbc_slice = self._slice_tile_state(self._lbc_host, tile, moist=False, include_qv=has_qv)
                     ptrs, kept = _pack_state_ptrs(lbc_slice, False)
                     self._raise_if_err(self.lib.nh_cuda_set_lbc_target(h, ctypes.byref(ptrs)), "tile set_lbc_target")
                     del kept
@@ -1196,7 +1199,9 @@ class NonHydrostaticGPUSolver:
                     del kept
 
                     if self._lbc_host is not None and (self.bc_x == 2 or self.bc_y == 2):
-                        lbc_slice = self._slice_tile_state(self._lbc_host, tile, moist=False)
+                        lbc_slice = self._slice_tile_state(
+                            self._lbc_host, tile, moist=False, include_qv=("qv" in self._lbc_host)
+                        )
                         lbc_ptrs, kept_l = _pack_state_ptrs(lbc_slice, False)
                         self._raise_if_err(self.lib.nh_cuda_set_lbc_target(h, ctypes.byref(lbc_ptrs)), "tile lbc")
                         del kept_l
