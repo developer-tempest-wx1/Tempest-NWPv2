@@ -284,6 +284,11 @@ def _regrid_latlon_field(
 _CFGRIB_CACHE: Dict[Tuple[str, float], Dict[str, Tuple[xr.DataArray, np.ndarray, np.ndarray]]] = {}
 
 
+def clear_cfgrib_cache() -> None:
+    """Release cached cfgrib DataArrays to reclaim host RAM after IC loading."""
+    _CFGRIB_CACHE.clear()
+
+
 def _read_cfgrib_var_map(grib_path: Path) -> Dict[str, Tuple[xr.DataArray, np.ndarray, np.ndarray]]:
     import warnings
     import cfgrib

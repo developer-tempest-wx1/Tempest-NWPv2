@@ -233,6 +233,7 @@ unsafe extern "C" {
         handle: *mut NhCudaHandle,
         ddt_state: *const NhConstStatePtrs,
     ) -> c_int;
+    pub fn nh_cuda_clear_iau_forcing(handle: *mut NhCudaHandle) -> c_int;
     pub fn nh_cuda_set_physics_config(handle: *mut NhCudaHandle, pcfg: *const NhPhysicsConfig) -> c_int;
     pub fn nh_cuda_set_surface_static(
         handle: *mut NhCudaHandle,

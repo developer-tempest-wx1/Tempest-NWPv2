@@ -250,6 +250,7 @@ int32_t nh_cuda_download_state(NhCudaHandle* handle, const NhStatePtrs* dst);
 
 int32_t nh_cuda_set_lbc_target(NhCudaHandle* handle, const NhConstStatePtrs* target);
 int32_t nh_cuda_set_iau_forcing(NhCudaHandle* handle, const NhConstStatePtrs* ddt_state);
+int32_t nh_cuda_clear_iau_forcing(NhCudaHandle* handle);
 
 /**
  * Configure, initialize, transfer, and execute Phase B2 GPU physics suite.

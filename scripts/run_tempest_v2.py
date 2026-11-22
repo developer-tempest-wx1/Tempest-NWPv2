@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 import datetime
+import gc
 import json
 import logging
 import sys
@@ -38,6 +39,7 @@ if str(PY_ROOT) not in sys.path:
 from tempest_v2.ic_builder import (  # noqa: E402
     aurora_wx1_to_ic,
     build_domain_static_fields,
+    clear_cfgrib_cache,
     ecmwf_grib_to_domain_state,
     load_tempest_restart_wx1,
 )
@@ -98,6 +100,12 @@ def main() -> None:
         "--quiet-steps",
         action="store_true",
         help="Suppress per-step CLI log lines (keep phase/output logs and tqdm bar)",
+    )
+    parser.add_argument(
+        "--mem-profile-every",
+        type=int,
+        default=0,
+        help="Optional diagnostic interval [steps] logging RSS, swap, VRAM, live np.ndarray count, and GPU telemetry (0 = off)",
     )
     args = parser.parse_args()
 
@@ -166,6 +174,7 @@ def main() -> None:
             osisaf_wx1_path=args.osisaf_wx1,
             show_progress=show_progress,
             log_steps=log_steps,
+            mem_profile_every=args.mem_profile_every,
         )
         printable = {
             "run_dir": str(summary.get("run_dir")),
@@ -213,6 +222,7 @@ def main() -> None:
             osisaf_wx1_path=args.osisaf_wx1,
             show_progress=show_progress,
             log_steps=log_steps,
+            mem_profile_every=args.mem_profile_every,
         )
         printable = {
             "run_dir": str(summary.get("run_dir")),
@@ -252,13 +262,25 @@ def main() -> None:
         obs_list, stn_rows = load_station_obs_wx1(obs_dir_eff, spec, valid_time_utc=init_dt)
         logger.info("[%s] Loaded %d DA observations across %d surface stations", spec.name, len(obs_list), len(stn_rows))
         if obs_list:
-            da_report["verify_bg"] = verify_against_stations(spec, state_3d, surf_state, hs_m, stn_rows)
+            st_bg = state_3d
+            da_report["verify_bg"] = verify_against_stations(spec, st_bg, surf_state, hs_m, stn_rows)
             use_iau = not (spec.is_spherical and spec.nz * spec.ny * spec.nx >= 50_000_000)
-            state_3d, surf_state, iau_f, vres = run_domain_3dvar(
-                spec, state_3d, surf_state, hs_m, sstatic["lsm"], obs_list, obs_dir=obs_dir_eff, compute_iau=use_iau
+            ana_st, surf_state, iau_f, vres = run_domain_3dvar(
+                spec, st_bg, surf_state, hs_m, sstatic["lsm"], obs_list, obs_dir=obs_dir_eff, compute_iau=use_iau
             )
             da_report["var3d"] = {"j0": vres.initial_cost_j0, "jf": vres.final_cost_j, "iters": vres.iterations}
-            da_report["verify_ana"] = verify_against_stations(spec, state_3d, surf_state, hs_m, stn_rows)
+            da_report["verify_ana"] = verify_against_stations(spec, ana_st, surf_state, hs_m, stn_rows)
+            if iau_f is not None:
+                # Bloom et al. (1996) IAU: start prognostic momentum/thermo from background so the increment is added once over the IAU window.
+                init_st = dict(ana_st)
+                for k_iau in ("u", "v", "theta_p", "pi_p"):
+                    init_st[k_iau] = st_bg[k_iau]
+                state_3d = init_st
+            else:
+                state_3d = ana_st
+            del ana_st, st_bg
+    clear_cfgrib_cache()
+    gc.collect()
 
     dt_s = {"d1": args.dt_d1, "d2": args.dt_d2, "d3": args.dt_d3}[args.mode]
     sched = forecast_output_schedule_hours(args.hours, ecmwf_schedule=args.ecmwf, hourly=True)
@@ -284,6 +306,7 @@ def main() -> None:
         include_3d_diagnostics=include_3d_diag,
         show_progress=show_progress,
         log_steps=log_steps,
+        mem_profile_every=args.mem_profile_every,
     )
     print(
         json.dumps(

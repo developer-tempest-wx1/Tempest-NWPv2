@@ -197,6 +197,8 @@ def load_cuda_library(lib_path: Optional[Path] = None) -> ctypes.CDLL:
     lib.nh_cuda_set_lbc_target.restype = ctypes.c_int32
     lib.nh_cuda_set_iau_forcing.argtypes = [ctypes.c_void_p, ctypes.POINTER(NhStatePtrsC)]
     lib.nh_cuda_set_iau_forcing.restype = ctypes.c_int32
+    lib.nh_cuda_clear_iau_forcing.argtypes = [ctypes.c_void_p]
+    lib.nh_cuda_clear_iau_forcing.restype = ctypes.c_int32
     lib.nh_cuda_set_physics_config.argtypes = [ctypes.c_void_p, ctypes.POINTER(NhPhysicsConfigC)]
     lib.nh_cuda_set_physics_config.restype = ctypes.c_int32
     lib.nh_cuda_set_surface_static.argtypes = [ctypes.c_void_p, ctypes.POINTER(NhSurfaceStaticPtrsC)]
@@ -534,6 +536,11 @@ class NonHydrostaticGPUSolver:
             if (self.is_spherical and self.bc_x == 1 and int(max_vram_bytes) == DEFAULT_MAX_VRAM_BYTES)
             else int(max_vram_bytes)
         )
+        try:
+            free_b, _ = cuda_vram_info()
+            eff_max_vram = min(eff_max_vram, max(512 * 1024 * 1024, int(free_b * 0.85)))
+        except Exception:
+            pass
         self.nt_y, self.nt_x, self.estimated_tile_vram_bytes = plan_horizontal_tiling(
             self.nz,
             self.ny,
@@ -837,6 +844,23 @@ class NonHydrostaticGPUSolver:
                     ptrs, kept = _pack_state_ptrs(iau_slice, False)
                     self._raise_if_err(self.lib.nh_cuda_set_iau_forcing(h, ctypes.byref(ptrs)), "tile set_iau_forcing")
                     del kept
+
+    def clear_iau_forcing(self) -> None:
+        """Disable IAU and free GPU/host IAU buffers once the IAU warm-up window ends."""
+        self._iau_host = None
+        self.has_iau = False
+        if getattr(self, "_handle", None):
+            self._raise_if_err(self.lib.nh_cuda_clear_iau_forcing(self._handle), "clear_iau_forcing")
+        if getattr(self, "_tile_handles", None):
+            for h in self._tile_handles:
+                if h:
+                    self._raise_if_err(self.lib.nh_cuda_clear_iau_forcing(h), "tile clear_iau_forcing")
+        if getattr(self, "_shape_tile_handles", None):
+            cleared: set[int] = set()
+            for h in self._shape_tile_handles.values():
+                if h and h not in cleared:
+                    self._raise_if_err(self.lib.nh_cuda_clear_iau_forcing(h), "shared clear_iau_forcing")
+                    cleared.add(h)
 
     def default_surface_static(
         self,

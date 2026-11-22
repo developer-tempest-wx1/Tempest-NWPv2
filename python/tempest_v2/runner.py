@@ -11,9 +11,11 @@ Features:
 from __future__ import annotations
 
 import datetime
+import gc
 import json
 import logging
 import math
+import subprocess
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -27,7 +29,7 @@ try:
 except ImportError:  # pragma: no cover - optional terminal progress bar
     _tqdm = None
 
-from tempest_v2.cuda_bridge import NonHydrostaticGPUSolver
+from tempest_v2.cuda_bridge import NonHydrostaticGPUSolver, cuda_vram_info
 from tempest_v2.diagnostics import (
     STANDARD_PLEV_PA,
     compute_pressure_level_fields,
@@ -36,6 +38,7 @@ from tempest_v2.diagnostics import (
 from tempest_v2.ic_builder import (
     aurora_wx1_to_ic,
     build_domain_static_fields,
+    clear_cfgrib_cache,
     ecmwf_grib_to_domain_state,
     load_tempest_restart_wx1,
     save_tempest_restart_wx1,
@@ -120,6 +123,65 @@ def forecast_output_schedule_hours(
             hours.append(m)
         return hours
     return [0.0, m] if m > 0.0 else [0.0]
+
+
+def _sample_mem_gpu_stats() -> Dict[str, Any]:
+    """Sample process RSS/Swap, live np.ndarray count, and CUDA VRAM/thermal telemetry."""
+    rss_mb = 0.0
+    swap_mb = 0.0
+    try:
+        with open("/proc/self/status", encoding="utf-8") as fh:
+            for line in fh:
+                if line.startswith("VmRSS:"):
+                    rss_mb = float(line.split()[1]) / 1024.0
+                elif line.startswith("VmSwap:"):
+                    swap_mb = float(line.split()[1]) / 1024.0
+    except OSError:
+        pass
+    vram_used_mib = 0
+    vram_total_mib = 0
+    try:
+        free_b, total_b = cuda_vram_info()
+        vram_used_mib = int((total_b - free_b) // (1024 * 1024))
+        vram_total_mib = int(total_b // (1024 * 1024))
+    except Exception:
+        pass
+    np_arrays = sum(1 for obj in gc.get_objects() if isinstance(obj, np.ndarray))
+    gpu_temp = float("nan")
+    gpu_clk = 0
+    gpu_pwr = float("nan")
+    gpu_thr = "n/a"
+    try:
+        out = subprocess.check_output(
+            [
+                "nvidia-smi",
+                "--query-gpu=temperature.gpu,clocks.sm,power.draw,clocks_throttle_reasons.active",
+                "--format=csv,noheader,nounits",
+            ],
+            stderr=subprocess.DEVNULL,
+            text=True,
+            timeout=2.0,
+        ).strip()
+        if out:
+            parts = [p.strip() for p in out.splitlines()[0].split(",")]
+            if len(parts) >= 4:
+                gpu_temp = float(parts[0])
+                gpu_clk = int(float(parts[1]))
+                gpu_pwr = float(parts[2])
+                gpu_thr = parts[3]
+    except Exception:
+        pass
+    return {
+        "rss_mb": rss_mb,
+        "swap_mb": swap_mb,
+        "vram_used_mib": vram_used_mib,
+        "vram_total_mib": vram_total_mib,
+        "np_arrays": np_arrays,
+        "gpu_temp_c": gpu_temp,
+        "gpu_clk_mhz": gpu_clk,
+        "gpu_pwr_w": gpu_pwr,
+        "gpu_thr": gpu_thr,
+    }
 
 
 def _lbc_dict_to_staggered(
@@ -438,6 +500,7 @@ def run_domain_forecast(
     include_3d_diagnostics: bool = True,
     show_progress: bool = True,
     log_steps: bool = True,
+    mem_profile_every: int = 0,
 ) -> Dict[str, Any]:
     """Integrate one nest on GPU with optional NEMO+SI3 coupling, Davies LBCs, IAU, WX-1 outputs & restart."""
     init_dt = (
@@ -665,6 +728,24 @@ def run_domain_forecast(
                     mode_tag,
                     step_elapsed,
                 )
+            if mem_profile_every > 0 and (s_cur == 1 or s_cur % mem_profile_every == 0 or s_cur == total_steps):
+                st_m = _sample_mem_gpu_stats()
+                logger.info(
+                    "[%s] [MEM] step=%d/%d | rss=%.1fMB | swap=%.1fMB | vram=%d/%dMiB | np_arrays=%d | gpu=%.1fC %dMHz %.1fW thr=%s | dt_step=%.2fs",
+                    spec.name,
+                    s_cur,
+                    total_steps,
+                    st_m["rss_mb"],
+                    st_m["swap_mb"],
+                    st_m["vram_used_mib"],
+                    st_m["vram_total_mib"],
+                    st_m["np_arrays"],
+                    st_m["gpu_temp_c"],
+                    st_m["gpu_clk_mhz"],
+                    st_m["gpu_pwr_w"],
+                    st_m["gpu_thr"],
+                    step_elapsed,
+                )
 
         def _handle_step_events(step_idx: int) -> None:
             nonlocal cur_state, cur_surf, cur_oce_state, iau_active
@@ -804,10 +885,11 @@ def run_domain_forecast(
                     logger.info("[%s] Saved cycle restart: %s", spec.name, rp.name)
 
             if iau_active and step_idx >= iau_off_step and step_idx < total_steps:
-                zero_iau = {k: np.zeros_like(v) for k, v in iau_forcing.items()}  # type: ignore[union-attr]
-                solver.set_iau_forcing(zero_iau)
+                solver.clear_iau_forcing()
+                iau_forcing = None
                 iau_active = False
-                logger.info("[%s] IAU warm-up completed at step %d (T+%05.2fh)", spec.name, step_idx, sim_sec / 3600.0)
+                gc.collect()
+                logger.info("[%s] IAU warm-up completed at step %d (T+%05.2fh); IAU buffers freed", spec.name, step_idx, sim_sec / 3600.0)
 
         _handle_step_events(0)
 
@@ -895,6 +977,7 @@ def run_domain_forecast(
         solver.close()
         if ocean_solver is not None:
             ocean_solver.close()
+        gc.collect()
 
 
 def _resolve_static(
@@ -1122,6 +1205,7 @@ def run_two_nest_pipeline(
     d3_static: Optional[Tuple[np.ndarray, Dict[str, np.ndarray]]] = None,
     show_progress: bool = True,
     log_steps: bool = True,
+    mem_profile_every: int = 0,
 ) -> Dict[str, Any]:
     """Run operational D2 (7.5 km Europe) -> WX-1 LBC -> D3 (1.5 km Benelux+DE) pipeline."""
     t0_pipe = time.perf_counter()
@@ -1131,20 +1215,10 @@ def run_two_nest_pipeline(
     hs_d2, ss_d2 = _resolve_static(d2_spec, d2_static)
     hs_d3, ss_d3 = _resolve_static(d3_spec, d3_static)
 
-    logger.info("[d3] Building initial conditions from %s...", ic_source)
-
-    st_d3, sf_d3, init_dt = _load_domain_ic(
-        d3_spec,
-        hs_d3,
-        ss_d3,
-        ic_source=ic_source,
-        restart_path=restart_path,
-        sfc_grib=sfc_grib,
-        pl_grib=pl_grib,
-        aurora_wx1_path=aurora_wx1_path,
-    )
-    assert init_dt is not None
-    st_d2, sf_d2, _ = _load_domain_ic(
+    # Sequential domain lifecycle: load D2 first and defer D3 until D2 finishes so two large 3D states never coexist in RAM.
+    logger.info("=== Phase 1/2: Europe D2 (%dx%dx%d) IC -> DA -> Forecast ===", d2_spec.nz, d2_spec.ny, d2_spec.nx)
+    t_ic2 = time.perf_counter()
+    st_d2, sf_d2, init_dt = _load_domain_ic(
         d2_spec,
         hs_d2,
         ss_d2,
@@ -1155,6 +1229,11 @@ def run_two_nest_pipeline(
         aurora_wx1_path=aurora_wx1_path,
         allow_zero_restart_fallback=True,
     )
+    if init_dt is None and restart_path is not None:
+        with wx1.open_dataset(restart_path) as rds:
+            init_dt = datetime.datetime.fromisoformat(str(rds.attrs["valid_time_utc"]).replace("Z", "+00:00"))
+    assert init_dt is not None
+    logger.info("[d2] Initial conditions ready in %.2fs (init=%s)", time.perf_counter() - t_ic2, init_dt.isoformat())
 
     layout: Optional[Dict[str, Path]] = None
     if run_dir is not None:
@@ -1187,11 +1266,12 @@ def run_two_nest_pipeline(
         manifest_path = None
 
     sched = forecast_output_schedule_hours(forecast_hours, ecmwf_schedule=ecmwf_schedule, hourly=True)
+    ens_dom_key = ensemble_domain.strip().lower()
 
-    logger.info("=== Phase 1/2: Europe D2 (%dx%dx%d) DA & Forecast ===", d2_spec.nz, d2_spec.ny, d2_spec.nx)
     st_d2, sf_d2, iau_d2, da_d2 = _run_d3_da(
         d2_spec, st_d2, sf_d2, hs_d2, ss_d2, init_dt, obs_dir, enable_da
     )
+    gc.collect()
 
     res_d2 = run_domain_forecast(
         d2_spec,
@@ -1221,12 +1301,37 @@ def run_two_nest_pipeline(
         include_3d_diagnostics=include_3d_diagnostics,
         show_progress=show_progress,
         log_steps=log_steps,
+        mem_profile_every=mem_profile_every,
     )
+    if not (int(ensemble_members) > 0 and ens_dom_key == "d2"):
+        del iau_d2
+        st_d2, sf_d2 = {}, {}
+        iau_d2 = None
+        if d2_spec.nz * d2_spec.ny * d2_spec.nx >= 10_000_000:
+            res_d2["state_3d"] = {}
+            res_d2["ocean_state"] = None
+        gc.collect()
+        logger.info("[d2] Freed host 3D state before loading D3.")
 
-    logger.info("=== Phase 2/2: Benelux+DE D3 (%dx%dx%d) DA & Forecast ===", d3_spec.nz, d3_spec.ny, d3_spec.nx)
+    logger.info("=== Phase 2/2: Benelux+DE D3 (%dx%dx%d) IC -> DA -> Forecast ===", d3_spec.nz, d3_spec.ny, d3_spec.nx)
+    t_ic3 = time.perf_counter()
+    st_d3, sf_d3, _ = _load_domain_ic(
+        d3_spec,
+        hs_d3,
+        ss_d3,
+        ic_source=ic_source,
+        restart_path=restart_path,
+        sfc_grib=sfc_grib,
+        pl_grib=pl_grib,
+        aurora_wx1_path=aurora_wx1_path,
+    )
+    clear_cfgrib_cache()
+    gc.collect()
+    logger.info("[d3] Initial conditions ready in %.2fs", time.perf_counter() - t_ic3)
     st_d3, sf_d3, iau_d3, da_metrics = _run_d3_da(
         d3_spec, st_d3, sf_d3, hs_d3, ss_d3, init_dt, obs_dir, enable_da
     )
+    gc.collect()
     if da_d2:
         da_metrics["d2"] = da_d2
 
@@ -1259,6 +1364,7 @@ def run_two_nest_pipeline(
         include_3d_diagnostics=include_3d_diagnostics,
         show_progress=show_progress,
         log_steps=log_steps,
+        mem_profile_every=mem_profile_every,
     )
 
     if enable_da and obs_dir is not None and da_metrics.get("verify_bg"):
@@ -1368,11 +1474,9 @@ def run_three_nest_pipeline(
     d3_static: Optional[Tuple[np.ndarray, Dict[str, np.ndarray]]] = None,
     show_progress: bool = True,
     log_steps: bool = True,
+    mem_profile_every: int = 0,
 ) -> Dict[str, Any]:
     """Run coupled global D1 (0.25 deg) -> regional D2 (7.5 km) -> D3 (1.5 km) pipeline with NEMO+SI3 & 3D diagnostics."""
-    import gc
-    from tempest_v2.ic_builder import _CFGRIB_CACHE
-
     t0_pipe = time.perf_counter()
     d1_hrs = max(float(forecast_hours), float(d1_forecast_hours)) if d1_forecast_hours is not None else float(forecast_hours)
     logger.info(
@@ -1464,6 +1568,7 @@ def run_three_nest_pipeline(
         include_3d_diagnostics=include_3d_diagnostics,
         show_progress=show_progress,
         log_steps=log_steps,
+        mem_profile_every=mem_profile_every,
     )
     del iau_d1
     if not (int(ensemble_members) > 0 and ens_dom_key == "d1"):
@@ -1522,6 +1627,7 @@ def run_three_nest_pipeline(
         include_3d_diagnostics=include_3d_diagnostics,
         show_progress=show_progress,
         log_steps=log_steps,
+        mem_profile_every=mem_profile_every,
     )
     del iau_d2
     if not (int(ensemble_members) > 0 and ens_dom_key == "d2"):
@@ -1545,7 +1651,7 @@ def run_three_nest_pipeline(
         pl_grib=pl_grib,
         aurora_wx1_path=aurora_wx1_path,
     )
-    _CFGRIB_CACHE.clear()
+    clear_cfgrib_cache()
     gc.collect()
     logger.info("[d3] Initial conditions ready in %.2fs", time.perf_counter() - t_ic3)
 
@@ -1587,6 +1693,7 @@ def run_three_nest_pipeline(
         include_3d_diagnostics=include_3d_diagnostics,
         show_progress=show_progress,
         log_steps=log_steps,
+        mem_profile_every=mem_profile_every,
     )
 
     if enable_da and obs_dir is not None and da_metrics.get("verify_bg"):

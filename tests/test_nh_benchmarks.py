@@ -523,3 +523,33 @@ def test_multi_tile_matches_untiled_exact() -> None:
     for key in sf_untiled:
         diff = float(np.max(np.abs(sf_tiled[key] - sf_untiled[key])))
         assert diff < 1e-6, f"Tiled surface field '{key}' diverged from untiled run: max_abs_diff={diff:.3e}"
+
+
+def test_clear_iau_forcing_frees_buffers_and_matches_zero() -> None:
+    """Verify clear_iau_forcing disables IAU cleanly and matches a zero-IAU continuation."""
+    nz, ny, nx = 12, 16, 16
+    vgrid = VerticalGrid(nz=nz, z_top_m=15_000.0, stretch_power=1.2)
+    hs = np.zeros((ny, nx), dtype=np.float64)
+
+    def _run_case(clear_after_init: bool) -> Dict[str, np.ndarray]:
+        solver = NonHydrostaticGPUSolver(
+            vgrid, 7500.0, 7500.0, hs, has_moist=True, has_physics=False, has_iau=clear_after_init
+        )
+        try:
+            st = solver.empty_state()
+            st["u"][:] = 5.0
+            st["qv"][:] = 0.005
+            solver.upload_state(st)
+            if clear_after_init:
+                iau = {k: np.full_like(st[k], 2.0e-3 if k == "theta_p" else 0.0) for k in ("u", "v", "w", "theta_p", "pi_p")}
+                solver.set_iau_forcing(iau)
+                solver.clear_iau_forcing()
+            solver.step_rk3(dt_s=10.0, n_steps=3)
+            return solver.download_state()
+        finally:
+            solver.close()
+
+    st_ref = _run_case(False)
+    st_clr = _run_case(True)
+    for key in ("u", "v", "w", "theta_p", "pi_p", "qv"):
+        assert np.max(np.abs(st_ref[key] - st_clr[key])) == 0.0, f"IAU clear mismatch on '{key}'"

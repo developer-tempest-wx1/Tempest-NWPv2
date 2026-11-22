@@ -2792,6 +2792,22 @@ int32_t nh_cuda_set_iau_forcing(NhCudaHandle* h, const NhConstStatePtrs* ddt_sta
     return 0;
 }
 
+int32_t nh_cuda_clear_iau_forcing(NhCudaHandle* h) {
+    if (!h) return -1;
+    auto cf = [](float*& p) {
+        if (p) {
+            cudaFree(p);
+            p = nullptr;
+        }
+    };
+    cf(h->d_iau_u);
+    cf(h->d_iau_v);
+    cf(h->d_iau_thp);
+    cf(h->d_iau_pip);
+    h->cfg.has_iau = 0;
+    return 0;
+}
+
 int32_t nh_cuda_rebind_tile_grid(
     NhCudaHandle* h,
     const NhGridConfig* cfg,
