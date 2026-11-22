@@ -93,6 +93,7 @@ pub struct NhPhysicsConfig {
     pub utc_seconds: f64,
     pub co2_ppm: f64,
     pub pbl_last: i32,
+    pub cy46_physics: i32,
 }
 
 impl Default for NhPhysicsConfig {
@@ -109,6 +110,7 @@ impl Default for NhPhysicsConfig {
             utc_seconds: 43_200.0,
             co2_ppm: 425.0,
             pbl_last: 0,
+            cy46_physics: 0,
         }
     }
 }

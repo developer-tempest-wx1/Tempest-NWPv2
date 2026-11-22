@@ -108,6 +108,12 @@ def main() -> None:
         help="IFS 50r1 physics ordering: execute vertical diffusion/PBL after moist microphysics",
     )
     parser.add_argument(
+        "--cy46-physics",
+        action="store_true",
+        default=False,
+        help="HARMONIE-AROME Cy46 physics: pressure CDNC profile (0.25x at k=0), Nielsen LW cloud optics, snow-melt f_sn>=0.25, XRIMAX=0.2",
+    )
+    parser.add_argument(
         "--mem-profile-every",
         type=int,
         default=0,
@@ -182,6 +188,7 @@ def main() -> None:
             log_steps=log_steps,
             mem_profile_every=args.mem_profile_every,
             pbl_last=args.pbl_last,
+            cy46_physics=args.cy46_physics,
         )
         printable = {
             "run_dir": str(summary.get("run_dir")),
@@ -231,6 +238,7 @@ def main() -> None:
             log_steps=log_steps,
             mem_profile_every=args.mem_profile_every,
             pbl_last=args.pbl_last,
+            cy46_physics=args.cy46_physics,
         )
         printable = {
             "run_dir": str(summary.get("run_dir")),
@@ -316,6 +324,7 @@ def main() -> None:
         log_steps=log_steps,
         mem_profile_every=args.mem_profile_every,
         pbl_last=args.pbl_last,
+        cy46_physics=args.cy46_physics,
     )
     print(
         json.dumps(

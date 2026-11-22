@@ -252,10 +252,38 @@ __device__ inline void sw_layer_optics(
     t_dir_diff = fminf(mu0_loc - r_dir, fmaxf(0.0f, t_dir_diff));
 }
 
+__device__ inline float cy46_cdnc_m3(float p_pa, int32_t k) {
+    // Gleeson et al. (2024) HARMONIE-AROME Cy46 Sec. 2.5.1: uniform land/sea linear profile, 0.25x at lowest level
+    float n = 250.0e6f * fminf(1.2f, fmaxf(0.05f, p_pa / 100000.0f));
+    if (k == 0) n *= 0.25f;
+    return n;
+}
+
+__device__ inline float nielsen_lw_kabs_si(int band, float re_um) {
+    // Gleeson et al. (2024) Sec. 2.1 Eq. 2 & Table 1 (verified RRTM bands 1,11,12,13; 6,7; 8,9,10)
+    // Converted from Fig. 4 absorptance units (m^2/g) to SI optical-depth units via / 1.66 * 1000
+    const float r = fminf(30.0f, fmaxf(4.0f, re_um));
+    const float r2 = r * r;
+    const float r3 = r2 * r;
+    float a, b, c, d, e, f, g;
+    if (band == 0) {
+        a = -2.405525e-2f; b = 9.130250e-4f; c = -1.828250e-5f; d = 1.461250e-7f;
+        e =  1.104675f;    f = -2.114500f;   g =  1.437475f;
+    } else if (band == 1) {
+        a =  7.896000e-2f; b = -4.226500e-3f; c =  9.795000e-5f; d = -8.370500e-7f;
+        e =  2.787000e-1f; f = -8.930000e-1f; g =  1.020100f;
+    } else {
+        a =  8.214000e-2f; b = -3.184000e-3f; c =  5.579667e-5f; d = -3.755000e-7f;
+        e =  1.165667e-2f; f = -1.327667e-1f; g =  1.124767e-1f;
+    }
+    const float n_m2g = a + b * r + c * r2 + d * r3 + (e + (f + g / r) / r) / r;
+    return fminf(200.0f, fmaxf(12.0f, (n_m2g / 1.66f) * 1000.0f));
+}
+
 __device__ inline void lw_layer_optics(
     int band, float p_pa, float t_k, float t_bot, float t_top, float dz, float rho,
     float qv, float qc, float qr, float qi, float qs,
-    float n_drop_m3, float co2_ppm,
+    float n_drop_m3, float co2_ppm, int use_cy46_lw,
     float& ref, float& trans, float& src_up, float& src_dn
 ) {
     const float dp = rho * GRAVITY_F * dz;
@@ -282,11 +310,20 @@ __device__ inline void lw_layer_optics(
         const float lwp = lwc * dz;
         const float re_um = fminf(40.0f, fmaxf(4.0f,
             1e6f * cbrtf(3.0f * lwc / (4.0f * PI_CONST_F * 1000.0f * 0.8f * fmaxf(n_drop_m3, 2e7f))) * 1.07f));
-        const float od_l = lwp * (90.0f + 280.0f / re_um);
         const float ssa_l = (band == 2) ? 0.30f : 0.18f;
-        od_abs += od_l * (1.0f - ssa_l);
-        od_sca += od_l * ssa_l;
-        g_sca += od_l * ssa_l * 0.72f;
+        float od_abs_l, od_sca_l;
+        if (use_cy46_lw != 0) {
+            const float k_abs_si = nielsen_lw_kabs_si(band, re_um);
+            od_abs_l = lwp * k_abs_si;
+            od_sca_l = od_abs_l * (ssa_l / (1.0f - ssa_l));
+        } else {
+            const float od_l = lwp * (90.0f + 280.0f / re_um);
+            od_abs_l = od_l * (1.0f - ssa_l);
+            od_sca_l = od_l * ssa_l;
+        }
+        od_abs += od_abs_l;
+        od_sca += od_sca_l;
+        g_sca += od_sca_l * 0.72f;
     }
     if (iwc > 1e-8f) {
         const float iwp = iwc * dz;
@@ -369,6 +406,7 @@ __global__ void nh_radiation_ecrad_kernel(
     const float alb0 = albedo_base ? albedo_base[col] : ((lsm_v >= 0.5f) ? 0.20f : 0.06f);
     const float n_drop = static_cast<float>((lsm_v >= 0.5f) ? pcfg.cloud_num_land : pcfg.cloud_num_sea);
     const float co2_ppm = static_cast<float>(pcfg.co2_ppm);
+    const int use_cy46 = (pcfg.cy46_physics != 0) ? 1 : 0;
 
     float alb_sfc = alb0;
     if (lsm_v >= 0.5f && snow_v > 0.0f) {
@@ -427,9 +465,10 @@ __global__ void nh_radiation_ecrad_kernel(
                 const float qs_v = (cfg.has_moist && qs) ? fmaxf(0.0f, qs[idx]) : 0.0f;
 
                 scratch_f[idx] = f_dir;
+                const float n_drop_k = use_cy46 ? cy46_cdnc_m3(p_k, k) : n_drop;
                 float r_d, t_d, r_dir, t_dd, t_dir;
                 sw_layer_optics(b, p_k, t_k, dz_k, rho, qv_v, qc_v, qr_v, qi_v, qs_v,
-                                n_drop, co2_ppm, mu0, r_d, t_d, r_dir, t_dd, t_dir);
+                                n_drop_k, co2_ppm, mu0, r_d, t_d, r_dir, t_dd, t_dir);
                 f_dir *= t_dir;
             }
             const float f_dir_sfc = f_dir;
@@ -448,9 +487,10 @@ __global__ void nh_radiation_ecrad_kernel(
                 const float qi_v = (cfg.has_moist && qi) ? fmaxf(0.0f, qi[idx]) : 0.0f;
                 const float qs_v = (cfg.has_moist && qs) ? fmaxf(0.0f, qs[idx]) : 0.0f;
 
+                const float n_drop_k = use_cy46 ? cy46_cdnc_m3(p_k, k) : n_drop;
                 float r_d, t_d, r_dir, t_dd, t_dir;
                 sw_layer_optics(b, p_k, t_k, dz_k, rho, qv_v, qc_v, qr_v, qi_v, qs_v,
-                                n_drop, co2_ppm, mu0, r_d, t_d, r_dir, t_dd, t_dir);
+                                n_drop_k, co2_ppm, mu0, r_d, t_d, r_dir, t_dd, t_dir);
                 const float f_dir_in = scratch_f[idx];
                 const float r_b = static_cast<float>(tri_c[static_cast<size_t>(k) * str3 + col]);
                 const float s_b = static_cast<float>(tri_d[static_cast<size_t>(k) * str3 + col]);
@@ -476,9 +516,10 @@ __global__ void nh_radiation_ecrad_kernel(
                 const float qi_v = (cfg.has_moist && qi) ? fmaxf(0.0f, qi[idx]) : 0.0f;
                 const float qs_v = (cfg.has_moist && qs) ? fmaxf(0.0f, qs[idx]) : 0.0f;
 
+                const float n_drop_k = use_cy46 ? cy46_cdnc_m3(p_k, k) : n_drop;
                 float r_d, t_d, r_dir, t_dd, t_dir;
                 sw_layer_optics(b, p_k, t_k, dz_k, rho, qv_v, qc_v, qr_v, qi_v, qs_v,
-                                n_drop, co2_ppm, mu0, r_d, t_d, r_dir, t_dd, t_dir);
+                                n_drop_k, co2_ppm, mu0, r_d, t_d, r_dir, t_dd, t_dir);
                 const float f_dir_in = scratch_f[idx];
                 const float r_b = static_cast<float>(tri_c[idx]);
                 const float s_b = static_cast<float>(tri_d[idx]);
@@ -523,9 +564,10 @@ __global__ void nh_radiation_ecrad_kernel(
             const float qi_v = (cfg.has_moist && qi) ? fmaxf(0.0f, qi[idx]) : 0.0f;
             const float qs_v = (cfg.has_moist && qs) ? fmaxf(0.0f, qs[idx]) : 0.0f;
 
+            const float n_drop_k = use_cy46 ? cy46_cdnc_m3(p_c, k) : n_drop;
             float r_d, t_d, s_up_k, s_dn_k;
             lw_layer_optics(b, p_c, t_c, t_bot_if, t_top_if, dz_c, rho_c,
-                            qv_v, qc_v, qr_v, qi_v, qs_v, n_drop, co2_ppm,
+                            qv_v, qc_v, qr_v, qi_v, qs_v, n_drop_k, co2_ppm, use_cy46,
                             r_d, t_d, s_up_k, s_dn_k);
 
             const float r_b = static_cast<float>(tri_c[idx]);
@@ -562,9 +604,10 @@ __global__ void nh_radiation_ecrad_kernel(
             const float qi_v = (cfg.has_moist && qi) ? fmaxf(0.0f, qi[idx]) : 0.0f;
             const float qs_v = (cfg.has_moist && qs) ? fmaxf(0.0f, qs[idx]) : 0.0f;
 
+            const float n_drop_k = use_cy46 ? cy46_cdnc_m3(p_c, k) : n_drop;
             float r_d, t_d, s_up_k, s_dn_k;
             lw_layer_optics(b, p_c, t_c, t_bot_if, t_top_if, dz_c, rho_c,
-                            qv_v, qc_v, qr_v, qi_v, qs_v, n_drop, co2_ppm,
+                            qv_v, qc_v, qr_v, qi_v, qs_v, n_drop_k, co2_ppm, use_cy46,
                             r_d, t_d, s_up_k, s_dn_k);
 
             const float r_b = static_cast<float>(tri_c[idx]);
@@ -647,11 +690,13 @@ __device__ inline float psih_jimenez(float zol) {
 
 __device__ inline void solve_mo_sfclayrev(
     float za, float u_spd, float thv_a, float thv_s,
-    float z0m, float z0h, float& ustar, float& zol_out, float& cm_out, float& ch_out
+    float z0m, float z0h, float& ustar, float& zol_out, float& cm_out, float& ch_out,
+    float ri_max = 1.0e6f
 ) {
     const float dthv = thv_a - thv_s;
     const float wspd = fmaxf(u_spd, 0.3f);
-    const float rib = GRAVITY_F * dthv * za / (fmaxf(0.5f * (thv_a + thv_s), 150.0f) * wspd * wspd);
+    const float rib_raw = GRAVITY_F * dthv * za / (fmaxf(0.5f * (thv_a + thv_s), 150.0f) * wspd * wspd);
+    const float rib = fminf(ri_max, rib_raw);
     const float ln_zm = logf(fmaxf(za / fmaxf(z0m, 1e-5f), 1.5f));
     const float ln_zh = logf(fmaxf(za / fmaxf(z0h, 1e-6f), 1.5f));
 
@@ -832,6 +877,7 @@ __global__ void nh_surface_and_lsm_kernel(
         t_sk_new = t_skin ? fminf(340.0f, fmaxf(210.0f, t_skin[col])) : ts_soil[0];
         if (t_sk_new <= 0.0f) t_sk_new = ts_soil[0];
 
+        const float land_ri_max = (pcfg.cy46_physics != 0) ? 0.2f : 1.0e6f;
         // 2-outer coupled (M-O <-> Newton skin balance) closure
         for (int outer = 0; outer < 2; ++outer) {
             const float th_sk = t_sk_new / pi_s;
@@ -839,7 +885,7 @@ __global__ void nh_surface_and_lsm_kernel(
             const float q_sk_est = qv_a + beta_ev * (q_sat_sk - qv_a);
             const float thv_a = th_a * (1.0f + EPS_V_F * qv_a);
             const float thv_s = th_sk * (1.0f + EPS_V_F * q_sk_est);
-            solve_mo_sfclayrev(za, wspd_eff, thv_a, thv_s, z0m_v, z0h_v, ustar_v, zol_v, cm_v, ch_v);
+            solve_mo_sfclayrev(za, wspd_eff, thv_a, thv_s, z0m_v, z0h_v, ustar_v, zol_v, cm_v, ch_v, land_ri_max);
 
             const float g_exch = ch_v * wspd_eff;
             const float beta_veg = 1.0f / (1.0f + g_exch * r_canopy);
@@ -874,7 +920,8 @@ __global__ void nh_surface_and_lsm_kernel(
             const float tf2 = T_FREEZE_F * T_FREEZE_F;
             const float e_avail = r_abs - emis * STEFAN_BOLTZMANN_F * tf2 * tf2 - h_flux - le_flux - g0_flux;
             if (e_avail > 0.0f) {
-                const float dm = fminf(swe, e_avail * dt_f / LF0_F);
+                const float f_melt = (pcfg.cy46_physics != 0) ? fmaxf(snow_cov, 0.25f) : 1.0f;
+                const float dm = fminf(swe, f_melt * e_avail * dt_f / LF0_F);
                 swe -= dm;
                 melt_mass = dm;
             }
@@ -1684,7 +1731,8 @@ __global__ void nh_microphysics_kernel(
         if (q[1] > 1e-7f) {
             const float l_c = rho * q[1];
             const float l_r = rho * q[2];
-            const float nc = fmaxf(n_drop, 2e7f);
+            const float n_drop_k = (pcfg.cy46_physics != 0) ? cy46_cdnc_m3(p_k, k) : n_drop;
+            const float nc = fmaxf(n_drop_k, 2e7f);
             const float x_c = l_c / nc;
             const float tau = fminf(0.99f, l_r / fmaxf(l_c + l_r, 1e-12f));
             const float tau68 = powf(tau, 0.68f);

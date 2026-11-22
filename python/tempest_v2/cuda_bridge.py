@@ -77,6 +77,7 @@ class NhPhysicsConfigC(ctypes.Structure):
         ("utc_seconds", ctypes.c_double),
         ("co2_ppm", ctypes.c_double),
         ("pbl_last", ctypes.c_int32),
+        ("cy46_physics", ctypes.c_int32),
     ]
 
 
@@ -937,6 +938,7 @@ class NonHydrostaticGPUSolver:
         utc_seconds: float = 43200.0,
         co2_ppm: float = 425.0,
         pbl_last: int = 0,
+        cy46_physics: int = 0,
     ) -> None:
         if config is None:
             config = NhPhysicsConfigC(
@@ -951,6 +953,7 @@ class NonHydrostaticGPUSolver:
                 utc_seconds=float(utc_seconds),
                 co2_ppm=float(co2_ppm),
                 pbl_last=int(pbl_last),
+                cy46_physics=int(cy46_physics),
             )
         self._pcfg = config
         if len(self._tiles) == 1:

@@ -502,6 +502,7 @@ def run_domain_forecast(
     log_steps: bool = True,
     mem_profile_every: int = 0,
     pbl_last: bool = False,
+    cy46_physics: bool = False,
 ) -> Dict[str, Any]:
     """Integrate one nest on GPU with optional NEMO+SI3 coupling, Davies LBCs, IAU, WX-1 outputs & restart."""
     init_dt = (
@@ -600,6 +601,7 @@ def run_domain_forecast(
             julian_day=doy,
             utc_seconds=utc_s,
             pbl_last=1 if pbl_last else 0,
+            cy46_physics=1 if cy46_physics else 0,
         )
         if has_parent_lbc:
             if lbc_interpolator is not None:
@@ -1209,6 +1211,7 @@ def run_two_nest_pipeline(
     log_steps: bool = True,
     mem_profile_every: int = 0,
     pbl_last: bool = False,
+    cy46_physics: bool = False,
 ) -> Dict[str, Any]:
     """Run operational D2 (7.5 km Europe) -> WX-1 LBC -> D3 (1.5 km Benelux+DE) pipeline."""
     t0_pipe = time.perf_counter()
@@ -1306,6 +1309,7 @@ def run_two_nest_pipeline(
         log_steps=log_steps,
         mem_profile_every=mem_profile_every,
         pbl_last=pbl_last,
+        cy46_physics=cy46_physics,
     )
     if not (int(ensemble_members) > 0 and ens_dom_key == "d2"):
         del iau_d2
@@ -1370,6 +1374,7 @@ def run_two_nest_pipeline(
         log_steps=log_steps,
         mem_profile_every=mem_profile_every,
         pbl_last=pbl_last,
+        cy46_physics=cy46_physics,
     )
 
     if enable_da and obs_dir is not None and da_metrics.get("verify_bg"):
@@ -1481,6 +1486,7 @@ def run_three_nest_pipeline(
     log_steps: bool = True,
     mem_profile_every: int = 0,
     pbl_last: bool = False,
+    cy46_physics: bool = False,
 ) -> Dict[str, Any]:
     """Run coupled global D1 (0.25 deg) -> regional D2 (7.5 km) -> D3 (1.5 km) pipeline with NEMO+SI3 & 3D diagnostics."""
     t0_pipe = time.perf_counter()
@@ -1576,6 +1582,7 @@ def run_three_nest_pipeline(
         log_steps=log_steps,
         mem_profile_every=mem_profile_every,
         pbl_last=pbl_last,
+        cy46_physics=cy46_physics,
     )
     del iau_d1
     if not (int(ensemble_members) > 0 and ens_dom_key == "d1"):
@@ -1636,6 +1643,7 @@ def run_three_nest_pipeline(
         log_steps=log_steps,
         mem_profile_every=mem_profile_every,
         pbl_last=pbl_last,
+        cy46_physics=cy46_physics,
     )
     del iau_d2
     if not (int(ensemble_members) > 0 and ens_dom_key == "d2"):
@@ -1703,6 +1711,7 @@ def run_three_nest_pipeline(
         log_steps=log_steps,
         mem_profile_every=mem_profile_every,
         pbl_last=pbl_last,
+        cy46_physics=cy46_physics,
     )
 
     if enable_da and obs_dir is not None and da_metrics.get("verify_bg"):

@@ -104,6 +104,7 @@ typedef struct NhPhysicsConfig {
     double utc_seconds;          /* UTC seconds since 00:00Z [s] */
     double co2_ppm;              /* CO2 volume mixing ratio [ppm], e.g. 425.0 */
     int32_t pbl_last;            /* 0 = default (PBL before microphysics), 1 = IFS 50r1 order (PBL last) */
+    int32_t cy46_physics;        /* 0 = default, 1 = HARMONIE Cy46 CDNC/Nielsen-LW/snow-melt/XRIMAX=0.2 */
 } NhPhysicsConfig;
 
 /**

@@ -620,3 +620,57 @@ def test_pbl_last_order_stability_and_default_unchanged() -> None:
         assert np.max(np.abs(outs[2]["qv"] - outs[0]["qv"])) > 1e-7
     finally:
         solver.close()
+
+
+def test_cy46_physics_lw_cdnc_snow_and_default_unchanged() -> None:
+    """Verify opt-in HARMONIE-Cy46 physics reduces optically thin fog LW optical depth and leaves default unchanged."""
+    nz, ny, nx = 24, 4, 4
+    vgrid = VerticalGrid(nz=nz, z_top_m=12_000.0, stretch_power=1.2)
+    hs = np.zeros((ny, nx), dtype=np.float64)
+    solver = NonHydrostaticGPUSolver(
+        vgrid,
+        dx_m=7500.0,
+        dy_m=7500.0,
+        hs_m=hs,
+        has_moist=True,
+        has_physics=True,
+    )
+    try:
+        sstatic = solver.default_surface_static()
+        fog_state = solver.empty_state()
+        fog_state["u"][:] = 4.0
+        fog_state["qv"][:] = 3.0e-3
+        fog_state["qc"][0:2] = 1.0e-4  # Optically thin surface fog where Nielsen+CDNC lower LW emissivity
+        fog_surf = solver.empty_surface_state()
+        fog_surf["snow_swe"].fill(0.5)
+        fog_surf["t_skin"].fill(273.5)
+
+        res_st = []
+        res_sf = []
+        for kw in ({}, {"cy46_physics": 0}, {"cy46_physics": 1}):
+            solver.upload_state(fog_state)
+            solver.set_surface_static(sstatic)
+            solver.upload_surface(fog_surf)
+            solver.set_physics_config(
+                enable_microphysics=1,
+                enable_pbl=1,
+                enable_radiation=1,
+                enable_surface=1,
+                rad_interval_s=0.0,
+                julian_day=326.0,
+                utc_seconds=0.0,
+                **kw,
+            )
+            solver.step_physics(dt_s=40.0, n_steps=3)
+            res_st.append(solver.download_state())
+            res_sf.append(solver.download_surface())
+
+        for sp in solver.SPECIES:
+            np.testing.assert_array_equal(res_st[0][sp], res_st[1][sp])
+            assert np.all(np.isfinite(res_st[2][sp]))
+            assert float(res_st[2][sp].min()) >= 0.0
+        np.testing.assert_array_equal(res_sf[0]["lw_down"], res_sf[1]["lw_down"])
+        assert np.all(np.isfinite(res_sf[2]["t2m"]))
+        assert float(res_sf[2]["lw_down"].mean()) < float(res_sf[0]["lw_down"].mean())
+    finally:
+        solver.close()
