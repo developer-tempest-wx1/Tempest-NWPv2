@@ -29,7 +29,12 @@ from typing import Any, Callable, Dict, Iterator, List, Optional, Sequence, Tupl
 from tempest_v2.notifier import notify_run_event
 from tempest_v2.projection import DomainSpec, get_domain_spec
 from tempest_v2.restart_validator import find_latest_valid_cycle_restart
-from tempest_v2.runner import create_run_layout, run_three_nest_pipeline, run_two_nest_pipeline
+from tempest_v2.runner import (
+    create_run_layout,
+    run_ecmwf_lbc_lam_pipeline,
+    run_three_nest_pipeline,
+    run_two_nest_pipeline,
+)
 
 logger = logging.getLogger("tempest_v2.daemon")
 
@@ -55,6 +60,13 @@ class DaemonConfig:
     physics_every: int = 5
     d1_domain: str = "d1_global_0p25"
     enable_d1: bool = False
+    lam_ecmwf_lbc: bool = False
+    lam_domain: str = "lam_bnl_ns_de_2p5km"
+    lam_lead_hours: float = 48.0
+    dt_lam_s: Optional[float] = None
+    lbc_resol: str = "auto"
+    lbc_interval_hours: float = 3.0
+    lbc_cache_dir: Optional[Path] = None
     ecmwf_schedule: bool = False
     pbl_last: bool = False
     cy46_physics: bool = False
@@ -211,6 +223,43 @@ def prune_old_runs(
     return removed
 
 
+def _ingest_cycle_obs_and_osisaf(
+    cfg: DaemonConfig,
+    layout: Dict[str, Path],
+    init_dt: datetime.datetime,
+    radar_spec: Optional[DomainSpec],
+    obs_fn: Optional[Callable[[Path, datetime.datetime], Optional[Path]]],
+) -> Tuple[Optional[Path], Optional[Path]]:
+    """Run operational obs/radar ingest for one daemon cycle and locate OSI-SAF sea-ice WX-1."""
+    obs_dir_used: Optional[Path] = None
+    if cfg.enable_da:
+        if obs_fn is not None:
+            obs_dir_used = obs_fn(layout["obs"], init_dt)
+        else:
+            from tempest_v2.download_all_observations import run_observation_ingest_pipeline
+
+            eff_radar = (radar_spec if radar_spec is not None else get_domain_spec("d3", nz=cfg.nz)) if cfg.enable_radar else None
+            obs_dir_used, _counts = run_observation_ingest_pipeline(
+                layout["obs"],
+                da_hours=6.0,
+                zulu_time=init_dt.strftime("%Y%m%d_%H%MZ"),
+                notify_topic=None,
+                include_sondehub=True,
+                spec_for_radar=eff_radar,
+            )
+
+    osisaf_path: Optional[Path] = None
+    if obs_dir_used is not None and Path(obs_dir_used).is_dir():
+        main_osi = sorted(Path(obs_dir_used).rglob("osi_saf_sea_ice.wx1"))
+        if main_osi:
+            osisaf_path = main_osi[-1]
+        else:
+            osisaf_matches = sorted(Path(obs_dir_used).rglob("osisaf*.wx1"))
+            if osisaf_matches:
+                osisaf_path = osisaf_matches[-1]
+    return obs_dir_used, osisaf_path
+
+
 def run_single_cycle(
     cfg: DaemonConfig,
     init_time_utc: datetime.datetime,
@@ -230,170 +279,229 @@ def run_single_cycle(
     run_dir = layout["run_dir"]
     run_id = run_dir.name
 
-    d1_spec_eff = d1_spec if d1_spec is not None else (
-        get_domain_spec(cfg.d1_domain, nz=cfg.nz) if (cfg.enable_d1 and pipeline_fn is None) else None
-    )
-    d1_name = d1_spec_eff.name if d1_spec_eff is not None else cfg.d1_domain
-    d2_name = d2_spec.name if d2_spec is not None else "d2_eu_lcc"
-    d3_name = d3_spec.name if d3_spec is not None else "d3_nl_2p5km"
-    d1_shape = (int(d1_spec_eff.nz), int(d1_spec_eff.ny), int(d1_spec_eff.nx)) if d1_spec_eff is not None else None
-    d2_shape = (int(d2_spec.nz), int(d2_spec.ny), int(d2_spec.nx)) if d2_spec is not None else None
-    d3_shape = (int(d3_spec.nz), int(d3_spec.ny), int(d3_spec.nx)) if d3_spec is not None else None
-
-    # 1. Discover valid warm-start restarts from prior cycles' `restarts/` directories
-    d3_restart = find_latest_valid_cycle_restart(
-        cfg.runs_root,
-        d3_name,
-        init_dt,
-        max_age_hours=cfg.restart_max_age_hours,
-        expected_shape=d3_shape,
-        exact_valid_match=True,
-    )
-    d2_restart = find_latest_valid_cycle_restart(
-        cfg.runs_root,
-        d2_name,
-        init_dt,
-        max_age_hours=cfg.restart_max_age_hours,
-        expected_shape=d2_shape,
-        exact_valid_match=True,
-    )
-    d1_restart: Optional[Path] = None
-    if cfg.enable_d1 and pipeline_fn is None:
-        d1_restart = find_latest_valid_cycle_restart(
-            cfg.runs_root,
-            d1_name,
-            init_dt,
-            max_age_hours=cfg.restart_max_age_hours,
-            expected_shape=d1_shape,
-            exact_valid_match=True,
-        )
-
     sfc_grib: Optional[Path] = None
     pl_grib: Optional[Path] = None
-    warm_ok = (d3_restart is not None) and (
-        pipeline_fn is not None or (d2_restart is not None and ((not cfg.enable_d1) or (d1_restart is not None)))
-    )
-    if warm_ok:
-        ic_source = "restart"
-        logger.info("[%s] Warm-starting cycle from %s (d2=%s, d1=%s)", run_id, d3_restart, d2_restart, d1_restart)
-    else:
-        ic_source = "ecmwf"
-        logger.info("[%s] Cold-starting cycle via ECMWF step-0 analysis", run_id)
-        if ic_fn is not None:
-            sfc_grib, pl_grib = ic_fn(layout["config"], init_dt)
-        else:
-            from tempest_v2.ingest_ecmwf import download_ecmwf_cold_start
+    d1_restart: Optional[Path] = None
+    d2_restart: Optional[Path] = None
+    d3_restart: Optional[Path] = None
 
-            raw_ecmwf_dir = layout["config"] / "raw_ecmwf"
-            if init_dt.hour in (0, 6, 12, 18):
+    if cfg.lam_ecmwf_lbc and pipeline_fn is None:
+        lam_spec = d3_spec if d3_spec is not None else get_domain_spec(cfg.lam_domain, nz=cfg.nz)
+        lam_shape = (int(lam_spec.nz), int(lam_spec.ny), int(lam_spec.nx))
+        d3_restart = find_latest_valid_cycle_restart(
+            cfg.runs_root,
+            lam_spec.name,
+            init_dt,
+            max_age_hours=cfg.restart_max_age_hours,
+            expected_shape=lam_shape,
+            exact_valid_match=True,
+        )
+        lam_ocean_restart: Optional[Path] = None
+        if d3_restart is not None:
+            ic_source = "restart"
+            import wx1 as _wx1
+
+            oce_cands: List[Path] = []
+            if f"{lam_spec.name}_cycle_" in d3_restart.name:
+                oce_cands.append(
+                    d3_restart.with_name(
+                        d3_restart.name.replace(f"{lam_spec.name}_cycle_", f"{lam_spec.name}_ocean_cycle_")
+                    )
+                )
+            oce_cands.extend(sorted(d3_restart.parent.glob(f"{lam_spec.name}_ocean_cycle_*.wx1")))
+            final_oce = d3_restart.parent.parent / "ocean" / f"restart_ocean_{lam_spec.name}.wx1"
+            if final_oce.is_file():
+                oce_cands.append(final_oce)
+            for cand_oce in oce_cands:
+                if cand_oce == d3_restart or not cand_oce.is_file():
+                    continue
                 try:
+                    with _wx1.open_dataset(cand_oce) as ods:
+                        if ods.attrs.get("kind") != "tempest_v2_ocean_si3_restart":
+                            continue
+                        ov_raw = str(ods.attrs.get("valid_time_utc", "")).strip()
+                        if not ov_raw:
+                            continue
+                        ov_dt = _to_utc(datetime.datetime.fromisoformat(ov_raw.replace("Z", "+00:00")))
+                        if abs((init_dt - ov_dt).total_seconds()) <= 60.0 and "temp_k" in ods:
+                            lam_ocean_restart = cand_oce
+                            break
+                except Exception:
+                    continue
+            logger.info("[%s] Warm-starting LAM cycle from %s (ocean=%s)", run_id, d3_restart, lam_ocean_restart)
+        else:
+            ic_source = "ecmwf"
+            if ic_fn is not None:
+                sfc_grib, pl_grib = ic_fn(layout["config"], init_dt)
+            logger.info("[%s] Cold-starting LAM (%s) via shifted ECMWF LBC scheduler", run_id, lam_spec.name)
+
+        obs_dir_used, osisaf_path = _ingest_cycle_obs_and_osisaf(cfg, layout, init_dt, lam_spec, obs_fn)
+        if cfg.enable_notifier:
+            notify_run_event("start", run_id, cfg.lam_lead_hours, 0.0, output_dir=run_dir, ntfy_topic=cfg.notify_topic)
+
+        pipe_res = run_ecmwf_lbc_lam_pipeline(
+            lam_spec=lam_spec,
+            forecast_hours=cfg.lam_lead_hours,
+            nz=cfg.nz,
+            init_time_utc=init_dt,
+            ic_source=ic_source,
+            sfc_grib=sfc_grib,
+            pl_grib=pl_grib,
+            restart_path=d3_restart,
+            obs_dir=obs_dir_used,
+            run_dir=run_dir,
+            cycle_restart_hours=cfg.cycle_restart_hours,
+            ensemble_members=cfg.ensemble_members,
+            ensemble_lead_hours=cfg.ensemble_lead_hours,
+            ensemble_seed=cfg.ensemble_seed,
+            ecmwf_schedule=cfg.ecmwf_schedule,
+            pbl_last=cfg.pbl_last,
+            cy46_physics=cfg.cy46_physics,
+            enable_da=cfg.enable_da,
+            dt_s=cfg.dt_lam_s,
+            physics_every=(cfg.physics_every if cfg.physics_every != 5 else None),
+            lbc_resol=cfg.lbc_resol,
+            lbc_interval_hours=cfg.lbc_interval_hours,
+            lbc_cache_dir=cfg.lbc_cache_dir or (cfg.runs_root / "ecmwf_lbc_cache"),
+            download_lbc=(ic_fn is None),
+            enable_ocean_si3=cfg.enable_ocean_si3,
+            include_3d_diagnostics=cfg.include_3d_diagnostics,
+            osisaf_wx1_path=osisaf_path,
+            ocean_restart_in=lam_ocean_restart,
+        )
+        lead_notify_h = cfg.lam_lead_hours
+    else:
+        d1_spec_eff = d1_spec if d1_spec is not None else (
+            get_domain_spec(cfg.d1_domain, nz=cfg.nz) if (cfg.enable_d1 and pipeline_fn is None) else None
+        )
+        d1_name = d1_spec_eff.name if d1_spec_eff is not None else cfg.d1_domain
+        d2_name = d2_spec.name if d2_spec is not None else "d2_eu_lcc"
+        d3_name = d3_spec.name if d3_spec is not None else "d3_nl_2p5km"
+        d1_shape = (int(d1_spec_eff.nz), int(d1_spec_eff.ny), int(d1_spec_eff.nx)) if d1_spec_eff is not None else None
+        d2_shape = (int(d2_spec.nz), int(d2_spec.ny), int(d2_spec.nx)) if d2_spec is not None else None
+        d3_shape = (int(d3_spec.nz), int(d3_spec.ny), int(d3_spec.nx)) if d3_spec is not None else None
+
+        # 1. Discover valid warm-start restarts from prior cycles' `restarts/` directories
+        d3_restart = find_latest_valid_cycle_restart(
+            cfg.runs_root,
+            d3_name,
+            init_dt,
+            max_age_hours=cfg.restart_max_age_hours,
+            expected_shape=d3_shape,
+            exact_valid_match=True,
+        )
+        d2_restart = find_latest_valid_cycle_restart(
+            cfg.runs_root,
+            d2_name,
+            init_dt,
+            max_age_hours=cfg.restart_max_age_hours,
+            expected_shape=d2_shape,
+            exact_valid_match=True,
+        )
+        if cfg.enable_d1 and pipeline_fn is None:
+            d1_restart = find_latest_valid_cycle_restart(
+                cfg.runs_root,
+                d1_name,
+                init_dt,
+                max_age_hours=cfg.restart_max_age_hours,
+                expected_shape=d1_shape,
+                exact_valid_match=True,
+            )
+
+        warm_ok = (d3_restart is not None) and (
+            pipeline_fn is not None or (d2_restart is not None and ((not cfg.enable_d1) or (d1_restart is not None)))
+        )
+        if warm_ok:
+            ic_source = "restart"
+            logger.info("[%s] Warm-starting cycle from %s (d2=%s, d1=%s)", run_id, d3_restart, d2_restart, d1_restart)
+        else:
+            ic_source = "ecmwf"
+            logger.info("[%s] Cold-starting cycle via ECMWF step-0 analysis", run_id)
+            if ic_fn is not None:
+                sfc_grib, pl_grib = ic_fn(layout["config"], init_dt)
+            else:
+                from tempest_v2.ingest_ecmwf import download_ecmwf_cold_start
+
+                raw_ecmwf_dir = layout["config"] / "raw_ecmwf"
+                if init_dt.hour in (0, 6, 12, 18):
+                    try:
+                        sfc_grib, pl_grib, _ = download_ecmwf_cold_start(
+                            step=0,
+                            prefer_0p1=False,
+                            output_dir=raw_ecmwf_dir,
+                            run_date=init_dt.strftime("%Y-%m-%d"),
+                            run_time=init_dt.hour,
+                        )
+                    except Exception as exc:
+                        logger.warning(
+                            "[%s] ECMWF cycle %s not available yet (%s); falling back to latest published ECMWF step-0 analysis.",
+                            run_id,
+                            init_dt.strftime("%Y-%m-%d %HZ"),
+                            exc,
+                        )
+                if sfc_grib is None or pl_grib is None:
                     sfc_grib, pl_grib, _ = download_ecmwf_cold_start(
                         step=0,
                         prefer_0p1=False,
                         output_dir=raw_ecmwf_dir,
-                        run_date=init_dt.strftime("%Y-%m-%d"),
-                        run_time=init_dt.hour,
                     )
-                except Exception as exc:
-                    logger.warning(
-                        "[%s] ECMWF cycle %s not available yet (%s); falling back to latest published ECMWF step-0 analysis.",
-                        run_id,
-                        init_dt.strftime("%Y-%m-%d %HZ"),
-                        exc,
-                    )
-            if sfc_grib is None or pl_grib is None:
-                sfc_grib, pl_grib, _ = download_ecmwf_cold_start(
-                    step=0,
-                    prefer_0p1=False,
-                    output_dir=raw_ecmwf_dir,
-                )
 
-    # 2. Observation & Radar QPE ingest into isolated cycle obs/ directory
-    obs_dir_used: Optional[Path] = None
-    if cfg.enable_da:
-        if obs_fn is not None:
-            obs_dir_used = obs_fn(layout["obs"], init_dt)
-        else:
-            from tempest_v2.download_all_observations import run_observation_ingest_pipeline
-
-            radar_spec = None
-            if cfg.enable_radar:
-                radar_spec = d3_spec if d3_spec is not None else get_domain_spec("d3", nz=cfg.nz)
-            run_obs_dir, _counts = run_observation_ingest_pipeline(
-                layout["obs"],
-                da_hours=6.0,
-                zulu_time=init_dt.strftime("%Y%m%d_%H%MZ"),
-                notify_topic=None,
-                include_sondehub=True,
-                spec_for_radar=radar_spec,
+        obs_dir_used, osisaf_path = _ingest_cycle_obs_and_osisaf(cfg, layout, init_dt, d3_spec, obs_fn)
+        if cfg.enable_notifier:
+            notify_run_event(
+                "start",
+                run_id,
+                cfg.d3_lead_hours,
+                0.0,
+                output_dir=run_dir,
+                ntfy_topic=cfg.notify_topic,
             )
-            obs_dir_used = run_obs_dir
 
-    osisaf_path: Optional[Path] = None
-    if obs_dir_used is not None and Path(obs_dir_used).is_dir():
-        main_osi = sorted(Path(obs_dir_used).rglob("osi_saf_sea_ice.wx1"))
-        if main_osi:
-            osisaf_path = main_osi[-1]
+        common_kwargs: Dict[str, Any] = {
+            "forecast_hours": cfg.d3_lead_hours,
+            "nz": cfg.nz,
+            "ic_source": ic_source,
+            "sfc_grib": sfc_grib,
+            "pl_grib": pl_grib,
+            "restart_path": d3_restart,
+            "d2_restart_path": d2_restart,
+            "obs_dir": obs_dir_used,
+            "run_dir": run_dir,
+            "cycle_restart_hours": cfg.cycle_restart_hours,
+            "ensemble_members": cfg.ensemble_members,
+            "ensemble_lead_hours": cfg.ensemble_lead_hours,
+            "ensemble_seed": cfg.ensemble_seed,
+            "d2_spec": d2_spec,
+            "d3_spec": d3_spec,
+            "ecmwf_schedule": cfg.ecmwf_schedule,
+            "pbl_last": cfg.pbl_last,
+            "cy46_physics": cfg.cy46_physics,
+            "enable_da": cfg.enable_da,
+            "dt_d2_s": cfg.dt_d2_s,
+            "dt_d3_s": cfg.dt_d3_s,
+            "physics_every": cfg.physics_every,
+        }
+        if pipeline_fn is not None:
+            pipe_res = pipeline_fn(**common_kwargs)
+        elif cfg.enable_d1:
+            pipe_res = run_three_nest_pipeline(
+                **common_kwargs,
+                d1_forecast_hours=cfg.d1_lead_hours,
+                d1_spec=d1_spec_eff,
+                d1_restart_path=d1_restart,
+                dt_d1_s=cfg.dt_d1_s,
+                enable_ocean_si3=cfg.enable_ocean_si3,
+                include_3d_diagnostics=cfg.include_3d_diagnostics,
+                osisaf_wx1_path=osisaf_path,
+            )
         else:
-            osisaf_matches = sorted(Path(obs_dir_used).rglob("osisaf*.wx1"))
-            if osisaf_matches:
-                osisaf_path = osisaf_matches[-1]
-
-    # 3. Execute operational 2-nest (D2->D3) or 3-nest (D1->D2->D3) + optional ensemble inside `layout["run_dir"]`
-    if cfg.enable_notifier:
-        notify_run_event(
-            "start",
-            run_id,
-            cfg.d3_lead_hours,
-            0.0,
-            output_dir=run_dir,
-            ntfy_topic=cfg.notify_topic,
-        )
-
-    common_kwargs: Dict[str, Any] = {
-        "forecast_hours": cfg.d3_lead_hours,
-        "nz": cfg.nz,
-        "ic_source": ic_source,
-        "sfc_grib": sfc_grib,
-        "pl_grib": pl_grib,
-        "restart_path": d3_restart,
-        "d2_restart_path": d2_restart,
-        "obs_dir": obs_dir_used,
-        "run_dir": run_dir,
-        "cycle_restart_hours": cfg.cycle_restart_hours,
-        "ensemble_members": cfg.ensemble_members,
-        "ensemble_lead_hours": cfg.ensemble_lead_hours,
-        "ensemble_seed": cfg.ensemble_seed,
-        "d2_spec": d2_spec,
-        "d3_spec": d3_spec,
-        "ecmwf_schedule": cfg.ecmwf_schedule,
-        "pbl_last": cfg.pbl_last,
-        "cy46_physics": cfg.cy46_physics,
-        "enable_da": cfg.enable_da,
-        "dt_d2_s": cfg.dt_d2_s,
-        "dt_d3_s": cfg.dt_d3_s,
-        "physics_every": cfg.physics_every,
-    }
-    if pipeline_fn is not None:
-        pipe_res = pipeline_fn(**common_kwargs)
-    elif cfg.enable_d1:
-        pipe_res = run_three_nest_pipeline(
-            **common_kwargs,
-            d1_forecast_hours=cfg.d1_lead_hours,
-            d1_spec=d1_spec_eff,
-            d1_restart_path=d1_restart,
-            dt_d1_s=cfg.dt_d1_s,
-            enable_ocean_si3=cfg.enable_ocean_si3,
-            include_3d_diagnostics=cfg.include_3d_diagnostics,
-            osisaf_wx1_path=osisaf_path,
-        )
-    else:
-        pipe_res = run_two_nest_pipeline(
-            **common_kwargs,
-            enable_ocean_si3=cfg.enable_ocean_si3,
-            include_3d_diagnostics=cfg.include_3d_diagnostics,
-            osisaf_wx1_path=osisaf_path,
-        )
+            pipe_res = run_two_nest_pipeline(
+                **common_kwargs,
+                enable_ocean_si3=cfg.enable_ocean_si3,
+                include_3d_diagnostics=cfg.include_3d_diagnostics,
+                osisaf_wx1_path=osisaf_path,
+            )
+        lead_notify_h = cfg.d3_lead_hours
 
     latest_link = update_latest_symlink(cfg.runs_root, run_dir)
     pruned = prune_old_runs(cfg.runs_root, cfg.keep_runs, protected_dirs=[run_dir])
@@ -419,7 +527,7 @@ def run_single_cycle(
         notify_run_event(
             "success",
             run_id,
-            cfg.d3_lead_hours,
+            lead_notify_h,
             elapsed_s,
             metrics=pipe_res.get("da") if isinstance(pipe_res, dict) else None,
             output_dir=run_dir,

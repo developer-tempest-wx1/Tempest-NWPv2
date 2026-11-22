@@ -37,11 +37,18 @@ DOMAIN_GEOMETRIES: Dict[str, Tuple[int, int]] = {
     "d1_0p5": (361, 720),
     "global05": (361, 720),
     "global025": (721, 1440),
-    # D2 Europe 0.1°
+    # Standalone & V2 LCC domains
+    "lam_bnl_ns_de_2p5km": (432, 432),
+    "lam_eu_5km": (480, 560),
+    "d3_nl_2p5km": (216, 216),
+    "d3_benelux_de_2p5km": (432, 432),
+    "d3_benelux_de_1p5km": (720, 720),
+    "d2_eu_lcc": (400, 520),
+    # D2 Europe 0.1° (legacy)
     "d2_europe": (421, 701),
     "d2_europe_0p1": (421, 701),
     "europe01": (421, 701),
-    # D3 Benelux 2.5 km
+    # D3 Benelux 2.5 km (legacy)
     "benelux": (420, 360),
     "d3_benelux": (420, 360),
     "d3_benelux_2p5km": (420, 360),
@@ -50,8 +57,20 @@ DOMAIN_GEOMETRIES: Dict[str, Tuple[int, int]] = {
 
 
 def normalize_domain_name(domain: str) -> str:
-    """Normalize names without collapsing global 0.25° into D1 0.4°."""
+    """Normalize names without collapsing distinct V2 LCC or global grids into legacy defaults."""
     d = str(domain).strip().lower().replace("-", "_")
+    if d in {"lam_bnl_ns_de_2p5km", "lam_bnl", "lam_bnl_2p5km", "bnl_ns_de_2p5km", "d3_nw", "d3_nw_2p5km"}:
+        return "lam_bnl_ns_de_2p5km"
+    if d in {"lam_eu_5km", "lam_eu", "lam_europe_5km", "eu_5km", "europe_5km"}:
+        return "lam_eu_5km"
+    if d in {"d3_nl_2p5km", "d3_nl", "nl_2p5km"}:
+        return "d3_nl_2p5km"
+    if d in {"d3_benelux_de_2p5km", "benelux_de_2p5km"}:
+        return "d3_benelux_de_2p5km"
+    if d in {"d3_benelux_de_1p5km", "d3_benelux_1p5km", "d3_1p5km"}:
+        return "d3_benelux_de_1p5km"
+    if d in {"d2_eu_lcc", "d2_europe_7p5km"}:
+        return "d2_eu_lcc"
     if d in {"d1_global_0p25", "global025", "global_025", "global_0p25", "global0p25"}:
         return "d1_global_0p25"
     if d in {"d1_global_0p5", "d1_0p5", "global05", "global_05", "global_0p5", "global0p5"}:

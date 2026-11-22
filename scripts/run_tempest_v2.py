@@ -46,10 +46,15 @@ from tempest_v2.ic_builder import (  # noqa: E402
 from tempest_v2.ingest_dwd_poi import ingest_dwd_poi_observations  # noqa: E402
 from tempest_v2.ingest_ecmwf import download_ecmwf_cold_start  # noqa: E402
 from tempest_v2.ingest_knmi_observations import ingest_knmi_observations  # noqa: E402
-from tempest_v2.projection import D1_DOMAIN_DEFAULT_DT_S, get_domain_spec  # noqa: E402
+from tempest_v2.projection import (  # noqa: E402
+    D1_DOMAIN_DEFAULT_DT_S,
+    LAM_DOMAIN_DEFAULT_DT_S,
+    get_domain_spec,
+)
 from tempest_v2.runner import (  # noqa: E402
     forecast_output_schedule_hours,
     run_domain_forecast,
+    run_ecmwf_lbc_lam_pipeline,
     run_three_nest_pipeline,
     run_two_nest_pipeline,
 )
@@ -64,7 +69,49 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description="Tempest-NWP v2 — Classical GPU Non-Hydrostatic NWP (0% AI / 0% ML)"
     )
-    parser.add_argument("--mode", choices=["d1_to_d2_to_d3", "d2_to_d3", "d3", "d3_benelux_2p5km", "d3_1p5km", "d2", "d1"], default="d2_to_d3")
+    parser.add_argument(
+        "--mode",
+        choices=[
+            "d1_to_d2_to_d3",
+            "d2_to_d3",
+            "lam_ecmwf_lbc",
+            "lam_bnl_ns_de_2p5km",
+            "lam_eu_5km",
+            "d3",
+            "d3_benelux_2p5km",
+            "d3_1p5km",
+            "d2",
+            "d1",
+        ],
+        default="d2_to_d3",
+    )
+    parser.add_argument(
+        "--lam-domain",
+        choices=list(LAM_DOMAIN_DEFAULT_DT_S),
+        default="lam_bnl_ns_de_2p5km",
+        help="Target LAM domain for --mode lam_ecmwf_lbc",
+    )
+    parser.add_argument(
+        "--lbc-resol",
+        choices=["auto", "0p1", "0p25"],
+        default="auto",
+        help="ECMWF Open Data resolution for --mode lam_ecmwf_lbc (auto = 0p1 with 0p25 fallback)",
+    )
+    parser.add_argument(
+        "--lbc-interval-hours",
+        type=float,
+        default=3.0,
+        help="ECMWF LBC cadence [h] for --mode lam_ecmwf_lbc (default: 3.0)",
+    )
+    parser.add_argument("--lbc-dir", type=Path, default=None, help="Optional prebuilt LBC WX-1 directory")
+    parser.add_argument("--lbc-cache-dir", type=Path, default=None, help="Shared GRIB2 cache dir across LAM domains")
+    parser.add_argument("--init-time", type=str, default=None, help="Optional UTC ISO init time (e.g. 2026-11-22T18:00Z)")
+    parser.add_argument(
+        "--dt-lam",
+        type=float,
+        default=None,
+        help="LAM dynamics step [s] (default: auto 6s for 2.5km, 15s for 5km)",
+    )
     parser.add_argument(
         "--d1-domain",
         choices=list(D1_DOMAIN_DEFAULT_DT_S),
@@ -144,7 +191,7 @@ def main() -> None:
     pl_grib = args.pl_grib
     obs_dir_eff = args.obs_dir
     if args.download_live:
-        if args.ic_source == "ecmwf" and (sfc_grib is None or pl_grib is None):
+        if args.mode != "lam_ecmwf_lbc" and args.ic_source == "ecmwf" and (sfc_grib is None or pl_grib is None):
             raw_dir = (args.runs_root / "raw_ecmwf") if args.runs_root is not None else (args.outdir / "raw_ecmwf")
             sfc_grib, pl_grib, _ = download_ecmwf_cold_start(
                 step=0, prefer_0p1=False, output_dir=raw_dir
@@ -153,7 +200,13 @@ def main() -> None:
             from tempest_v2.download_all_observations import run_observation_ingest_pipeline
 
             args.obs_dir.mkdir(parents=True, exist_ok=True)
-            radar_target_spec = get_domain_spec("d3", nz=args.nz)
+            if args.mode == "lam_ecmwf_lbc":
+                radar_dom = args.lam_domain
+            elif args.mode in ("lam_bnl_ns_de_2p5km", "lam_eu_5km"):
+                radar_dom = args.mode
+            else:
+                radar_dom = "d3"
+            radar_target_spec = get_domain_spec(radar_dom, nz=args.nz)
             obs_dir_eff, _ = run_observation_ingest_pipeline(
                 args.obs_dir,
                 da_hours=6.0,
@@ -166,6 +219,65 @@ def main() -> None:
     )
     include_3d_diag = not args.no_3d_diagnostics
     dt_d1_eff = float(args.dt_d1) if args.dt_d1 is not None else D1_DOMAIN_DEFAULT_DT_S[args.d1_domain]
+
+    init_dt_arg = None
+    if args.init_time:
+        raw_t = datetime.datetime.fromisoformat(args.init_time.strip().replace("Z", "+00:00"))
+        init_dt_arg = raw_t.replace(tzinfo=datetime.timezone.utc) if raw_t.tzinfo is None else raw_t.astimezone(datetime.timezone.utc)
+
+    if args.mode == "lam_ecmwf_lbc":
+        phys_lam = args.physics_every if "--physics-every" in sys.argv else None
+        summary = run_ecmwf_lbc_lam_pipeline(
+            lam_domain=args.lam_domain,
+            forecast_hours=args.hours,
+            nz=args.nz,
+            init_time_utc=init_dt_arg,
+            ic_source=args.ic_source,
+            sfc_grib=sfc_grib,
+            pl_grib=pl_grib,
+            aurora_wx1_path=args.aurora_ic,
+            restart_path=args.restart_in,
+            obs_dir=obs_dir_eff if args.enable_da else None,
+            outdir=args.outdir,
+            runs_root=args.runs_root,
+            cycle_restart_hours=cyc_rst_hours,
+            ensemble_members=args.ensemble_members,
+            ensemble_lead_hours=args.ensemble_hours,
+            ensemble_seed=args.ensemble_seed,
+            ecmwf_schedule=args.ecmwf,
+            enable_da=args.enable_da,
+            dt_s=args.dt_lam,
+            physics_every=phys_lam,
+            lbc_dir=args.lbc_dir,
+            lbc_cache_dir=args.lbc_cache_dir,
+            lbc_resol=args.lbc_resol,
+            lbc_interval_hours=args.lbc_interval_hours,
+            download_lbc=args.download_live or (args.lbc_dir is None and (sfc_grib is None or pl_grib is None)),
+            enable_ocean_si3=use_ocean,
+            include_3d_diagnostics=include_3d_diag,
+            osisaf_wx1_path=args.osisaf_wx1,
+            show_progress=show_progress,
+            log_steps=log_steps,
+            mem_profile_every=args.mem_profile_every,
+            pbl_last=args.pbl_last,
+            cy46_physics=args.cy46_physics,
+        )
+        printable = {
+            "mode": "lam_ecmwf_lbc",
+            "domain": args.lam_domain,
+            "run_dir": str(summary.get("run_dir")),
+            "elapsed_s": summary["lam"]["elapsed_s"],
+            "num_tiles": summary["lam"]["num_tiles"],
+            "outputs": [str(p) for p in summary["lam"]["output_paths"]],
+            "lbc": summary.get("lbc"),
+            "restart": str(summary["lam"].get("restart_path")) if summary["lam"].get("restart_path") else None,
+            "ocean_restart": str(summary["lam"].get("ocean_restart_path")) if summary["lam"].get("ocean_restart_path") else None,
+            "cycle_restart_paths": [str(p) for p in summary.get("cycle_restart_paths", [])],
+            "da": summary["da"],
+            "ensemble": summary.get("ensemble"),
+        }
+        print(json.dumps(printable, indent=2, default=str))
+        return
 
     if args.mode == "d1_to_d2_to_d3":
         summary = run_three_nest_pipeline(
@@ -321,6 +433,8 @@ def main() -> None:
         "d3": args.dt_d3,
         "d3_benelux_2p5km": args.dt_d3,
         "d3_1p5km": 4.0 if ("--dt-d3" not in sys.argv) else args.dt_d3,
+        "lam_bnl_ns_de_2p5km": args.dt_lam if args.dt_lam is not None else LAM_DOMAIN_DEFAULT_DT_S["lam_bnl_ns_de_2p5km"],
+        "lam_eu_5km": args.dt_lam if args.dt_lam is not None else LAM_DOMAIN_DEFAULT_DT_S["lam_eu_5km"],
     }[args.mode]
     sched = forecast_output_schedule_hours(args.hours, ecmwf_schedule=args.ecmwf, hourly=True)
     res = run_domain_forecast(

@@ -252,26 +252,97 @@ def _regrid_latlon_field(
     *,
     fill_nan_value: Optional[float] = None,
 ) -> np.ndarray:
-    data = np.asarray(src, dtype=np.float64)
-    lats = np.asarray(src_lats, dtype=np.float64)
-    lons = np.asarray(src_lons, dtype=np.float64)
+    src_raw = np.asarray(src)
+    lats_raw = np.asarray(src_lats, dtype=np.float64)
+    lons_raw = np.asarray(src_lons, dtype=np.float64)
+
+    # Crop global lat/lon inputs (e.g. ECMWF 0p1 1801x3600) to regional bbox + 1.5 deg before float64 copy.
+    cropped = False
+    tgt_lon_180 = ((np.asarray(target_spec.lon2d, dtype=np.float64) + 180.0) % 360.0) - 180.0
+    lat_min = max(-90.0, float(np.min(target_spec.lat2d)) - 1.5)
+    lat_max = min(90.0, float(np.max(target_spec.lat2d)) + 1.5)
+    lon_min = float(np.min(tgt_lon_180)) - 1.5
+    lon_max = float(np.max(tgt_lon_180)) + 1.5
+    is_regional = (
+        not target_spec.is_periodic_lon
+        and (lon_max - lon_min) < 180.0
+        and lon_min > -179.5
+        and lon_max < 179.5
+        and len(lats_raw) > 4
+        and len(lons_raw) > 4
+    )
+    if is_regional:
+        lat_mask = (lats_raw >= lat_min) & (lats_raw <= lat_max)
+        lat_idx = np.where(lat_mask)[0]
+        if lat_idx.size >= 2:
+            j0 = max(0, int(lat_idx[0]) - 1)
+            j1 = min(len(lats_raw) - 1, int(lat_idx[-1]) + 1)
+            lats_c = lats_raw[j0 : j1 + 1]
+            sub_y = src_raw[..., j0 : j1 + 1, :]
+
+            idx_sorted: Optional[np.ndarray] = None
+            lons_c: Optional[np.ndarray] = None
+            if lons_raw.max() > 180.0 and lons_raw.min() >= 0.0:
+                if lon_min < 0.0 <= lon_max:
+                    iw = np.where(lons_raw >= 360.0 + lon_min)[0]
+                    ie = np.where(lons_raw <= lon_max)[0]
+                    if iw.size >= 1 and ie.size >= 1:
+                        iw0, iw1 = max(0, int(iw[0]) - 1), min(len(lons_raw) - 1, int(iw[-1]) + 1)
+                        ie0, ie1 = max(0, int(ie[0]) - 1), min(len(lons_raw) - 1, int(ie[-1]) + 1)
+                        idx_comb = np.concatenate([np.arange(iw0, iw1 + 1), np.arange(ie0, ie1 + 1)])
+                        _, uniq_pos = np.unique(idx_comb, return_index=True)
+                        idx_comb = idx_comb[np.sort(uniq_pos)]
+                        lons_wrapped = ((lons_raw[idx_comb] + 180.0) % 360.0) - 180.0
+                        order = np.argsort(lons_wrapped)
+                        idx_sorted = idx_comb[order]
+                        lons_c = lons_wrapped[order]
+                elif lon_min >= 0.0:
+                    il = np.where((lons_raw >= lon_min) & (lons_raw <= lon_max))[0]
+                    if il.size >= 2:
+                        i0, i1 = max(0, int(il[0]) - 1), min(len(lons_raw) - 1, int(il[-1]) + 1)
+                        idx_sorted = np.arange(i0, i1 + 1)
+                        lons_c = lons_raw[idx_sorted]
+                else:  # lon_max < 0.0
+                    il = np.where((lons_raw >= 360.0 + lon_min) & (lons_raw <= 360.0 + lon_max))[0]
+                    if il.size >= 2:
+                        i0, i1 = max(0, int(il[0]) - 1), min(len(lons_raw) - 1, int(il[-1]) + 1)
+                        idx_sorted = np.arange(i0, i1 + 1)
+                        lons_c = lons_raw[idx_sorted] - 360.0
+            else:
+                il = np.where((lons_raw >= lon_min) & (lons_raw <= lon_max))[0]
+                if il.size >= 2:
+                    i0, i1 = max(0, int(il[0]) - 1), min(len(lons_raw) - 1, int(il[-1]) + 1)
+                    idx_sorted = np.arange(i0, i1 + 1)
+                    lons_c = lons_raw[idx_sorted]
+
+            if idx_sorted is not None and lons_c is not None and len(lons_c) >= 2 and np.all(np.diff(lons_c) > 0):
+                data = np.asarray(sub_y[..., :, idx_sorted], dtype=np.float64)
+                lats = lats_c
+                lons = lons_c
+                cropped = True
+
+    if not cropped:
+        data = np.asarray(src_raw, dtype=np.float64)
+        lats = lats_raw
+        lons = lons_raw
 
     if lats[0] > lats[-1]:
         lats = lats[::-1]
         data = data[..., ::-1, :]
 
-    if lons.max() > 180.0 and lons.min() >= 0.0:
-        # Unwrap 0..360 -> -180..180 sorted cleanly if global/Benelux spans 0E
-        lons_w = ((lons + 180.0) % 360.0) - 180.0
-        order = np.argsort(lons_w)
-        lons = lons_w[order]
-        data = data[..., :, order]
+    if not cropped:
+        if lons.max() > 180.0 and lons.min() >= 0.0:
+            # Unwrap 0..360 -> -180..180 sorted cleanly if global/Benelux spans 0E
+            lons_w = ((lons + 180.0) % 360.0) - 180.0
+            order = np.argsort(lons_w)
+            lons = lons_w[order]
+            data = data[..., :, order]
 
-    if len(lons) >= 2 and (lons[-1] - lons[0]) > 350.0:
-        lons = np.append(lons, lons[0] + 360.0)
-        data = np.concatenate([data, data[..., :, :1]], axis=-1)
+        if len(lons) >= 2 and (lons[-1] - lons[0]) > 350.0:
+            lons = np.append(lons, lons[0] + 360.0)
+            data = np.concatenate([data, data[..., :, :1]], axis=-1)
 
-    tgt_lon = ((target_spec.lon2d + 180.0) % 360.0) - 180.0
+    tgt_lon = tgt_lon_180
     if len(lons) >= 2 and lons[-1] > 180.0:
         tgt_lon = np.where(tgt_lon < lons[0], tgt_lon + 360.0, tgt_lon)
     pts = np.column_stack([target_spec.lat2d.ravel(), tgt_lon.ravel()])
@@ -298,14 +369,16 @@ def clear_cfgrib_cache() -> None:
     _CFGRIB_CACHE.clear()
 
 
-def _read_cfgrib_var_map(grib_path: Path) -> Dict[str, Tuple[xr.DataArray, np.ndarray, np.ndarray]]:
+def _read_cfgrib_var_map(
+    grib_path: Path, *, use_cache: bool = True
+) -> Dict[str, Tuple[xr.DataArray, np.ndarray, np.ndarray]]:
     import warnings
     import cfgrib
 
     key = (str(grib_path.resolve()), grib_path.stat().st_mtime if grib_path.exists() else 0.0)
-    if key in _CFGRIB_CACHE:
+    if use_cache and key in _CFGRIB_CACHE:
         return _CFGRIB_CACHE[key]
-    if len(_CFGRIB_CACHE) >= 4:
+    if use_cache and len(_CFGRIB_CACHE) >= 4:
         _CFGRIB_CACHE.pop(next(iter(_CFGRIB_CACHE)))
 
     found: Dict[str, Tuple[xr.DataArray, np.ndarray, np.ndarray]] = {}
@@ -323,7 +396,8 @@ def _read_cfgrib_var_map(grib_path: Path) -> Dict[str, Tuple[xr.DataArray, np.nd
                 da = ds[vname].load()
                 found[str(vname)] = (da, lats, lons)
             ds.close()
-    _CFGRIB_CACHE[key] = found
+    if use_cache:
+        _CFGRIB_CACHE[key] = found
     return found
 
 

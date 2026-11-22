@@ -25,6 +25,7 @@ STANDARD_SFC_VARS = [
     "sd", "rsn", "asn",
     "tclw", "tciw", "tcwv",
 ]
+LBC_SFC_VARS = ["msl", "2t"]
 
 # 4-layer soil temperature and volumetric moisture (levels 1, 2, 3, 4)
 STANDARD_SOIL_LEVELS = [1, 2, 3, 4]
@@ -42,6 +43,7 @@ def download_ecmwf_data(
     source: str = "azure",
     run_date: str | None = None,
     run_time: int | str | None = None,
+    skip_existing: bool = False,
 ) -> tuple[Path, Path]:
     """Downloads real-time operational ECMWF IFS forecast files in GRIB2 format.
 
@@ -92,11 +94,23 @@ def download_ecmwf_data(
         soil_path = out_dir / f"ecmwf_ifs_{resol}_{cycle_stamp}_soil_step{step:03d}.grib2"
         meta_path = out_dir / f"ecmwf_ifs_{resol}_{cycle_stamp}_step{step:03d}_metadata.json"
 
+    if (
+        skip_existing
+        and cycle_stamp is not None
+        and sfc_path.is_file()
+        and pl_path.is_file()
+        and sfc_path.stat().st_size > 1024
+        and pl_path.stat().st_size > 1024
+        and (not include_soil or (soil_path.is_file() and soil_path.stat().st_size > 1024))
+    ):
+        logger.info("Reusing cached ECMWF %s %s step=%d GRIB2 files", resol, cycle_stamp, step)
+        return sfc_path, pl_path
+
     client = Client(source=source, model="ifs", resol=resol)
 
-    # 1. Retrieve 2D surface fields. ecmwf-opendata returns the actual run datetime;
-    # preserve it so a cold-start model cycle never invents a valid time.
-    logger.info("Downloading ECMWF %s full surface parameters %s (step=%d)...", resol, target_sfc_vars, step)
+    # 1. Retrieve 2D surface fields. Explicit levtype="sfc" is required for 0p1 split files
+    # and accepted identically by 0p25. Preserve provider run datetime for strict time alignment.
+    logger.info("Downloading ECMWF %s surface parameters %s (step=%d)...", resol, target_sfc_vars, step)
     retrieve_cycle = {}
     if run_date is not None and run_time is not None:
         retrieve_cycle = {"date": run_date, "time": int(str(run_time).replace("Z", ""))}
@@ -104,6 +118,7 @@ def download_ecmwf_data(
         **retrieve_cycle,
         step=step,
         type="fc",
+        levtype="sfc",
         param=target_sfc_vars,
         target=str(sfc_path),
     )

@@ -45,9 +45,15 @@ from tempest_v2.ic_builder import (
     stagger_uv,
     unstagger_uv,
 )
+from tempest_v2.ecmwf_lbc import ecmwf_grib_to_lbc_wx1, prepare_ecmwf_lbc_series
 from tempest_v2.lbc_manager import LBCInterpolator, export_child_lbc_step
 from tempest_v2.ocean_si3_bridge import NemoSi3GPUSolver
-from tempest_v2.projection import DomainSpec, get_domain_spec
+from tempest_v2.projection import (
+    DomainSpec,
+    LAM_DOMAIN_DEFAULT_DT_S,
+    LAM_DOMAIN_DEFAULT_PHYSICS_EVERY,
+    get_domain_spec,
+)
 from tempest_v2.verification import (
     compute_mslp_pa,
     load_station_obs_wx1,
@@ -577,10 +583,14 @@ def run_domain_forecast(
 
         if ocean_solver is not None:
             t_oce_init = time.perf_counter()
+            loaded_oce = False
             if ocean_restart_in is not None and Path(ocean_restart_in).is_file():
                 logger.info("[%s] Loading coupled NEMO+SI3 restart: %s", spec.name, ocean_restart_in)
                 cur_oce_state, _ = NemoSi3GPUSolver.load_restart_wx1(ocean_restart_in)
-            else:
+                loaded_oce = "temp_k" in cur_oce_state
+                if not loaded_oce:
+                    logger.warning("[%s] Ocean restart %s missing 'temp_k'; initializing ocean+SI3 cleanly.", spec.name, ocean_restart_in)
+            if not loaded_oce:
                 logger.info("[%s] Initializing coupled NEMO 5.0.2 + SI3 (%d z-levels)...", spec.name, int(ocean_nz))
                 cur_oce_state = ocean_solver.init_from_atmosphere_and_osisaf(
                     cur_surf, osisaf_wx1_path=osisaf_wx1_path, obs_dir=obs_dir
@@ -1783,5 +1793,312 @@ def run_three_nest_pipeline(
         "layout": layout,
         "manifest_path": manifest_path,
         "cycle_restart_paths": cyc_list,
+        "ensemble": ens_summary,
+    }
+
+
+def _infer_grib_init_utc(sfc_grib: Path | str, pl_grib: Optional[Path | str] = None) -> Optional[datetime.datetime]:
+    sfc_p = Path(sfc_grib)
+    cand_meta = Path(str(sfc_p).replace("_sfc_", "_").replace(".grib2", "_metadata.json"))
+    if cand_meta.is_file():
+        try:
+            meta = json.loads(cand_meta.read_text(encoding="utf-8"))
+            v_iso = meta.get("valid_time_utc")
+            if v_iso:
+                dt = datetime.datetime.fromisoformat(str(v_iso).replace("Z", "+00:00"))
+                return dt.replace(tzinfo=datetime.timezone.utc) if dt.tzinfo is None else dt.astimezone(datetime.timezone.utc)
+        except Exception:
+            pass
+    try:
+        from tempest_v2.ic_builder import _read_cfgrib_var_map
+
+        vmap = _read_cfgrib_var_map(Path(pl_grib) if pl_grib is not None else sfc_p, use_cache=False)
+        for da, _la, _lo in vmap.values():
+            if "valid_time" in da.coords:
+                ts = int(np.datetime64(da.coords["valid_time"].values, "s").astype(np.int64))
+                return datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc)
+    except Exception:
+        pass
+    return None
+
+
+def run_ecmwf_lbc_lam_pipeline(
+    *,
+    lam_domain: str = "lam_bnl_ns_de_2p5km",
+    lam_spec: Optional[DomainSpec] = None,
+    forecast_hours: float = 48.0,
+    nz: int = 65,
+    init_time_utc: Optional[datetime.datetime] = None,
+    ic_source: str = "ecmwf",
+    sfc_grib: Optional[Path | str] = None,
+    pl_grib: Optional[Path | str] = None,
+    aurora_wx1_path: Optional[Path | str] = None,
+    restart_path: Optional[Path | str] = None,
+    obs_dir: Optional[Path | str] = None,
+    outdir: Path | str = "data/forecasts",
+    runs_root: Optional[Path | str] = None,
+    run_dir: Optional[Path | str] = None,
+    run_tag: Optional[str] = None,
+    cycle_restart_hours: Sequence[float] = (6.0,),
+    ensemble_members: int = 0,
+    ensemble_lead_hours: Optional[float] = None,
+    ensemble_seed: Optional[int] = None,
+    ecmwf_schedule: bool = False,
+    enable_da: bool = True,
+    dt_s: Optional[float] = None,
+    physics_every: Optional[int] = None,
+    lbc_dir: Optional[Path | str] = None,
+    lbc_cache_dir: Optional[Path | str] = None,
+    lbc_resol: str = "auto",
+    lbc_interval_hours: float = 3.0,
+    download_lbc: bool = True,
+    ecmwf_source: str = "azure",
+    enable_ocean_si3: bool = True,
+    include_3d_diagnostics: bool = True,
+    ocean_nz: int = 16,
+    ocean_coupling_interval_s: float = 1800.0,
+    osisaf_wx1_path: Optional[Path | str] = None,
+    ocean_restart_in: Optional[Path | str] = None,
+    lam_static: Optional[Tuple[np.ndarray, Dict[str, np.ndarray]]] = None,
+    show_progress: bool = True,
+    log_steps: bool = True,
+    mem_profile_every: int = 0,
+    pbl_last: bool = False,
+    cy46_physics: bool = False,
+) -> Dict[str, Any]:
+    """Run KNMI-style standalone LAM (100% Tempest physics/dynamics/DA/NEMO+SI3) with shifted ECMWF LBCs."""
+    t0_pipe = time.perf_counter()
+    lam_spec = lam_spec if lam_spec is not None else get_domain_spec(lam_domain, nz=nz)
+    dt_eff = float(dt_s) if dt_s is not None else float(LAM_DOMAIN_DEFAULT_DT_S.get(lam_spec.name, 6.0))
+    phys_eff = int(physics_every) if physics_every is not None else int(LAM_DOMAIN_DEFAULT_PHYSICS_EVERY.get(lam_spec.name, 5))
+
+    logger.info(
+        "=== Tempest-NWP v2 Pipeline [LAM + ECMWF LBC: %s] | nz=%d | hours=%.2fh | dt=%.1fs | phys_every=%d | ocean_si3=%s ===",
+        lam_spec.name,
+        int(lam_spec.nz),
+        float(forecast_hours),
+        dt_eff,
+        phys_eff,
+        enable_ocean_si3,
+    )
+    t_prep = time.perf_counter()
+    hs_lam, ss_lam = _resolve_static(lam_spec, lam_static)
+    logger.info("[%s] Static terrain/soil/bathymetry ready in %.2fs", lam_spec.name, time.perf_counter() - t_prep)
+
+    if init_time_utc is not None:
+        init_dt = (
+            init_time_utc.astimezone(datetime.timezone.utc)
+            if init_time_utc.tzinfo is not None
+            else init_time_utc.replace(tzinfo=datetime.timezone.utc)
+        )
+    elif ic_source == "restart" and restart_path is not None:
+        with wx1.open_dataset(restart_path) as rds:
+            raw_v = str(rds.attrs["valid_time_utc"])
+        parsed = datetime.datetime.fromisoformat(raw_v.replace("Z", "+00:00"))
+        init_dt = parsed.replace(tzinfo=datetime.timezone.utc) if parsed.tzinfo is None else parsed.astimezone(datetime.timezone.utc)
+    elif sfc_grib is not None:
+        inferred = _infer_grib_init_utc(sfc_grib, pl_grib)
+        if inferred is not None:
+            init_dt = inferred
+        else:
+            ref_utc = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=35)
+            init_dt = ref_utc.replace(hour=(ref_utc.hour // 3) * 3, minute=0, second=0, microsecond=0)
+    else:
+        ref_utc = datetime.datetime.now(datetime.timezone.utc) - datetime.timedelta(minutes=35)
+        init_dt = ref_utc.replace(hour=(ref_utc.hour // 3) * 3, minute=0, second=0, microsecond=0)
+
+    if run_dir is not None:
+        layout = _ensure_run_layout_dirs(Path(run_dir))
+    elif runs_root is not None:
+        layout = create_run_layout(runs_root, init_dt, run_tag=run_tag)
+    else:
+        layout = create_run_layout(Path(outdir), init_dt, run_tag=run_tag)
+
+    out_root = layout["run_dir"]
+    lam_out_dir = layout["d2"] if lam_spec.dx_m >= 4500.0 else layout["d3"]
+    cyc_dir = layout["restarts"]
+    eff_lbc_dir = Path(lbc_dir) if lbc_dir is not None else (out_root / f"lbc_{lam_spec.name}")
+    eff_cache_dir = (
+        Path(lbc_cache_dir)
+        if lbc_cache_dir is not None
+        else ((Path(runs_root) / "ecmwf_lbc_cache") if runs_root is not None else (out_root / "raw_ecmwf"))
+    )
+
+    lbc_meta: Dict[str, Any] = {"lbc_dir": str(eff_lbc_dir), "resol": lbc_resol}
+    existing_lbc = sorted(eff_lbc_dir.glob(f"lbc_{lam_spec.name}_step_*.wx1")) if eff_lbc_dir.is_dir() else []
+    need_ic_grib = (ic_source == "ecmwf") and (sfc_grib is None or pl_grib is None)
+
+    if existing_lbc and not need_ic_grib:
+        logger.info("[%s] Reusing %d prebuilt LBC files in %s", lam_spec.name, len(existing_lbc), eff_lbc_dir)
+        lbc_meta["source"] = "prebuilt"
+        lbc_meta["lbc_files"] = [str(p) for p in existing_lbc]
+    elif download_lbc:
+        prep = prepare_ecmwf_lbc_series(
+            lam_spec,
+            hs_lam,
+            init_dt,
+            forecast_hours,
+            eff_lbc_dir,
+            resol=lbc_resol,
+            lbc_interval_hours=lbc_interval_hours,
+            source=ecmwf_source,
+            grib_cache_dir=eff_cache_dir,
+            need_ic_grib=need_ic_grib,
+        )
+        plan = prep["plan"]
+        if need_ic_grib and prep.get("ic_sfc_grib") is not None and prep.get("ic_pl_grib") is not None:
+            sfc_grib = prep["ic_sfc_grib"]
+            pl_grib = prep["ic_pl_grib"]
+        lbc_meta = {
+            "source": "ecmwf_opendata",
+            "resol": plan.resol,
+            "ecmwf_cycle_utc": plan.ecmwf_cycle_utc.isoformat(),
+            "lead_offset_hours": float(plan.lead_offset_hours),
+            "ecmwf_steps": list(plan.ecmwf_steps),
+            "ic_step": int(plan.ic_step),
+            "lbc_dir": str(eff_lbc_dir),
+            "lbc_files": [str(p) for p in prep["lbc_paths"]],
+        }
+    elif sfc_grib is not None and pl_grib is not None:
+        end_dt_lbc = init_dt + datetime.timedelta(hours=float(forecast_hours))
+        p0 = ecmwf_grib_to_lbc_wx1(
+            sfc_grib, pl_grib, lam_spec, hs_lam, eff_lbc_dir, 0, 0.0, init_dt, resol=lbc_resol
+        )
+        p1 = ecmwf_grib_to_lbc_wx1(
+            sfc_grib,
+            pl_grib,
+            lam_spec,
+            hs_lam,
+            eff_lbc_dir,
+            1,
+            max(1.0, float(forecast_hours) * 3600.0),
+            end_dt_lbc,
+            resol=lbc_resol,
+        )
+        lbc_meta = {
+            "source": "local_grib_static",
+            "resol": lbc_resol,
+            "lbc_dir": str(eff_lbc_dir),
+            "lbc_files": [str(p0), str(p1)],
+        }
+    else:
+        raise ValueError("Provide prebuilt --lbc-dir, local --sfc-grib/--pl-grib, or enable LBC downloading.")
+
+    t_ic = time.perf_counter()
+    st_lam, sf_lam, ic_valid_dt = _load_domain_ic(
+        lam_spec,
+        hs_lam,
+        ss_lam,
+        ic_source=ic_source,
+        restart_path=restart_path,
+        sfc_grib=sfc_grib,
+        pl_grib=pl_grib,
+        aurora_wx1_path=aurora_wx1_path,
+    )
+    if ic_valid_dt is not None and init_time_utc is None and ic_source == "restart":
+        init_dt = ic_valid_dt
+    clear_cfgrib_cache()
+    gc.collect()
+    logger.info("[%s] Initial conditions ready in %.2fs (init=%s)", lam_spec.name, time.perf_counter() - t_ic, init_dt.isoformat())
+
+    st_lam, sf_lam, iau_lam, da_metrics = _run_d3_da(
+        lam_spec, st_lam, sf_lam, hs_lam, ss_lam, init_dt, obs_dir, enable_da
+    )
+    gc.collect()
+
+    lbc_interp = LBCInterpolator(eff_lbc_dir, lam_spec.name)
+    sched = forecast_output_schedule_hours(forecast_hours, ecmwf_schedule=ecmwf_schedule, hourly=True)
+    lam_ocean_out = (layout["ocean"] / f"restart_ocean_{lam_spec.name}.wx1") if enable_ocean_si3 else None
+
+    res_lam = run_domain_forecast(
+        lam_spec,
+        hs_lam,
+        ss_lam,
+        st_lam,
+        sf_lam,
+        init_dt,
+        forecast_hours=forecast_hours,
+        dt_s=dt_eff,
+        physics_every=phys_eff,
+        lbc_interpolator=lbc_interp,
+        iau_forcing=iau_lam,
+        iau_duration_s=900.0 if iau_lam is not None else 0.0,
+        output_dir=lam_out_dir,
+        output_hours=sched,
+        save_restart_path=cyc_dir / f"restart_{lam_spec.name}.wx1",
+        save_cycle_restart_hours=cycle_restart_hours,
+        cycle_restart_dir=cyc_dir,
+        enable_ocean_si3=enable_ocean_si3,
+        ocean_coupling_interval_s=ocean_coupling_interval_s,
+        ocean_nz=ocean_nz,
+        osisaf_wx1_path=osisaf_wx1_path,
+        obs_dir=obs_dir,
+        ocean_restart_in=ocean_restart_in,
+        ocean_restart_out=lam_ocean_out,
+        include_3d_diagnostics=include_3d_diagnostics,
+        show_progress=show_progress,
+        log_steps=log_steps,
+        mem_profile_every=mem_profile_every,
+        pbl_last=pbl_last,
+        cy46_physics=cy46_physics,
+    )
+
+    if enable_da and obs_dir is not None and da_metrics.get("verify_bg"):
+        _, stn_rows = load_station_obs_wx1(obs_dir, lam_spec, valid_time_utc=init_dt)
+        da_metrics["verify_end"] = verify_against_stations(
+            lam_spec, res_lam["state_3d"], res_lam["surf_state"], hs_lam, stn_rows
+        )
+
+    ens_summary = _run_pipeline_ensemble(
+        {"d3": (lam_spec, hs_lam, ss_lam, st_lam, sf_lam, dt_eff, phys_eff, lbc_interp, iau_lam, res_lam)},
+        ensemble_domain="d3",
+        ensemble_members=ensemble_members,
+        ensemble_lead_hours=ensemble_lead_hours,
+        ensemble_seed=ensemble_seed,
+        forecast_hours=forecast_hours,
+        sched=sched,
+        init_dt=init_dt,
+        ens_dir=layout["ensemble"],
+        show_progress=show_progress,
+    )
+
+    manifest_path = out_root / "manifest.json"
+    wall_total = float(time.perf_counter() - t0_pipe)
+    manifest = {
+        "mode": "lam_ecmwf_lbc",
+        "domain": lam_spec.name,
+        "init_time_utc": init_dt.isoformat(),
+        "ic_source": ic_source,
+        "warm_start": bool(ic_source == "restart"),
+        "forecast_hours": float(forecast_hours),
+        "nz": int(lam_spec.nz),
+        "dt_s": float(dt_eff),
+        "physics_every": int(phys_eff),
+        "include_3d_diagnostics": bool(include_3d_diagnostics),
+        "lbc": lbc_meta,
+        "ocean": {
+            "enabled": bool(enable_ocean_si3),
+            "nz": int(ocean_nz),
+            "coupling_interval_s": float(ocean_coupling_interval_s),
+            "restart_path": str(res_lam["ocean_restart_path"]) if res_lam.get("ocean_restart_path") else None,
+        },
+        "lam": _domain_manifest_entry(lam_spec, res_lam),
+        "da": da_metrics,
+        "ensemble": ens_summary,
+        "cycle_restart_paths": [str(p) for p in res_lam.get("cycle_restart_paths", [])],
+        "wall_time_s": wall_total,
+    }
+    manifest_path.write_text(json.dumps(manifest, indent=2))
+    logger.info("=== Tempest-NWP v2 Pipeline [LAM + ECMWF LBC: %s] finished in %.2fs ===", lam_spec.name, wall_total)
+
+    return {
+        "lam": res_lam,
+        "d3": res_lam,
+        "lbc": lbc_meta,
+        "da": da_metrics,
+        "run_dir": out_root,
+        "layout": layout,
+        "manifest_path": manifest_path,
+        "cycle_restart_paths": res_lam.get("cycle_restart_paths", []),
         "ensemble": ens_summary,
     }

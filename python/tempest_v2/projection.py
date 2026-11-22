@@ -283,6 +283,24 @@ D1_DOMAIN_DEFAULT_DT_S: Dict[str, float] = {
     "d1_global_0p5": 120.0,
 }
 
+LAM_DOMAIN_DEFAULT_DT_S: Dict[str, float] = {
+    "lam_bnl_ns_de_2p5km": 6.0,
+    "lam_eu_5km": 15.0,
+    "d3_nl_2p5km": 6.0,
+    "d3_benelux_de_2p5km": 6.0,
+    "d3_benelux_de_1p5km": 4.0,
+    "d2_eu_lcc": 20.0,
+}
+
+LAM_DOMAIN_DEFAULT_PHYSICS_EVERY: Dict[str, int] = {
+    "lam_bnl_ns_de_2p5km": 5,
+    "lam_eu_5km": 3,
+    "d3_nl_2p5km": 5,
+    "d3_benelux_de_2p5km": 5,
+    "d3_benelux_de_1p5km": 5,
+    "d2_eu_lcc": 2,
+}
+
 
 def get_domain_spec(
     name: str,
@@ -290,11 +308,37 @@ def get_domain_spec(
     z_top_m: Optional[float] = None,
     stretch_power: float = 1.5,
 ) -> DomainSpec:
-    """Return canonical DomainSpec for D1 Global, D2 Europe LCC (7.5 km), or D3 Netherlands+buffer LCC (2.5 km default, 216x216; optional 'd3_benelux_2p5km' 432x432 or 'd3_1p5km' 720x720)."""
+    """Return canonical DomainSpec for D1 Global, D2 Europe LCC (7.5 km), D3 LCC (2.5/1.5 km), or standalone LAMs."""
     key = name.strip().lower().replace("-", "_")
     if z_top_m is None:
         z_top_m = 31_000.0 if nz >= 90 else 22_000.0
     vgrid = VerticalGrid(nz=nz, z_top_m=z_top_m, stretch_power=stretch_power)
+
+    if key in ("lam_bnl_ns_de_2p5km", "lam_bnl", "lam_bnl_2p5km", "bnl_ns_de_2p5km", "d3_nw", "d3_nw_2p5km"):
+        proj = LCCProjection(lat1_deg=50.0, lat2_deg=55.5, lat0_deg=52.8, lon0_deg=4.5)
+        return _make_lcc_domain(
+            "lam_bnl_ns_de_2p5km",
+            ny=432,
+            nx=432,
+            dx_m=2500.0,
+            projection=proj,
+            vertical=vgrid,
+            center_lat_deg=52.8,
+            center_lon_deg=4.5,
+        )
+
+    if key in ("lam_eu_5km", "lam_eu", "lam_europe_5km", "eu_5km", "europe_5km"):
+        proj = LCCProjection(lat1_deg=46.0, lat2_deg=57.0, lat0_deg=51.5, lon0_deg=6.0)
+        return _make_lcc_domain(
+            "lam_eu_5km",
+            ny=480,
+            nx=560,
+            dx_m=5000.0,
+            projection=proj,
+            vertical=vgrid,
+            center_lat_deg=51.5,
+            center_lon_deg=6.0,
+        )
 
     if key in ("d3", "d3_nl", "d3_nl_2p5km", "nl_2p5km"):
         proj = LCCProjection(lat1_deg=50.5, lat2_deg=53.8, lat0_deg=52.15, lon0_deg=5.30)

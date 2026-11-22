@@ -16,7 +16,7 @@ if str(PY_ROOT) not in sys.path:
     sys.path.insert(0, str(PY_ROOT))
 
 from tempest_v2.daemon import DaemonConfig, latest_ready_cycle_time_utc, run_daemon_loop, run_single_cycle  # noqa: E402
-from tempest_v2.projection import D1_DOMAIN_DEFAULT_DT_S  # noqa: E402
+from tempest_v2.projection import D1_DOMAIN_DEFAULT_DT_S, LAM_DOMAIN_DEFAULT_DT_S  # noqa: E402
 
 
 def _parse_iso_utc(raw: str) -> datetime.datetime:
@@ -52,6 +52,22 @@ def main() -> None:
         help="Global D1 dynamics step [s] (default: auto 60/90/120s for 0p25/0p4/0p5)",
     )
     parser.add_argument("--enable-d1", action="store_true", help="Enable global D1 -> D2 -> D3 3-nest pipeline")
+    parser.add_argument(
+        "--lam-ecmwf-lbc",
+        action="store_true",
+        help="Run KNMI-style standalone LAM (100%% Tempest physics/DA/NEMO) driven by shifted ECMWF 0p1/0p25 LBCs",
+    )
+    parser.add_argument(
+        "--lam-domain",
+        choices=list(LAM_DOMAIN_DEFAULT_DT_S),
+        default="lam_bnl_ns_de_2p5km",
+        help="Standalone LAM domain for --lam-ecmwf-lbc",
+    )
+    parser.add_argument("--lam-hours", type=float, default=48.0, help="Forecast length [h] for --lam-ecmwf-lbc")
+    parser.add_argument("--dt-lam", type=float, default=None, help="LAM dynamics step [s] (default: auto)")
+    parser.add_argument("--lbc-resol", choices=["auto", "0p1", "0p25"], default="auto")
+    parser.add_argument("--lbc-interval-hours", type=float, default=3.0)
+    parser.add_argument("--lbc-cache-dir", type=Path, default=None)
     parser.add_argument(
         "--ecmwf",
         action="store_true",
@@ -100,6 +116,13 @@ def main() -> None:
         d1_domain=args.d1_domain,
         dt_d1_s=dt_d1_eff,
         enable_d1=args.enable_d1,
+        lam_ecmwf_lbc=args.lam_ecmwf_lbc,
+        lam_domain=args.lam_domain,
+        lam_lead_hours=args.lam_hours,
+        dt_lam_s=args.dt_lam,
+        lbc_resol=args.lbc_resol,
+        lbc_interval_hours=args.lbc_interval_hours,
+        lbc_cache_dir=args.lbc_cache_dir,
         ecmwf_schedule=args.ecmwf,
         pbl_last=args.pbl_last,
         cy46_physics=args.cy46_physics,
