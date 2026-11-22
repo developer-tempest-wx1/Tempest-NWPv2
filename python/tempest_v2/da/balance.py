@@ -47,8 +47,14 @@ class BalanceOperator:
         pi0 = ref["pi_bar"][0]
         p0 = ref["p_bar"][0]
 
-        # Surface pressure -> bottom Exner factor: d(pi)/d(ps) = kappa * pi_0 / p_0
+        z_agl = np.maximum(0.0, z_s - np.asarray(hs_m, dtype=np.float64)[None, :, :])
+        # Surface pressure -> bottom Exner factor (c_ps retained for API compatibility)
+        # with baroclinic exponential attenuation aloft to avoid stratospheric wind blow-up.
         self.c_ps = KAPPA * pi0 / np.maximum(p0, 1000.0)
+        self.c_ps_3d = (
+            (KAPPA * ref["pi_bar"] / np.maximum(p0, 1000.0)[None, :, :])
+            * np.exp(-z_agl / 12_000.0)
+        )
 
         # Layer thickness for hydrostatic integration: c_theta[k] = g * dz_k / (cp * theta_bar^2)
         dz_col = np.zeros_like(z_s)
@@ -60,7 +66,6 @@ class BalanceOperator:
         f_inv = f / (f * f + f0_taper_hz * f0_taper_hz)
 
         # Taper geostrophic coupling weaker in lowest boundary layer (~0.3 -> 1.0 aloft)
-        z_agl = np.maximum(0.0, z_s - np.asarray(hs_m, dtype=np.float64)[None, :, :])
         bl_taper = 0.30 + 0.70 * (1.0 - np.exp(-z_agl / 1200.0))
         self.geo_coeff = (
             self.alpha_geo
@@ -86,7 +91,7 @@ class BalanceOperator:
         if self.alpha_hyd != 0.0:
             hyd = np.zeros_like(pi_b, dtype=np.float64)
             if "ps" in out:
-                hyd += (self.c_ps * out["ps"])[None, :, :]
+                hyd += self.c_ps_3d * out["ps"][None, :, :]
             if "theta_p" in out:
                 terms = np.zeros_like(pi_b, dtype=np.float64)
                 terms[1:] = self.c_theta[1:] * out["theta_p"][1:]
@@ -135,7 +140,7 @@ class BalanceOperator:
         if self.alpha_hyd != 0.0:
             adj_hyd = self.alpha_hyd * adj_pi_b
             if "ps" in out:
-                out["ps"] = out["ps"] + self.c_ps * np.sum(adj_hyd, axis=0)
+                out["ps"] = out["ps"] + np.sum(self.c_ps_3d * adj_hyd, axis=0)
             if "theta_p" in out:
                 cum_rev = np.cumsum(adj_hyd[::-1], axis=0)[::-1]
                 out["theta_p"][1:] += self.c_theta[1:] * cum_rev[1:]

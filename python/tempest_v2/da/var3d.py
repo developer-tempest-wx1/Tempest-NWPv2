@@ -542,6 +542,7 @@ class Var3DConfig:
     sigma_sst: float = 0.5
     sigma_soil_t: float = 1.2
     sigma_soil_m: float = 0.03
+    bg_check_sigma: float = 5.0
     use_balance: bool = True
     iau_window_sec: float = 1800.0
 
@@ -633,6 +634,46 @@ def solve_3dvar_pcg(
     y_obs = np.array([o.value for o in obs_list], dtype=np.float64)
     r_inv = np.array([1.0 / max(1e-9, o.error_variance) for o in obs_list], dtype=np.float64)
     d = y_obs - h_xb
+
+    if config.bg_check_sigma > 0.0:
+        sigma_b_map = {
+            "ps": config.sigma_ps,
+            "t2m": config.sigma_theta,
+            "theta_p": config.sigma_theta,
+            "theta": config.sigma_theta,
+            "u": config.sigma_wind,
+            "v": config.sigma_wind,
+            "u_geo": config.sigma_wind,
+            "v_geo": config.sigma_wind,
+            "qv": config.sigma_qv,
+            "qv2m": config.sigma_qv,
+            "td2m": config.sigma_qv,
+            "sst": config.sigma_sst,
+            "soil_t": config.sigma_soil_t,
+            "soil_m": config.sigma_soil_m,
+            "ztd": 0.025,
+        }
+        n_bg_rej = 0
+        for idx_o, o in enumerate(obs_list):
+            if not o.valid:
+                d[idx_o] = 0.0
+                r_inv[idx_o] = 0.0
+                continue
+            sb = sigma_b_map.get(o.var_type, 1.0)
+            sig_tot = math.sqrt(sb * sb + max(1e-9, float(o.error_variance)))
+            if not math.isfinite(d[idx_o]) or abs(d[idx_o]) > config.bg_check_sigma * sig_tot:
+                o.valid = False
+                d[idx_o] = 0.0
+                r_inv[idx_o] = 0.0
+                n_bg_rej += 1
+        if n_bg_rej > 0:
+            logger.info(
+                "3D-Var background-check QC rejected %d/%d outlier innovations (>%.1f sigma)",
+                n_bg_rej,
+                len(obs_list),
+                config.bg_check_sigma,
+            )
+
     j0 = float(0.5 * np.sum(d * d * r_inv))
 
     ctrl_template = {k: np.zeros_like(v, dtype=np.float64) for k, v in background_fields.items()}

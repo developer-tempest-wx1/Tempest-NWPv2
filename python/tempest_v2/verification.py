@@ -254,6 +254,7 @@ def load_station_obs_wx1(
         times = np.asarray(data.get("time", np.full(n, np.nan)), dtype=np.float64)
 
         step_sfc = max(1, n // 1500) if provider in ("metar", "global_sfc") and not spec.is_projected else 1
+        best_by_loc: Dict[Tuple[float, float], Tuple[float, int, float, float, float]] = {}
         for idx in range(0, n, step_sfc):
             lat = float(lats[idx])
             lon = float(lons[idx])
@@ -261,6 +262,14 @@ def load_station_obs_wx1(
             if chk is None:
                 continue
             xm, ym, t_off = chk
+            loc_key = (round(lat, 3), round(lon, 3))
+            prev = best_by_loc.get(loc_key)
+            if prev is None or abs(t_off) < prev[0]:
+                best_by_loc[loc_key] = (abs(t_off), idx, xm, ym, t_off)
+
+        for _, idx, xm, ym, t_off in sorted(best_by_loc.values(), key=lambda x: x[1]):
+            lat = float(lats[idx])
+            lon = float(lons[idx])
 
             elev = float(elevs[idx]) if math.isfinite(float(elevs[idx])) else 0.0
             elev = float(np.clip(elev, -10.0, 4000.0))
@@ -815,6 +824,7 @@ def run_domain_3dvar(
                 else:
                     inc_st = inc_f
                 del inc_f
+                np.clip(inc_st, -25.0, 25.0, out=inc_st)
                 if not compute_iau:
                     ana_state[wkey] += inc_st
                     np.clip(ana_state[wkey], -150.0, 150.0, out=ana_state[wkey])
@@ -839,6 +849,10 @@ def run_domain_3dvar(
                     else:
                         ana_state["qv"] = np.clip(ana_state["qv"] + inc_f, 1e-8, 0.04).astype(np.float32)
                 else:
+                    if skey == "theta_p":
+                        np.clip(inc_f, -12.0, 12.0, out=inc_f)
+                    elif skey == "pi_p":
+                        np.clip(inc_f, -0.004, 0.004, out=inc_f)
                     if not compute_iau:
                         ana_state[skey] += inc_f
                         del inc_f
@@ -901,7 +915,17 @@ def run_domain_3dvar(
             land_mask=(np.asarray(lsm) >= 0.5),
             trajectory=eff_traj,
         )
-        updated_c = apply_analysis_increments_with_bounds(bg_centered, res.analysis_increments)
+        inc_bounds = {
+            "u": (-25.0, 25.0),
+            "v": (-25.0, 25.0),
+            "theta_p": (-12.0, 12.0),
+            "pi_p": (-0.004, 0.004),
+        }
+        bounded_inc = {
+            k: np.clip(v, *inc_bounds[k]) if k in inc_bounds else v
+            for k, v in res.analysis_increments.items()
+        }
+        updated_c = apply_analysis_increments_with_bounds(bg_centered, bounded_inc)
         u_st, v_st = stagger_uv(updated_c["u"], updated_c["v"])
         ana_state = {k: v.copy() for k, v in state_3d.items()}
         ana_state["u"] = u_st
@@ -912,10 +936,10 @@ def run_domain_3dvar(
         sst_updated = updated_c.get("sst")
         if compute_iau:
             inc_c = {
-                "u": res.analysis_increments.get("u", np.zeros_like(u_c)),
-                "v": res.analysis_increments.get("v", np.zeros_like(v_c)),
-                "theta_p": res.analysis_increments.get("theta_p", np.zeros_like(ana_state["theta_p"])),
-                "pi_p": res.analysis_increments.get("pi_p", np.zeros_like(ana_state["pi_p"])),
+                "u": bounded_inc.get("u", np.zeros_like(u_c)),
+                "v": bounded_inc.get("v", np.zeros_like(v_c)),
+                "theta_p": bounded_inc.get("theta_p", np.zeros_like(ana_state["theta_p"])),
+                "pi_p": bounded_inc.get("pi_p", np.zeros_like(ana_state["pi_p"])),
             }
             iau_raw = compute_iau_tendencies(inc_c, tau_sec=iau_tau_sec)
             iau_u_st, iau_v_st = stagger_uv(iau_raw["u"], iau_raw["v"])

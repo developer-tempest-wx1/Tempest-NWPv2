@@ -484,10 +484,13 @@ def run_domain_forecast(
         has_iau=(iau_forcing is not None),
         is_spherical=use_spherical,
         polar_filter_lat_deg=60.0 if use_spherical else 0.0,
+        beta_offcenter=0.55,
+        div_damp_coeff=0.04,
+        hyperdiff_coeff=0.005,
         sponge_depth_m=min(6000.0, 0.22 * spec.vertical.z_top_m),
         sponge_tau_max_s=0.01,
         lbc_rim_width=max(2, min(8, spec.nx // 4)) if has_parent_lbc else 0,
-        lbc_tau_max_s=0.04 if has_parent_lbc else 0.0,
+        lbc_tau_max_s=min(0.04, 0.45 / max(float(dt_s), 1.0)) if has_parent_lbc else 0.0,
         theta_sfc_k=theta_sfc_ref,
         p_sfc_pa=p_sfc_ref,
         n_ref_s=n_ref_hz,
@@ -974,10 +977,11 @@ def _run_d3_da(
             len(stn_rows),
         )
         if obs_list:
-            da_metrics["verify_bg"] = verify_against_stations(d3_spec, st_d3, sf_d3, hs_d3, stn_rows)
+            st_bg = st_d3
+            da_metrics["verify_bg"] = verify_against_stations(d3_spec, st_bg, sf_d3, hs_d3, stn_rows)
             use_iau = not (d3_spec.is_spherical and d3_spec.nz * d3_spec.ny * d3_spec.nx >= 50_000_000)
-            st_d3, sf_d3, iau_d3, var_res = run_domain_3dvar(
-                d3_spec, st_d3, sf_d3, hs_d3, ss_d3["lsm"], obs_list, obs_dir=obs_dir, compute_iau=use_iau
+            ana_st, sf_d3, iau_d3, var_res = run_domain_3dvar(
+                d3_spec, st_bg, sf_d3, hs_d3, ss_d3["lsm"], obs_list, obs_dir=obs_dir, compute_iau=use_iau
             )
             da_metrics["var3d"] = {
                 "j0": var_res.initial_cost_j0,
@@ -985,7 +989,15 @@ def _run_d3_da(
                 "iterations": var_res.iterations,
                 "converged": var_res.converged,
             }
-            da_metrics["verify_ana"] = verify_against_stations(d3_spec, st_d3, sf_d3, hs_d3, stn_rows)
+            da_metrics["verify_ana"] = verify_against_stations(d3_spec, ana_st, sf_d3, hs_d3, stn_rows)
+            if iau_d3 is not None:
+                # Bloom et al. (1996) IAU: start prognostic momentum/thermo from background so the increment is added once over the IAU window.
+                init_st = dict(ana_st)
+                for k_iau in ("u", "v", "theta_p", "pi_p"):
+                    init_st[k_iau] = st_bg[k_iau]
+                st_d3 = init_st
+            else:
+                st_d3 = ana_st
         else:
             logger.info("[%s] No in-domain DA observations found; skipping 3D-Var.", d3_spec.name)
     return st_d3, sf_d3, iau_d3, da_metrics
