@@ -150,6 +150,18 @@ __device__ __host__ inline void eval_theta_pi_bar_f32(
     if (pi_bar < 1e-4f) pi_bar = 1e-4f;
 }
 
+__device__ __host__ inline float eval_theta_bar_f32(
+    float z,
+    float theta_sfc,
+    float n_ref
+) {
+    const float n2 = n_ref * n_ref;
+    if (n2 > 1e-12f) {
+        return theta_sfc * expf((n2 * z) / GRAVITY_F);
+    }
+    return theta_sfc;
+}
+
 __device__ __host__ inline float eval_rho_bar_f32(
     float z,
     float theta_sfc,

@@ -111,6 +111,97 @@ __device__ inline double moisture_load_scalar(
     return 1.0 + EPS_V * qv_out - qhyd_out;
 }
 
+__device__ inline float moisture_load_scalar_f(
+    int32_t has_moist, size_t idx,
+    const float* qv, const float* qc, const float* qr,
+    const float* qi, const float* qs, const float* qg,
+    float& qv_out, float& qhyd_out
+) {
+    if (!has_moist) {
+        qv_out = 0.0f;
+        qhyd_out = 0.0f;
+        return 1.0f;
+    }
+    qv_out = qv[idx];
+    qhyd_out = qc[idx] + qr[idx] + qi[idx] + qs[idx] + qg[idx];
+    return 1.0f + EPS_V_F * qv_out - qhyd_out;
+}
+
+__device__ inline double interp_pi_at_z_f(
+    const NhGridConfig& cfg,
+    const DeviceStaticGrid& g,
+    const float* pi_p,
+    const float* theta_p,
+    const float* qv, const float* qc, const float* qr,
+    const float* qi, const float* qs, const float* qg,
+    int32_t k_hint,
+    int32_t j_clamped,
+    int32_t i_clamped,
+    double hs_col,
+    double z_target
+) {
+    const int32_t nz = cfg.nz;
+    const int32_t ny = cfg.ny;
+    const int32_t nx = cfg.nx;
+    int32_t m = k_hint;
+    if (m < 0) m = 0;
+    if (m > nz - 2) m = nz - 2;
+
+    auto z_col = [&](int32_t kk) -> double {
+        return g.zeta_s[kk] + g.b_s[kk] * hs_col;
+    };
+
+    auto hydro_slope = [&](size_t s_idx, float z_lvl) -> double {
+        float qvv, qhv;
+        const float thb = eval_theta_bar_f32(z_lvl, static_cast<float>(cfg.theta_sfc_k), static_cast<float>(cfg.n_ref_s));
+        const float vfac = moisture_load_scalar_f(cfg.has_moist, s_idx, qv, qc, qr, qi, qs, qg, qvv, qhv);
+        const float th_tot = (thb + theta_p[s_idx]) * vfac;
+        const float dth_v = theta_p[s_idx] * vfac + thb * (vfac - 1.0f);
+        return static_cast<double>((GRAVITY_F * dth_v) / (CP_D_F * thb * fmaxf(th_tot, 50.0f)));
+    };
+
+    if (z_target <= z_col(0)) {
+        const size_t idx0 = static_cast<size_t>(j_clamped) * nx + i_clamped;
+        const size_t idx1 = static_cast<size_t>(ny) * nx + idx0;
+        const double z0 = z_col(0);
+        const double z1 = z_col(1);
+        const double s0 = hydro_slope(idx0, static_cast<float>(z0));
+        const double s1 = hydro_slope(idx1, static_cast<float>(z1));
+        const double d2pi = fmax(-1.5e-9, fmin(1.5e-9, (s1 - s0) / fmax(z1 - z0, 1.0)));
+        const double dz = z_target - z0;
+        return static_cast<double>(pi_p[idx0]) + s0 * dz + 0.5 * d2pi * dz * dz;
+    }
+    const double z_top_s = z_col(nz - 1);
+    if (z_target >= z_top_s) {
+        const size_t idx_t = static_cast<size_t>(nz - 1) * ny * nx + static_cast<size_t>(j_clamped) * nx + i_clamped;
+        const size_t idx_m = static_cast<size_t>(nz - 2) * ny * nx + static_cast<size_t>(j_clamped) * nx + i_clamped;
+        const double z_m = z_col(nz - 2);
+        const double s_t = hydro_slope(idx_t, static_cast<float>(z_top_s));
+        const double s_m = hydro_slope(idx_m, static_cast<float>(z_m));
+        const double d2pi = fmax(-1.5e-9, fmin(1.5e-9, (s_t - s_m) / fmax(z_top_s - z_m, 1.0)));
+        const double dz = z_target - z_top_s;
+        return static_cast<double>(pi_p[idx_t]) + s_t * dz + 0.5 * d2pi * dz * dz;
+    }
+
+    while (m > 0 && z_target < z_col(m)) --m;
+    while (m < nz - 2 && z_target > z_col(m + 1)) ++m;
+
+    const double z0 = z_col(m);
+    const double z1 = z_col(m + 1);
+    const size_t i0 = static_cast<size_t>(m) * ny * nx + static_cast<size_t>(j_clamped) * nx + i_clamped;
+    const size_t i1 = static_cast<size_t>(m + 1) * ny * nx + static_cast<size_t>(j_clamped) * nx + i_clamped;
+    const double w = (z_target - z0) / fmax(z1 - z0, 1e-6);
+    return (1.0 - w) * static_cast<double>(pi_p[i0]) + w * static_cast<double>(pi_p[i1]);
+}
+
+__device__ inline float sponge_tau_f(float z, float z_top, float depth, float tau_max) {
+    if (depth <= 0.0f || tau_max <= 0.0f) return 0.0f;
+    const float z_start = z_top - depth;
+    if (z <= z_start) return 0.0f;
+    const float s = sinf(0.5f * PI_CONST_F * (z - z_start) / depth);
+    return tau_max * s * s;
+}
+
 __device__ inline double interp_pi_at_z(
     const NhGridConfig& cfg,
     const DeviceStaticGrid& g,
@@ -145,25 +236,15 @@ __device__ inline double interp_pi_at_z(
 
     if (z_target <= z_col(0)) {
         const size_t idx0 = static_cast<size_t>(j_clamped) * nx + i_clamped;
-        const size_t idx1 = static_cast<size_t>(ny) * nx + idx0;
         const double z0 = z_col(0);
-        const double z1 = z_col(1);
         const double dpi0 = hydro_slope(idx0, z0);
-        const double dpi1 = hydro_slope(idx1, z1);
-        const double d2pi = (dpi1 - dpi0) / fmax(z1 - z0, 1e-6);
-        const double dz = z_target - z0;
-        return static_cast<double>(pi_p[idx0]) + (dpi0 + 0.5 * d2pi * dz) * dz;
+        return static_cast<double>(pi_p[idx0]) + dpi0 * (z_target - z0);
     }
     const double z_top_s = z_col(nz - 1);
     if (z_target >= z_top_s) {
         const size_t idx_t = static_cast<size_t>(nz - 1) * ny * nx + static_cast<size_t>(j_clamped) * nx + i_clamped;
-        const size_t idx_tm = static_cast<size_t>(nz - 2) * ny * nx + static_cast<size_t>(j_clamped) * nx + i_clamped;
-        const double z_tm = z_col(nz - 2);
         const double dpi_t = hydro_slope(idx_t, z_top_s);
-        const double dpi_tm = hydro_slope(idx_tm, z_tm);
-        const double d2pi = (dpi_t - dpi_tm) / fmax(z_top_s - z_tm, 1e-6);
-        const double dz = z_target - z_top_s;
-        return static_cast<double>(pi_p[idx_t]) + (dpi_t + 0.5 * d2pi * dz) * dz;
+        return static_cast<double>(pi_p[idx_t]) + dpi_t * (z_target - z_top_s);
     }
 
     while (m > 0 && z_target < z_col(m)) --m;
@@ -352,6 +433,7 @@ __device__ inline void compute_contravariant_at_scalar_col_f(
 __global__ void nh_slow_scalar_kernel(
     NhGridConfig cfg,
     DeviceStaticGrid g,
+    float tau_stage,
     const float* u,
     const float* v,
     const float* w,
@@ -388,28 +470,31 @@ __global__ void nh_slow_scalar_kernel(
     compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, k, j, i, gz_lo);
     compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, k + 1, j, i, gz_hi);
     const float zeta_dot = 0.5f * (gz_lo + gz_hi) / fmaxf(g_s, 1e-4f);
+    // Wicker & Skamarock (2020) IEVA split: cap explicit vertical Courant number at 0.45
+    const float zd_cap = 0.45f * dz_k / fmaxf(tau_stage, 1e-6f);
+    const float zd_exp = fmaxf(-zd_cap, fminf(zd_cap, zeta_dot));
 
     // Advect theta'
     const float th_xp = horiz_face_val_x_f(thp, k, j, i + 1, uc, nz, ny, nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
     const float th_xm = horiz_face_val_x_f(thp, k, j, i,     uc, nz, ny, nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
     const float th_yp = horiz_face_val_y_f(thp, k, j + 1, i, vc, nz, ny, nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
     const float th_ym = horiz_face_val_y_f(thp, k, j,     i, vc, nz, ny, nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
-    const float th_zp = vert_tvd_face_val_f(thp, k + 1, j, i, zeta_dot, g.dzeta, nz, ny, nx, cfg.bc_x, cfg.bc_y);
-    const float th_zm = vert_tvd_face_val_f(thp, k,     j, i, zeta_dot, g.dzeta, nz, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float th_zp = vert_tvd_face_val_f(thp, k + 1, j, i, zd_exp, g.dzeta, nz, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float th_zm = vert_tvd_face_val_f(thp, k,     j, i, zd_exp, g.dzeta, nz, ny, nx, cfg.bc_x, cfg.bc_y);
 
     float tend_th = -(msf * uc * (th_xp - th_xm) / dx_f + my * vc * (th_yp - th_ym) / dy_f)
-                    - zeta_dot * (th_zp - th_zm) / dz_k;
+                    - zd_exp * (th_zp - th_zm) / dz_k;
 
     // Advect pi'
     const float pi_xp = horiz_face_val_x_f(pip, k, j, i + 1, uc, nz, ny, nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
     const float pi_xm = horiz_face_val_x_f(pip, k, j, i,     uc, nz, ny, nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
     const float pi_yp = horiz_face_val_y_f(pip, k, j + 1, i, vc, nz, ny, nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
     const float pi_ym = horiz_face_val_y_f(pip, k, j,     i, vc, nz, ny, nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
-    const float pi_zp = vert_tvd_face_val_f(pip, k + 1, j, i, zeta_dot, g.dzeta, nz, ny, nx, cfg.bc_x, cfg.bc_y);
-    const float pi_zm = vert_tvd_face_val_f(pip, k,     j, i, zeta_dot, g.dzeta, nz, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float pi_zp = vert_tvd_face_val_f(pip, k + 1, j, i, zd_exp, g.dzeta, nz, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float pi_zm = vert_tvd_face_val_f(pip, k,     j, i, zd_exp, g.dzeta, nz, ny, nx, cfg.bc_x, cfg.bc_y);
 
     float tend_pi = -(msf * uc * (pi_xp - pi_xm) / dx_f + my * vc * (pi_yp - pi_ym) / dy_f)
-                    - zeta_dot * (pi_zp - pi_zm) / dz_k;
+                    - zd_exp * (pi_zp - pi_zm) / dz_k;
 
     // Explicit 3D Laplacian diffusion (used cleanly for Straka K=75 m^2/s)
     const float th0 = thp[idx];
@@ -432,6 +517,28 @@ __global__ void nh_slow_scalar_kernel(
             lap_v -= (th0 - read_s_f(thp, k - 1, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y)) / (dz_m * dz_c);
         }
         tend_th += static_cast<float>(cfg.kh_const) * (lap_h + lap_v);
+    }
+
+    // Optional dimensionless 4th-order horizontal hyperdiffusion for 2*dx steep-orography noise control
+    if (cfg.hyperdiff_coeff > 0.0) {
+        const bool ok_x = (cfg.bc_x == 1) || (i >= 2 && i <= nx - 3);
+        const bool ok_y = (cfg.bc_y == 1) || (j >= 2 && j <= ny - 3);
+        float d4 = 0.0f;
+        if (ok_x) {
+            d4 += read_s_f(thp, k, j, i - 2, nz, ny, nx, cfg.bc_x, cfg.bc_y)
+                - 4.0f * read_s_f(thp, k, j, i - 1, nz, ny, nx, cfg.bc_x, cfg.bc_y)
+                + 6.0f * th0
+                - 4.0f * read_s_f(thp, k, j, i + 1, nz, ny, nx, cfg.bc_x, cfg.bc_y)
+                + read_s_f(thp, k, j, i + 2, nz, ny, nx, cfg.bc_x, cfg.bc_y);
+        }
+        if (ok_y) {
+            d4 += read_s_f(thp, k, j - 2, i, nz, ny, nx, cfg.bc_x, cfg.bc_y)
+                - 4.0f * read_s_f(thp, k, j - 1, i, nz, ny, nx, cfg.bc_x, cfg.bc_y)
+                + 6.0f * th0
+                - 4.0f * read_s_f(thp, k, j + 1, i, nz, ny, nx, cfg.bc_x, cfg.bc_y)
+                + read_s_f(thp, k, j + 2, i, nz, ny, nx, cfg.bc_x, cfg.bc_y);
+        }
+        tend_th -= (static_cast<float>(cfg.hyperdiff_coeff) / fmaxf(tau_stage, 1e-6f)) * d4;
     }
 
     // Optional Davies lateral boundary relaxation
@@ -464,6 +571,7 @@ __global__ void nh_slow_scalar_kernel(
 __global__ void nh_slow_u_kernel(
     NhGridConfig cfg,
     DeviceStaticGrid g,
+    float tau_stage,
     const float* u,
     const float* v,
     const float* w,
@@ -530,14 +638,16 @@ __global__ void nh_slow_u_kernel(
                 up3_left_f(u_get(k, j + 1, i), uc, u_get(k, j - 1, i))) / dy_f;
     }
     const float dz_k = static_cast<float>(g.dzeta[k]);
+    const float zd_cap = 0.45f * dz_k / fmaxf(tau_stage, 1e-6f);
+    const float zd_exp = fmaxf(-zd_cap, fminf(zd_cap, zeta_dot));
     float dudz = 0.0f;
-    if (zeta_dot >= 0.0f && k > 0) {
+    if (zd_exp >= 0.0f && k > 0) {
         dudz = (uc - u_get(k - 1, j, i)) / (0.5f * (dz_k + static_cast<float>(g.dzeta[k - 1])));
-    } else if (zeta_dot < 0.0f && k < nz - 1) {
+    } else if (zd_exp < 0.0f && k < nz - 1) {
         dudz = (u_get(k + 1, j, i) - uc) / (0.5f * (static_cast<float>(g.dzeta[k + 1]) + dz_k));
     }
 
-    float tend = -(msf * uc * dudx + my * vc * dudy) - zeta_dot * dudz;
+    float tend = -(msf * uc * dudx + my * vc * dudy) - zd_exp * dudz;
 
     if (cfg.use_coriolis) {
         const float f_u = 0.5f * (static_cast<float>(g.fcor[j * nx + il]) + static_cast<float>(g.fcor[j * nx + ir]));
@@ -570,6 +680,21 @@ __global__ void nh_slow_u_kernel(
         tend += static_cast<float>(cfg.km_const) * (lap_h + lap_v);
     }
 
+    if (cfg.hyperdiff_coeff > 0.0) {
+        const bool ok_x = (cfg.bc_x == 1) || (i >= 2 && i <= nx - 2);
+        const bool ok_y = (cfg.bc_y == 1) || (j >= 2 && j <= ny - 3);
+        float d4 = 0.0f;
+        if (ok_x) {
+            d4 += u_get(k, j, i - 2) - 4.0f * u_get(k, j, i - 1) + 6.0f * uc
+                - 4.0f * u_get(k, j, i + 1) + u_get(k, j, i + 2);
+        }
+        if (ok_y) {
+            d4 += u_get(k, j - 2, i) - 4.0f * u_get(k, j - 1, i) + 6.0f * uc
+                - 4.0f * u_get(k, j + 1, i) + u_get(k, j + 2, i);
+        }
+        tend -= (static_cast<float>(cfg.hyperdiff_coeff) / fmaxf(tau_stage, 1e-6f)) * d4;
+    }
+
     if ((cfg.bc_x == 2 || cfg.bc_y == 2) && lbc_u != nullptr && cfg.lbc_tau_max_s > 0.0) {
         const float tau_max = static_cast<float>(cfg.lbc_tau_max_s);
         float tau = 0.0f;
@@ -593,6 +718,7 @@ __global__ void nh_slow_u_kernel(
 __global__ void nh_slow_v_kernel(
     NhGridConfig cfg,
     DeviceStaticGrid g,
+    float tau_stage,
     const float* u,
     const float* v,
     const float* w,
@@ -658,14 +784,16 @@ __global__ void nh_slow_v_kernel(
                 up3_left_f(v_get(k, j + 1, i), vc, v_get(k, j - 1, i))) / dy_f;
     }
     const float dz_k = static_cast<float>(g.dzeta[k]);
+    const float zd_cap = 0.45f * dz_k / fmaxf(tau_stage, 1e-6f);
+    const float zd_exp = fmaxf(-zd_cap, fminf(zd_cap, zeta_dot));
     float dvdz = 0.0f;
-    if (zeta_dot >= 0.0f && k > 0) {
+    if (zd_exp >= 0.0f && k > 0) {
         dvdz = (vc - v_get(k - 1, j, i)) / (0.5f * (dz_k + static_cast<float>(g.dzeta[k - 1])));
-    } else if (zeta_dot < 0.0f && k < nz - 1) {
+    } else if (zd_exp < 0.0f && k < nz - 1) {
         dvdz = (v_get(k + 1, j, i) - vc) / (0.5f * (static_cast<float>(g.dzeta[k + 1]) + dz_k));
     }
 
-    float tend = -(msf * uc * dvdx + my * vc * dvdy) - zeta_dot * dvdz;
+    float tend = -(msf * uc * dvdx + my * vc * dvdy) - zd_exp * dvdz;
 
     if (cfg.use_coriolis) {
         const float f_v = 0.5f * (static_cast<float>(g.fcor[jl * nx + i]) + static_cast<float>(g.fcor[jr * nx + i]));
@@ -698,6 +826,21 @@ __global__ void nh_slow_v_kernel(
         tend += static_cast<float>(cfg.km_const) * (lap_h + lap_v);
     }
 
+    if (cfg.hyperdiff_coeff > 0.0) {
+        const bool ok_x = (cfg.bc_x == 1) || (i >= 2 && i <= nx - 3);
+        const bool ok_y = (cfg.bc_y == 1) || (j >= 2 && j <= ny - 2);
+        float d4 = 0.0f;
+        if (ok_x) {
+            d4 += v_get(k, j, i - 2) - 4.0f * v_get(k, j, i - 1) + 6.0f * vc
+                - 4.0f * v_get(k, j, i + 1) + v_get(k, j, i + 2);
+        }
+        if (ok_y) {
+            d4 += v_get(k, j - 2, i) - 4.0f * v_get(k, j - 1, i) + 6.0f * vc
+                - 4.0f * v_get(k, j + 1, i) + v_get(k, j + 2, i);
+        }
+        tend -= (static_cast<float>(cfg.hyperdiff_coeff) / fmaxf(tau_stage, 1e-6f)) * d4;
+    }
+
     if ((cfg.bc_x == 2 || cfg.bc_y == 2) && lbc_v != nullptr && cfg.lbc_tau_max_s > 0.0) {
         const float tau_max = static_cast<float>(cfg.lbc_tau_max_s);
         float tau = 0.0f;
@@ -721,6 +864,7 @@ __global__ void nh_slow_v_kernel(
 __global__ void nh_slow_w_kernel(
     NhGridConfig cfg,
     DeviceStaticGrid g,
+    float tau_stage,
     const float* u,
     const float* v,
     const float* w,
@@ -780,14 +924,17 @@ __global__ void nh_slow_w_kernel(
         dwdy = (up3_left_f(w_get(k, j + 2, i), w_get(k, j + 1, i), wc) -
                 up3_left_f(w_get(k, j + 1, i), wc, w_get(k, j - 1, i))) / dy_f;
     }
+    const float dz_w_min = fminf(ds_k, ds_km);
+    const float zd_cap = 0.45f * dz_w_min / fmaxf(tau_stage, 1e-6f);
+    const float zd_exp = fmaxf(-zd_cap, fminf(zd_cap, zeta_dot));
     float dwdz = 0.0f;
-    if (zeta_dot >= 0.0f) {
+    if (zd_exp >= 0.0f) {
         dwdz = (wc - w_get(k - 1, j, i)) / ds_km;
     } else {
         dwdz = (w_get(k + 1, j, i) - wc) / ds_k;
     }
 
-    float tend = -(msf * u_w * dwdx + my * v_w * dwdy) - zeta_dot * dwdz;
+    float tend = -(msf * u_w * dwdx + my * v_w * dwdy) - zd_exp * dwdz;
 
     if (cfg.km_const > 0.0) {
         const float lap_h = (msf * msf) * (w_get(k, j, i + 1) - 2.0f * wc + w_get(k, j, i - 1)) / (dx_f * dx_f)
@@ -814,6 +961,354 @@ __global__ void nh_slow_w_kernel(
     }
 
     rw[idx] = tend;
+}
+
+// ---------------------------------------------------------------------------
+// IEVA (Wicker & Skamarock 2020): Column-Implicit Residual Vertical Advection
+// Solves strictly diagonally-dominant tridiagonal system wherever |CFL_z| > 0.45
+// ---------------------------------------------------------------------------
+__global__ void nh_ieva_vert_advect_scalar_kernel(
+    NhGridConfig cfg,
+    DeviceStaticGrid g,
+    float tau_stage,
+    const float* u,
+    const float* v,
+    const float* w,
+    float* thp,
+    float* pip,
+    double* tri_c,
+    double* tri_d
+) {
+    const int32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int32_t j = blockIdx.y * blockDim.y + threadIdx.y;
+    if (j >= cfg.ny || i >= cfg.nx) return;
+
+    const int32_t nz = cfg.nz, ny = cfg.ny, nx = cfg.nx;
+    const size_t col_stride = static_cast<size_t>(ny) * nx;
+    const size_t col = static_cast<size_t>(j) * nx + i;
+    const float hs = static_cast<float>(g.hs[col]);
+    const float tau_safe = fmaxf(tau_stage, 1e-6f);
+
+    bool any_imp = false;
+    float gz_lo = 0.0f;
+    compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, 0, j, i, gz_lo);
+    for (int32_t k = 0; k < nz; ++k) {
+        float gz_hi = 0.0f;
+        compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, k + 1, j, i, gz_hi);
+        const float g_s = 1.0f + static_cast<float>(g.db_s[k]) * hs;
+        const float zd = 0.5f * (gz_lo + gz_hi) / fmaxf(g_s, 1e-4f);
+        gz_lo = gz_hi;
+        const float dz_k = static_cast<float>(g.dzeta[k]);
+        const float zd_cap = 0.45f * dz_k / tau_safe;
+        if (fabsf(zd) > zd_cap) {
+            any_imp = true;
+            break;
+        }
+    }
+    if (!any_imp) return;
+
+    // Pass 1: Solve tridiagonal system for theta' and factorize tri_c once
+    compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, 0, j, i, gz_lo);
+    for (int32_t k = 0; k < nz; ++k) {
+        float gz_hi = 0.0f;
+        compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, k + 1, j, i, gz_hi);
+        const float g_s = 1.0f + static_cast<float>(g.db_s[k]) * hs;
+        const float zd = 0.5f * (gz_lo + gz_hi) / fmaxf(g_s, 1e-4f);
+        gz_lo = gz_hi;
+        const float dz_k = static_cast<float>(g.dzeta[k]);
+        const float zd_cap = 0.45f * dz_k / tau_safe;
+        const float zd_exp = fmaxf(-zd_cap, fminf(zd_cap, zd));
+        const double zd_imp = static_cast<double>(zd - zd_exp);
+
+        const size_t idx = static_cast<size_t>(k) * col_stride + col;
+        const double A_k = (k > 0 && zd_imp > 0.0) ? (-tau_stage * zd_imp / g.dzeta[k]) : 0.0;
+        const double C_k = (k < nz - 1 && zd_imp < 0.0) ? (tau_stage * zd_imp / g.dzeta[k]) : 0.0;
+        const double B_k = 1.0 - A_k - C_k;
+        const double rhs = static_cast<double>(thp[idx]);
+        if (k == 0) {
+            tri_c[idx] = C_k / B_k;
+            tri_d[idx] = rhs / B_k;
+        } else {
+            const size_t idx_m = static_cast<size_t>(k - 1) * col_stride + col;
+            const double denom = B_k - A_k * tri_c[idx_m];
+            tri_c[idx] = (k < nz - 1) ? (C_k / denom) : 0.0;
+            tri_d[idx] = (rhs - A_k * tri_d[idx_m]) / denom;
+        }
+    }
+    double x_next = tri_d[static_cast<size_t>(nz - 1) * col_stride + col];
+    thp[static_cast<size_t>(nz - 1) * col_stride + col] = static_cast<float>(x_next);
+    for (int32_t k = nz - 2; k >= 0; --k) {
+        const size_t idx = static_cast<size_t>(k) * col_stride + col;
+        x_next = tri_d[idx] - tri_c[idx] * x_next;
+        thp[idx] = static_cast<float>(x_next);
+    }
+
+    // Pass 2: Forward/backward Thomas for pi' using identical velocity field
+    compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, 0, j, i, gz_lo);
+    for (int32_t k = 0; k < nz; ++k) {
+        float gz_hi = 0.0f;
+        compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, k + 1, j, i, gz_hi);
+        const float g_s = 1.0f + static_cast<float>(g.db_s[k]) * hs;
+        const float zd = 0.5f * (gz_lo + gz_hi) / fmaxf(g_s, 1e-4f);
+        gz_lo = gz_hi;
+        const float dz_k = static_cast<float>(g.dzeta[k]);
+        const float zd_cap = 0.45f * dz_k / tau_safe;
+        const float zd_exp = fmaxf(-zd_cap, fminf(zd_cap, zd));
+        const double zd_imp = static_cast<double>(zd - zd_exp);
+
+        const size_t idx = static_cast<size_t>(k) * col_stride + col;
+        const double A_k = (k > 0 && zd_imp > 0.0) ? (-tau_stage * zd_imp / g.dzeta[k]) : 0.0;
+        const double C_k = (k < nz - 1 && zd_imp < 0.0) ? (tau_stage * zd_imp / g.dzeta[k]) : 0.0;
+        const double B_k = 1.0 - A_k - C_k;
+        const double rhs = static_cast<double>(pip[idx]);
+        if (k == 0) {
+            tri_c[idx] = C_k / B_k;
+            tri_d[idx] = rhs / B_k;
+        } else {
+            const size_t idx_m = static_cast<size_t>(k - 1) * col_stride + col;
+            const double denom = B_k - A_k * tri_c[idx_m];
+            tri_c[idx] = (k < nz - 1) ? (C_k / denom) : 0.0;
+            tri_d[idx] = (rhs - A_k * tri_d[idx_m]) / denom;
+        }
+    }
+    x_next = tri_d[static_cast<size_t>(nz - 1) * col_stride + col];
+    pip[static_cast<size_t>(nz - 1) * col_stride + col] = static_cast<float>(x_next);
+    for (int32_t k = nz - 2; k >= 0; --k) {
+        const size_t idx = static_cast<size_t>(k) * col_stride + col;
+        x_next = tri_d[idx] - tri_c[idx] * x_next;
+        pip[idx] = static_cast<float>(x_next);
+    }
+}
+
+__global__ void nh_ieva_vert_advect_u_kernel(
+    NhGridConfig cfg,
+    DeviceStaticGrid g,
+    float tau_stage,
+    const float* v,
+    const float* w,
+    float* u,
+    double* tri_c,
+    double* tri_d
+) {
+    const int32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int32_t j = blockIdx.y * blockDim.y + threadIdx.y;
+    if (j >= cfg.ny || i > cfg.nx) return;
+    if (cfg.bc_x == 0 && (i == 0 || i == cfg.nx)) return;
+
+    const int32_t nz = cfg.nz, ny = cfg.ny, nx = cfg.nx;
+    const size_t col_stride = static_cast<size_t>(ny) * (nx + 1);
+    const size_t col = static_cast<size_t>(j) * (nx + 1) + i;
+    const int32_t il = (cfg.bc_x == 1) ? wrap_idx(i - 1, nx) : ((i <= 0) ? 0 : i - 1);
+    const int32_t ir = (cfg.bc_x == 1) ? wrap_idx(i, nx) : ((i >= nx) ? nx - 1 : i);
+    const float hs_u = 0.5f * (static_cast<float>(g.hs[j * nx + il]) + static_cast<float>(g.hs[j * nx + ir]));
+    const float tau_safe = fmaxf(tau_stage, 1e-6f);
+
+    bool any_imp = false;
+    float gzl_lo = 0.0f, gzr_lo = 0.0f;
+    compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, 0, j, il, gzl_lo);
+    compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, 0, j, ir, gzr_lo);
+    for (int32_t k = 0; k < nz; ++k) {
+        float gzl_hi = 0.0f, gzr_hi = 0.0f;
+        compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, k + 1, j, il, gzl_hi);
+        compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, k + 1, j, ir, gzr_hi);
+        const float g_u = 1.0f + static_cast<float>(g.db_s[k]) * hs_u;
+        const float zd = 0.25f * (gzl_lo + gzl_hi + gzr_lo + gzr_hi) / fmaxf(g_u, 1e-4f);
+        gzl_lo = gzl_hi; gzr_lo = gzr_hi;
+        const float dz_k = static_cast<float>(g.dzeta[k]);
+        if (fabsf(zd) > 0.45f * dz_k / tau_safe) {
+            any_imp = true;
+            break;
+        }
+    }
+    if (!any_imp) return;
+
+    compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, 0, j, il, gzl_lo);
+    compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, 0, j, ir, gzr_lo);
+    for (int32_t k = 0; k < nz; ++k) {
+        float gzl_hi = 0.0f, gzr_hi = 0.0f;
+        compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, k + 1, j, il, gzl_hi);
+        compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, k + 1, j, ir, gzr_hi);
+        const float g_u = 1.0f + static_cast<float>(g.db_s[k]) * hs_u;
+        const float zd = 0.25f * (gzl_lo + gzl_hi + gzr_lo + gzr_hi) / fmaxf(g_u, 1e-4f);
+        gzl_lo = gzl_hi; gzr_lo = gzr_hi;
+        const float dz_k = static_cast<float>(g.dzeta[k]);
+        const float zd_cap = 0.45f * dz_k / tau_safe;
+        const float zd_exp = fmaxf(-zd_cap, fminf(zd_cap, zd));
+        const double zd_imp = static_cast<double>(zd - zd_exp);
+
+        const size_t idx = static_cast<size_t>(k) * col_stride + col;
+        const double A_k = (k > 0 && zd_imp > 0.0) ? (-tau_stage * zd_imp / (0.5 * (g.dzeta[k] + g.dzeta[k - 1]))) : 0.0;
+        const double C_k = (k < nz - 1 && zd_imp < 0.0) ? (tau_stage * zd_imp / (0.5 * (g.dzeta[k + 1] + g.dzeta[k]))) : 0.0;
+        const double B_k = 1.0 - A_k - C_k;
+        const double rhs = static_cast<double>(u[idx]);
+        if (k == 0) {
+            tri_c[idx] = C_k / B_k;
+            tri_d[idx] = rhs / B_k;
+        } else {
+            const size_t idx_m = static_cast<size_t>(k - 1) * col_stride + col;
+            const double denom = B_k - A_k * tri_c[idx_m];
+            tri_c[idx] = (k < nz - 1) ? (C_k / denom) : 0.0;
+            tri_d[idx] = (rhs - A_k * tri_d[idx_m]) / denom;
+        }
+    }
+    double x_next = tri_d[static_cast<size_t>(nz - 1) * col_stride + col];
+    u[static_cast<size_t>(nz - 1) * col_stride + col] = static_cast<float>(x_next);
+    for (int32_t k = nz - 2; k >= 0; --k) {
+        const size_t idx = static_cast<size_t>(k) * col_stride + col;
+        x_next = tri_d[idx] - tri_c[idx] * x_next;
+        u[idx] = static_cast<float>(x_next);
+    }
+}
+
+__global__ void nh_ieva_vert_advect_v_kernel(
+    NhGridConfig cfg,
+    DeviceStaticGrid g,
+    float tau_stage,
+    const float* u,
+    const float* w,
+    float* v,
+    double* tri_c,
+    double* tri_d
+) {
+    const int32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int32_t j = blockIdx.y * blockDim.y + threadIdx.y;
+    if (j > cfg.ny || i >= cfg.nx) return;
+    if (cfg.bc_y == 0 && (j == 0 || j == cfg.ny)) return;
+
+    const int32_t nz = cfg.nz, ny = cfg.ny, nx = cfg.nx;
+    const size_t col_stride = static_cast<size_t>(ny + 1) * nx;
+    const size_t col = static_cast<size_t>(j) * nx + i;
+    const int32_t jl = (cfg.bc_y == 1) ? wrap_idx(j - 1, ny) : ((j <= 0) ? 0 : j - 1);
+    const int32_t jr = (cfg.bc_y == 1) ? wrap_idx(j, ny) : ((j >= ny) ? ny - 1 : j);
+    const float hs_v = 0.5f * (static_cast<float>(g.hs[jl * nx + i]) + static_cast<float>(g.hs[jr * nx + i]));
+    const float tau_safe = fmaxf(tau_stage, 1e-6f);
+
+    bool any_imp = false;
+    float gzl_lo = 0.0f, gzr_lo = 0.0f;
+    compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, 0, jl, i, gzl_lo);
+    compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, 0, jr, i, gzr_lo);
+    for (int32_t k = 0; k < nz; ++k) {
+        float gzl_hi = 0.0f, gzr_hi = 0.0f;
+        compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, k + 1, jl, i, gzl_hi);
+        compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, k + 1, jr, i, gzr_hi);
+        const float g_v = 1.0f + static_cast<float>(g.db_s[k]) * hs_v;
+        const float zd = 0.25f * (gzl_lo + gzl_hi + gzr_lo + gzr_hi) / fmaxf(g_v, 1e-4f);
+        gzl_lo = gzl_hi; gzr_lo = gzr_hi;
+        const float dz_k = static_cast<float>(g.dzeta[k]);
+        if (fabsf(zd) > 0.45f * dz_k / tau_safe) {
+            any_imp = true;
+            break;
+        }
+    }
+    if (!any_imp) return;
+
+    compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, 0, jl, i, gzl_lo);
+    compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, 0, jr, i, gzr_lo);
+    for (int32_t k = 0; k < nz; ++k) {
+        float gzl_hi = 0.0f, gzr_hi = 0.0f;
+        compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, k + 1, jl, i, gzl_hi);
+        compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, k + 1, jr, i, gzr_hi);
+        const float g_v = 1.0f + static_cast<float>(g.db_s[k]) * hs_v;
+        const float zd = 0.25f * (gzl_lo + gzl_hi + gzr_lo + gzr_hi) / fmaxf(g_v, 1e-4f);
+        gzl_lo = gzl_hi; gzr_lo = gzr_hi;
+        const float dz_k = static_cast<float>(g.dzeta[k]);
+        const float zd_cap = 0.45f * dz_k / tau_safe;
+        const float zd_exp = fmaxf(-zd_cap, fminf(zd_cap, zd));
+        const double zd_imp = static_cast<double>(zd - zd_exp);
+
+        const size_t idx = static_cast<size_t>(k) * col_stride + col;
+        const double A_k = (k > 0 && zd_imp > 0.0) ? (-tau_stage * zd_imp / (0.5 * (g.dzeta[k] + g.dzeta[k - 1]))) : 0.0;
+        const double C_k = (k < nz - 1 && zd_imp < 0.0) ? (tau_stage * zd_imp / (0.5 * (g.dzeta[k + 1] + g.dzeta[k]))) : 0.0;
+        const double B_k = 1.0 - A_k - C_k;
+        const double rhs = static_cast<double>(v[idx]);
+        if (k == 0) {
+            tri_c[idx] = C_k / B_k;
+            tri_d[idx] = rhs / B_k;
+        } else {
+            const size_t idx_m = static_cast<size_t>(k - 1) * col_stride + col;
+            const double denom = B_k - A_k * tri_c[idx_m];
+            tri_c[idx] = (k < nz - 1) ? (C_k / denom) : 0.0;
+            tri_d[idx] = (rhs - A_k * tri_d[idx_m]) / denom;
+        }
+    }
+    double x_next = tri_d[static_cast<size_t>(nz - 1) * col_stride + col];
+    v[static_cast<size_t>(nz - 1) * col_stride + col] = static_cast<float>(x_next);
+    for (int32_t k = nz - 2; k >= 0; --k) {
+        const size_t idx = static_cast<size_t>(k) * col_stride + col;
+        x_next = tri_d[idx] - tri_c[idx] * x_next;
+        v[idx] = static_cast<float>(x_next);
+    }
+}
+
+__global__ void nh_ieva_vert_advect_w_kernel(
+    NhGridConfig cfg,
+    DeviceStaticGrid g,
+    float tau_stage,
+    const float* u,
+    const float* v,
+    float* w,
+    double* tri_c,
+    double* tri_d
+) {
+    const int32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int32_t j = blockIdx.y * blockDim.y + threadIdx.y;
+    if (j >= cfg.ny || i >= cfg.nx) return;
+
+    const int32_t nz = cfg.nz, ny = cfg.ny, nx = cfg.nx;
+    if (nz < 3) return;
+    const size_t col_stride = static_cast<size_t>(ny) * nx;
+    const size_t col = static_cast<size_t>(j) * nx + i;
+    const float hs = static_cast<float>(g.hs[col]);
+    const float tau_safe = fmaxf(tau_stage, 1e-6f);
+
+    bool any_imp = false;
+    for (int32_t k = 1; k < nz; ++k) {
+        float gz_w = 0.0f;
+        compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, k, j, i, gz_w);
+        const float g_w = 1.0f + static_cast<float>(g.db_w[k]) * hs;
+        const float zd = gz_w / fmaxf(g_w, 1e-4f);
+        const float dz_min = fminf(static_cast<float>(g.dzeta[k]), static_cast<float>(g.dzeta[k - 1]));
+        if (fabsf(zd) > 0.45f * dz_min / tau_safe) {
+            any_imp = true;
+            break;
+        }
+    }
+    if (!any_imp) return;
+
+    const double w0_bc = static_cast<double>(w[col]);
+    for (int32_t k = 1; k < nz; ++k) {
+        float gz_w = 0.0f;
+        compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, k, j, i, gz_w);
+        const float g_w = 1.0f + static_cast<float>(g.db_w[k]) * hs;
+        const float zd = gz_w / fmaxf(g_w, 1e-4f);
+        const float dz_min = fminf(static_cast<float>(g.dzeta[k]), static_cast<float>(g.dzeta[k - 1]));
+        const float zd_cap = 0.45f * dz_min / tau_safe;
+        const float zd_exp = fmaxf(-zd_cap, fminf(zd_cap, zd));
+        const double zd_imp = static_cast<double>(zd - zd_exp);
+
+        const size_t idx = static_cast<size_t>(k) * col_stride + col;
+        const double A_k = (zd_imp > 0.0) ? (-tau_stage * zd_imp / g.dzeta[k - 1]) : 0.0;
+        const double C_k = (zd_imp < 0.0) ? (tau_stage * zd_imp / g.dzeta[k]) : 0.0;
+        const double B_k = 1.0 - A_k - C_k;
+        double rhs = static_cast<double>(w[idx]);
+        if (k == 1) {
+            rhs -= A_k * w0_bc;
+            tri_c[idx] = C_k / B_k;
+            tri_d[idx] = rhs / B_k;
+        } else {
+            const size_t idx_m = static_cast<size_t>(k - 1) * col_stride + col;
+            const double denom = B_k - A_k * tri_c[idx_m];
+            tri_c[idx] = (k < nz - 1) ? (C_k / denom) : 0.0;
+            tri_d[idx] = (rhs - A_k * tri_d[idx_m]) / denom;
+        }
+    }
+    double x_next = tri_d[static_cast<size_t>(nz - 1) * col_stride + col];
+    w[static_cast<size_t>(nz - 1) * col_stride + col] = static_cast<float>(x_next);
+    for (int32_t k = nz - 2; k >= 1; --k) {
+        const size_t idx = static_cast<size_t>(k) * col_stride + col;
+        x_next = tri_d[idx] - tri_c[idx] * x_next;
+        w[idx] = static_cast<float>(x_next);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -887,7 +1382,7 @@ __global__ void nh_compute_div_kernel(
 __global__ void nh_acoustic_u_kernel(
     NhGridConfig cfg,
     DeviceStaticGrid g,
-    double dts,
+    float dts,
     const float* ru,
     const float* thp,
     const float* pip,
@@ -914,51 +1409,50 @@ __global__ void nh_acoustic_u_kernel(
     const size_t idxl = static_cast<size_t>(k) * ny * nx + static_cast<size_t>(j) * nx + il;
     const size_t idxr = static_cast<size_t>(k) * ny * nx + static_cast<size_t>(j) * nx + ir;
 
-    const double hs_l = g.hs[j * nx + il];
-    const double hs_r = g.hs[j * nx + ir];
-    const double msf_u = 0.5 * (g.msf[j * nx + il] + g.msf[j * nx + ir]);
+    const float dx_f = static_cast<float>(cfg.dx_m);
+    const float dy_f = static_cast<float>(cfg.dy_m);
+    const float hs_l = static_cast<float>(g.hs[j * nx + il]);
+    const float hs_r = static_cast<float>(g.hs[j * nx + ir]);
+    const float msf_u = 0.5f * (static_cast<float>(g.msf[j * nx + il]) + static_cast<float>(g.msf[j * nx + ir]));
 
-    double dpidx_z = 0.0;
+    float dpidx_z = 0.0f;
     if (cfg.bc_x == 1 || (i > 0 && i < nx)) {
         if (hs_l == hs_r) {
-            dpidx_z = (static_cast<double>(pip[idxr]) - static_cast<double>(pip[idxl])) / cfg.dx_m;
+            dpidx_z = (pip[idxr] - pip[idxl]) / dx_f;
         } else {
-            const double z_l = g.zeta_s[k] + g.b_s[k] * hs_l;
-            const double z_r = g.zeta_s[k] + g.b_s[k] * hs_r;
-            const double z_u = 0.5 * (z_l + z_r);
-            const double pi_l = interp_pi_at_z(cfg, g, pip, thp, qv, qc, qr, qi, qs, qg, k, j, il, hs_l, z_u);
-            const double pi_r = interp_pi_at_z(cfg, g, pip, thp, qv, qc, qr, qi, qs, qg, k, j, ir, hs_r, z_u);
-            dpidx_z = (pi_r - pi_l) / cfg.dx_m;
+            const double hs_l_d = g.hs[j * nx + il];
+            const double hs_r_d = g.hs[j * nx + ir];
+            const double z_l = g.zeta_s[k] + g.b_s[k] * hs_l_d;
+            const double z_r = g.zeta_s[k] + g.b_s[k] * hs_r_d;
+            const double z_u_d = 0.5 * (z_l + z_r);
+            const double pi_l = interp_pi_at_z_f(cfg, g, pip, thp, qv, qc, qr, qi, qs, qg, k, j, il, hs_l_d, z_u_d);
+            const double pi_r = interp_pi_at_z_f(cfg, g, pip, thp, qv, qc, qr, qi, qs, qg, k, j, ir, hs_r_d, z_u_d);
+            dpidx_z = static_cast<float>((pi_r - pi_l) / cfg.dx_m);
         }
     }
 
-    const double z_u = g.zeta_s[k] + g.b_s[k] * 0.5 * (hs_l + hs_r);
-    double qvl, qhl, qvr, qhr;
-    const double thb = eval_theta_bar(z_u, cfg.theta_sfc_k, cfg.n_ref_s);
-    const double vf_l = moisture_load_scalar(cfg.has_moist, idxl, qv, qc, qr, qi, qs, qg, qvl, qhl);
-    const double vf_r = moisture_load_scalar(cfg.has_moist, idxr, qv, qc, qr, qi, qs, qg, qvr, qhr);
-    const double thv_u = 0.5 * (
-        (thb + static_cast<double>(thp[idxl])) * vf_l +
-        (thb + static_cast<double>(thp[idxr])) * vf_r
-    );
+    const float z_u = static_cast<float>(g.zeta_s[k]) + static_cast<float>(g.b_s[k]) * (0.5f * (hs_l + hs_r));
+    float qvl, qhl, qvr, qhr;
+    const float thb = eval_theta_bar_f32(z_u, static_cast<float>(cfg.theta_sfc_k), static_cast<float>(cfg.n_ref_s));
+    const float vf_l = moisture_load_scalar_f(cfg.has_moist, idxl, qv, qc, qr, qi, qs, qg, qvl, qhl);
+    const float vf_r = moisture_load_scalar_f(cfg.has_moist, idxr, qv, qc, qr, qi, qs, qg, qvr, qhr);
+    const float thv_u = 0.5f * ((thb + thp[idxl]) * vf_l + (thb + thp[idxr]) * vf_r);
 
-    double ddiv_dx = 0.0;
+    float ddiv_dx = 0.0f;
     if (cfg.div_damp_coeff > 0.0 && div3d != nullptr && (cfg.bc_x == 1 || (i > 0 && i < nx))) {
-        const double dx_loc = cfg.is_spherical ? (cfg.dx_m / fmax(msf_u, 1e-6)) : cfg.dx_m;
-        const double dmin = fmin(dx_loc, cfg.dy_m);
-        const double nu_div = cfg.div_damp_coeff * (dmin * dmin) / fmax(dts, 1e-6);
-        ddiv_dx = nu_div * msf_u * (static_cast<double>(div3d[idxr]) - static_cast<double>(div3d[idxl])) / cfg.dx_m;
+        const float dx_loc = cfg.is_spherical ? (dx_f / fmaxf(msf_u, 1e-6f)) : dx_f;
+        const float dmin = fminf(dx_loc, dy_f);
+        const float nu_div = static_cast<float>(cfg.div_damp_coeff) * (dmin * dmin) / fmaxf(dts, 1e-6f);
+        ddiv_dx = nu_div * msf_u * (div3d[idxr] - div3d[idxl]) / dx_f;
     }
 
-    const double u_next = static_cast<double>(u[idx])
-                        + dts * (static_cast<double>(ru[idx]) - CP_D * thv_u * msf_u * dpidx_z + ddiv_dx);
-    u[idx] = static_cast<float>(u_next);
+    u[idx] += dts * (ru[idx] - CP_D_F * thv_u * msf_u * dpidx_z + ddiv_dx);
 }
 
 __global__ void nh_acoustic_v_kernel(
     NhGridConfig cfg,
     DeviceStaticGrid g,
-    double dts,
+    float dts,
     const float* rv,
     const float* thp,
     const float* pip,
@@ -985,56 +1479,56 @@ __global__ void nh_acoustic_v_kernel(
     const size_t idxl = static_cast<size_t>(k) * ny * nx + static_cast<size_t>(jl) * nx + i;
     const size_t idxr = static_cast<size_t>(k) * ny * nx + static_cast<size_t>(jr) * nx + i;
 
-    const double hs_l = g.hs[jl * nx + i];
-    const double hs_r = g.hs[jr * nx + i];
-    const double msf_v = 0.5 * (g.msf[jl * nx + i] + g.msf[jr * nx + i]);
-    const double my_v = cfg.is_spherical ? 1.0 : msf_v;
+    const float dx_f = static_cast<float>(cfg.dx_m);
+    const float dy_f = static_cast<float>(cfg.dy_m);
+    const float hs_l = static_cast<float>(g.hs[jl * nx + i]);
+    const float hs_r = static_cast<float>(g.hs[jr * nx + i]);
+    const float msf_v = 0.5f * (static_cast<float>(g.msf[jl * nx + i]) + static_cast<float>(g.msf[jr * nx + i]));
+    const float my_v = cfg.is_spherical ? 1.0f : msf_v;
 
-    double dpidy_z = 0.0;
+    float dpidy_z = 0.0f;
     if (cfg.bc_y == 1 || (j > 0 && j < ny)) {
         if (hs_l == hs_r) {
-            dpidy_z = (static_cast<double>(pip[idxr]) - static_cast<double>(pip[idxl])) / cfg.dy_m;
+            dpidy_z = (pip[idxr] - pip[idxl]) / dy_f;
         } else {
-            const double z_l = g.zeta_s[k] + g.b_s[k] * hs_l;
-            const double z_r = g.zeta_s[k] + g.b_s[k] * hs_r;
-            const double z_v = 0.5 * (z_l + z_r);
-            const double pi_l = interp_pi_at_z(cfg, g, pip, thp, qv, qc, qr, qi, qs, qg, k, jl, i, hs_l, z_v);
-            const double pi_r = interp_pi_at_z(cfg, g, pip, thp, qv, qc, qr, qi, qs, qg, k, jr, i, hs_r, z_v);
-            dpidy_z = (pi_r - pi_l) / cfg.dy_m;
+            const double hs_l_d = g.hs[jl * nx + i];
+            const double hs_r_d = g.hs[jr * nx + i];
+            const double z_l = g.zeta_s[k] + g.b_s[k] * hs_l_d;
+            const double z_r = g.zeta_s[k] + g.b_s[k] * hs_r_d;
+            const double z_v_d = 0.5 * (z_l + z_r);
+            const double pi_l = interp_pi_at_z_f(cfg, g, pip, thp, qv, qc, qr, qi, qs, qg, k, jl, i, hs_l_d, z_v_d);
+            const double pi_r = interp_pi_at_z_f(cfg, g, pip, thp, qv, qc, qr, qi, qs, qg, k, jr, i, hs_r_d, z_v_d);
+            dpidy_z = static_cast<float>((pi_r - pi_l) / cfg.dy_m);
         }
     }
 
-    const double z_v = g.zeta_s[k] + g.b_s[k] * 0.5 * (hs_l + hs_r);
-    double qvl, qhl, qvr, qhr;
-    const double thb = eval_theta_bar(z_v, cfg.theta_sfc_k, cfg.n_ref_s);
-    const double vf_l = moisture_load_scalar(cfg.has_moist, idxl, qv, qc, qr, qi, qs, qg, qvl, qhl);
-    const double vf_r = moisture_load_scalar(cfg.has_moist, idxr, qv, qc, qr, qi, qs, qg, qvr, qhr);
-    const double thv_v = 0.5 * (
-        (thb + static_cast<double>(thp[idxl])) * vf_l +
-        (thb + static_cast<double>(thp[idxr])) * vf_r
-    );
+    const float z_v = static_cast<float>(g.zeta_s[k]) + static_cast<float>(g.b_s[k]) * (0.5f * (hs_l + hs_r));
+    float qvl, qhl, qvr, qhr;
+    const float thb = eval_theta_bar_f32(z_v, static_cast<float>(cfg.theta_sfc_k), static_cast<float>(cfg.n_ref_s));
+    const float vf_l = moisture_load_scalar_f(cfg.has_moist, idxl, qv, qc, qr, qi, qs, qg, qvl, qhl);
+    const float vf_r = moisture_load_scalar_f(cfg.has_moist, idxr, qv, qc, qr, qi, qs, qg, qvr, qhr);
+    const float thv_v = 0.5f * ((thb + thp[idxl]) * vf_l + (thb + thp[idxr]) * vf_r);
 
-    double ddiv_dy = 0.0;
+    float ddiv_dy = 0.0f;
     if (cfg.div_damp_coeff > 0.0 && div3d != nullptr && (cfg.bc_y == 1 || (j > 0 && j < ny))) {
-        const double dx_loc = cfg.is_spherical ? (cfg.dx_m / fmax(msf_v, 1e-6)) : cfg.dx_m;
-        const double dmin = fmin(dx_loc, cfg.dy_m);
-        const double nu_div = cfg.div_damp_coeff * (dmin * dmin) / fmax(dts, 1e-6);
-        ddiv_dy = nu_div * my_v * (static_cast<double>(div3d[idxr]) - static_cast<double>(div3d[idxl])) / cfg.dy_m;
+        const float dx_loc = cfg.is_spherical ? (dx_f / fmaxf(msf_v, 1e-6f)) : dx_f;
+        const float dmin = fminf(dx_loc, dy_f);
+        const float nu_div = static_cast<float>(cfg.div_damp_coeff) * (dmin * dmin) / fmaxf(dts, 1e-6f);
+        ddiv_dy = nu_div * my_v * (div3d[idxr] - div3d[idxl]) / dy_f;
     }
 
-    const double v_next = static_cast<double>(v[idx])
-                        + dts * (static_cast<double>(rv[idx]) - CP_D * thv_v * my_v * dpidy_z + ddiv_dy);
-    v[idx] = static_cast<float>(v_next);
+    v[idx] += dts * (rv[idx] - CP_D_F * thv_v * my_v * dpidy_z + ddiv_dy);
 }
 
 // ---------------------------------------------------------------------------
 // Kernel 3: Column-implicit HEVI vertical (w, pi') Thomas solver + theta' update
-// Uses global coalesced d_tri_c and d_tri_d (zero per-thread nz arrays!).
+// Uses global coalesced FP32 views of d_tri_c and d_tri_d (zero per-thread nz arrays!).
 // ---------------------------------------------------------------------------
 __global__ void nh_acoustic_vert_implicit_kernel(
     NhGridConfig cfg,
     DeviceStaticGrid g,
-    double dts,
+    float dts,
+    float pi_sfc_f,
     const float* u,
     const float* v,
     const float* rw,
@@ -1045,8 +1539,8 @@ __global__ void nh_acoustic_vert_implicit_kernel(
     float* w,
     float* thp,
     float* pip,
-    double* tri_c,
-    double* tri_d
+    float* tri_c,
+    float* tri_d
 ) {
     const int32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     const int32_t j = blockIdx.y * blockDim.y + threadIdx.y;
@@ -1056,159 +1550,145 @@ __global__ void nh_acoustic_vert_implicit_kernel(
     const size_t col_stride = static_cast<size_t>(ny) * nx;
     const size_t h_idx = static_cast<size_t>(j) * nx + i;
 
-    const double hs = g.hs[h_idx];
-    const double msf = g.msf[h_idx];
-    const double dh_dx = (read_2d(g.hs, j, i + 1, ny, nx, cfg.bc_x, cfg.bc_y) -
-                          read_2d(g.hs, j, i - 1, ny, nx, cfg.bc_x, cfg.bc_y)) / (2.0 * cfg.dx_m);
-    const double dh_dy = (read_2d(g.hs, j + 1, i, ny, nx, cfg.bc_x, cfg.bc_y) -
-                          read_2d(g.hs, j - 1, i, ny, nx, cfg.bc_x, cfg.bc_y)) / (2.0 * cfg.dy_m);
-    const double slope_h = msf * dh_dx;
-    const double slope_y = (cfg.is_spherical ? 1.0 : msf) * dh_dy;
+    const float dx_f = static_cast<float>(cfg.dx_m);
+    const float dy_f = static_cast<float>(cfg.dy_m);
+    const float hs = static_cast<float>(g.hs[h_idx]);
+    const float msf = static_cast<float>(g.msf[h_idx]);
+    const float dh_dx = (read_2d_f(g.hs, j, i + 1, ny, nx, cfg.bc_x, cfg.bc_y) -
+                         read_2d_f(g.hs, j, i - 1, ny, nx, cfg.bc_x, cfg.bc_y)) / (2.0f * dx_f);
+    const float dh_dy = (read_2d_f(g.hs, j + 1, i, ny, nx, cfg.bc_x, cfg.bc_y) -
+                         read_2d_f(g.hs, j - 1, i, ny, nx, cfg.bc_x, cfg.bc_y)) / (2.0f * dy_f);
+    const float slope_h = msf * dh_dx;
+    const float slope_y = (cfg.is_spherical ? 1.0f : msf) * dh_dy;
 
-    const double msf_r = read_2d(g.msf, j, i + 1, ny, nx, cfg.bc_x, cfg.bc_y);
-    const double msf_l = read_2d(g.msf, j, i - 1, ny, nx, cfg.bc_x, cfg.bc_y);
-    const double msf_n = read_2d(g.msf, j + 1, i, ny, nx, cfg.bc_x, cfg.bc_y);
-    const double msf_s = read_2d(g.msf, j - 1, i, ny, nx, cfg.bc_x, cfg.bc_y);
-    const double mu_r = 0.5 * (msf + msf_r), mu_l = 0.5 * (msf + msf_l);
-    const double mv_n = 0.5 * (msf + msf_n), mv_s = 0.5 * (msf + msf_s);
+    const float msf_r = read_2d_f(g.msf, j, i + 1, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float msf_l = read_2d_f(g.msf, j, i - 1, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float msf_n = read_2d_f(g.msf, j + 1, i, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float msf_s = read_2d_f(g.msf, j - 1, i, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float mu_r = 0.5f * (msf + msf_r), mu_l = 0.5f * (msf + msf_l);
+    const float mv_n = 0.5f * (msf + msf_n), mv_s = 0.5f * (msf + msf_s);
 
-    const double hs_r = read_2d(g.hs, j, i + 1, ny, nx, cfg.bc_x, cfg.bc_y);
-    const double hs_l = read_2d(g.hs, j, i - 1, ny, nx, cfg.bc_x, cfg.bc_y);
-    const double hs_n = read_2d(g.hs, j + 1, i, ny, nx, cfg.bc_x, cfg.bc_y);
-    const double hs_s = read_2d(g.hs, j - 1, i, ny, nx, cfg.bc_x, cfg.bc_y);
-    const double hsu_r = 0.5 * (hs + hs_r), hsu_l = 0.5 * (hs + hs_l);
-    const double hsv_n = 0.5 * (hs + hs_n), hsv_s = 0.5 * (hs + hs_s);
+    const float hs_r = read_2d_f(g.hs, j, i + 1, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float hs_l = read_2d_f(g.hs, j, i - 1, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float hs_n = read_2d_f(g.hs, j + 1, i, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float hs_s = read_2d_f(g.hs, j - 1, i, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float hsu_r = 0.5f * (hs + hs_r), hsu_l = 0.5f * (hs + hs_l);
+    const float hsv_n = 0.5f * (hs + hs_n), hsv_s = 0.5f * (hs + hs_s);
 
-    const double beta = cfg.beta_offcenter;
-    const double omb = 1.0 - beta;
+    const float beta = static_cast<float>(cfg.beta_offcenter);
+    const float omb = 1.0f - beta;
+    const float th_sfc_f = static_cast<float>(cfg.theta_sfc_k);
+    const float n_ref_f = static_cast<float>(cfg.n_ref_s);
 
-    auto omega_h_at = [&](int32_t k_iface) -> double {
-        if (k_iface >= nz) return 0.0;
-        double uw = 0.0, vw = 0.0;
+    auto omega_h_at = [&](int32_t k_iface) -> float {
+        if (k_iface >= nz) return 0.0f;
+        float uw = 0.0f, vw = 0.0f;
         if (k_iface == 0) {
-            uw = 0.5 * (read_u(u, 0, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y) +
-                        read_u(u, 0, j, i + 1, nz, ny, nx, cfg.bc_x, cfg.bc_y));
-            vw = 0.5 * (read_v(v, 0, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y) +
-                        read_v(v, 0, j + 1, i, nz, ny, nx, cfg.bc_x, cfg.bc_y));
+            uw = 0.5f * (read_u_f(u, 0, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y) +
+                         read_u_f(u, 0, j, i + 1, nz, ny, nx, cfg.bc_x, cfg.bc_y));
+            vw = 0.5f * (read_v_f(v, 0, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y) +
+                         read_v_f(v, 0, j + 1, i, nz, ny, nx, cfg.bc_x, cfg.bc_y));
         } else {
-            const double ds_k = g.dzeta[k_iface];
-            const double ds_km = g.dzeta[k_iface - 1];
-            const double wt = ds_km / (ds_k + ds_km);
-            uw = (1.0 - wt) * 0.5 * (read_u(u, k_iface - 1, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y) +
-                                     read_u(u, k_iface - 1, j, i + 1, nz, ny, nx, cfg.bc_x, cfg.bc_y)) +
-                 wt         * 0.5 * (read_u(u, k_iface, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y) +
-                                     read_u(u, k_iface, j, i + 1, nz, ny, nx, cfg.bc_x, cfg.bc_y));
-            vw = (1.0 - wt) * 0.5 * (read_v(v, k_iface - 1, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y) +
-                                     read_v(v, k_iface - 1, j + 1, i, nz, ny, nx, cfg.bc_x, cfg.bc_y)) +
-                 wt         * 0.5 * (read_v(v, k_iface, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y) +
-                                     read_v(v, k_iface, j + 1, i, nz, ny, nx, cfg.bc_x, cfg.bc_y));
+            const float ds_k = static_cast<float>(g.dzeta[k_iface]);
+            const float ds_km = static_cast<float>(g.dzeta[k_iface - 1]);
+            const float wt = ds_km / (ds_k + ds_km);
+            uw = (1.0f - wt) * 0.5f * (read_u_f(u, k_iface - 1, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y) +
+                                       read_u_f(u, k_iface - 1, j, i + 1, nz, ny, nx, cfg.bc_x, cfg.bc_y)) +
+                 wt          * 0.5f * (read_u_f(u, k_iface, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y) +
+                                       read_u_f(u, k_iface, j, i + 1, nz, ny, nx, cfg.bc_x, cfg.bc_y));
+            vw = (1.0f - wt) * 0.5f * (read_v_f(v, k_iface - 1, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y) +
+                                       read_v_f(v, k_iface - 1, j + 1, i, nz, ny, nx, cfg.bc_x, cfg.bc_y)) +
+                 wt          * 0.5f * (read_v_f(v, k_iface, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y) +
+                                       read_v_f(v, k_iface, j + 1, i, nz, ny, nx, cfg.bc_x, cfg.bc_y));
         }
-        return -g.b_w[k_iface] * (slope_h * uw + slope_y * vw);
+        return -static_cast<float>(g.b_w[k_iface]) * (slope_h * uw + slope_y * vw);
     };
 
-    const double w0_new = -omega_h_at(0);
-    w[h_idx] = static_cast<float>(w0_new);
+    const float w0_new = -omega_h_at(0);
+    w[h_idx] = w0_new;
     w[static_cast<size_t>(nz) * col_stride + h_idx] = 0.0f;
 
-    // Pass 1: Precompute scalar layer hat_pi[k] -> store temporarily in tri_d[k]?
-    // Wait: tri_c & tri_d have size nz+1! Wait - during forward elimination k=1..nz-1 we ONLY
-    // need hat_pi[k] at levels k-1 and k! So we can keep sliding variables (hat_pi_prev, a_p_prev, a_m_prev, pi_m_prev)
-    // and compute hat_pi[k] on the fly in Pass 1 (storing hat_pi into pip only AFTER Thomas solve,
-    // wait: NO, pip[k] IS needed to compute hat_pi[k], OR store hat_pi[k] in tri_c[k] during a pre-pass?
-    // Wait: we need both hat_pi[k] and Thomas c'[k]! What about storing hat_pi[k] in pip[k]? NO, (1-beta)*pi_m + beta*hat_pi needs pi_m!).
-    // Wait: compute (pi_eff[k] = (1-beta)*pi_m[k] + beta*hat_pi[k]) and store hat_pi[k] into d_tri_c / NO:
-    // Look! At k=0..nz-1, computing pi_eff_k and storing pi_hat_k in w/pip:
-    // Actually we can pass through k=0..nz-1 computing pi_hat_k in 2 lines on the fly from scalar u,v,w,
-    // OR compute hat_pi_k at step k just once by keeping ONLY `prev` scalar registers in Pass 1?!
-    // CHECK: Does Pass 2 (backward substitution) need hat_pi[k] to update pip[k] = hat_pi[k] - dts*beta*(a_p*w[k+1] - a_m*w[k])?
-    // YES! So storing hat_pi[k] temporarily in pip[k] AFTER saving pi_eff[k] into RHS? Wait: why not check!
-    // During Pass 1 at level k, once pi_hat[k] is computed:
-    //   RHS[k] ONLY uses pi_eff[k] and pi_eff[k-1] (`pi_eff = (1-beta)*pi_m + beta*pi_hat`).
-    //   Notice after RHS[k] uses pi_eff[k-1] and pi_eff[k], pip[k-1] is NEVER read again in Pass 1!
-    //   AND Pass 2 updates pip[k] from pi_hat[k] and w[k+1], w[k]!
-    //   SO in Pass 1, as soon as we compute pi_hat[k] from pi_m[k], we can overwrite pip[k-1] = pi_hat[k-1] (keeping pi_hat_prev in a register!),
-    //   and overwrite pip[nz-1] = pi_hat[nz-1] at the end of Pass 1!! Zero extra arrays needed AND 100% coalesced!!
-
-    const double pi_sfc = pow(cfg.p_sfc_pa / P0_PA, KAPPA);
-    double om_lo = omega_h_at(0);
-    double ap_prev = 0.0, am_prev = 0.0, pi_eff_prev = 0.0, pi_hat_prev = 0.0, thb_km = 0.0;
-    double wm_prev = static_cast<double>(w[h_idx]);
+    float om_lo = omega_h_at(0);
+    float ap_prev = 0.0f, am_prev = 0.0f, pi_eff_prev = 0.0f, pi_hat_prev = 0.0f, thb_km = 0.0f;
+    float wm_prev = w0_new;
 
     for (int32_t k = 0; k < nz; ++k) {
         const size_t idx = static_cast<size_t>(k) * col_stride + h_idx;
-        const double z_s = g.zeta_s[k] + g.b_s[k] * hs;
-        const double g_s = 1.0 + g.db_s[k] * hs;
-        const double dz_s = g_s * g.dzeta[k];
+        const float dz_k = static_cast<float>(g.dzeta[k]);
+        const float db_s_k = static_cast<float>(g.db_s[k]);
+        const float z_s = static_cast<float>(g.zeta_s[k]) + static_cast<float>(g.b_s[k]) * hs;
+        const float g_s = 1.0f + db_s_k * hs;
+        const float dz_s = g_s * dz_k;
 
-        double thb = 0.0, pib = 0.0;
-        eval_theta_pi_bar_pis(z_s, cfg.theta_sfc_k, pi_sfc, cfg.n_ref_s, thb, pib);
-        const double c_ac = (R_D / CV_D) * pib;
+        float thb = 0.0f, pib = 0.0f;
+        eval_theta_pi_bar_f32(z_s, th_sfc_f, pi_sfc_f, n_ref_f, thb, pib);
+        const float c_ac = (R_D_F / CV_D_F) * pib;
 
-        const double om_hi = omega_h_at(k + 1);
-        const double gu_r = 1.0 + g.db_s[k] * hsu_r, gu_l = 1.0 + g.db_s[k] * hsu_l;
-        const double gv_n = 1.0 + g.db_s[k] * hsv_n, gv_s = 1.0 + g.db_s[k] * hsv_s;
-        const double u_r = read_u(u, k, j, i + 1, nz, ny, nx, cfg.bc_x, cfg.bc_y);
-        const double u_l = read_u(u, k, j, i,     nz, ny, nx, cfg.bc_x, cfg.bc_y);
-        const double v_n = read_v(v, k, j + 1, i, nz, ny, nx, cfg.bc_x, cfg.bc_y);
-        const double v_s = read_v(v, k, j,     i, nz, ny, nx, cfg.bc_x, cfg.bc_y);
+        const float om_hi = omega_h_at(k + 1);
+        const float gu_r = 1.0f + db_s_k * hsu_r, gu_l = 1.0f + db_s_k * hsu_l;
+        const float gv_n = 1.0f + db_s_k * hsv_n, gv_s = 1.0f + db_s_k * hsv_s;
+        const float u_r = read_u_f(u, k, j, i + 1, nz, ny, nx, cfg.bc_x, cfg.bc_y);
+        const float u_l = read_u_f(u, k, j, i,     nz, ny, nx, cfg.bc_x, cfg.bc_y);
+        const float v_n = read_v_f(v, k, j + 1, i, nz, ny, nx, cfg.bc_x, cfg.bc_y);
+        const float v_s = read_v_f(v, k, j,     i, nz, ny, nx, cfg.bc_x, cfg.bc_y);
 
-        const double hdiv_v = cfg.is_spherical
+        const float hdiv_v = cfg.is_spherical
             ? msf * (
-                (gu_r * u_r - gu_l * u_l) / cfg.dx_m +
-                (gv_n * v_n / mv_n - gv_s * v_s / mv_s) / cfg.dy_m
+                (gu_r * u_r - gu_l * u_l) / dx_f +
+                (gv_n * v_n / mv_n - gv_s * v_s / mv_s) / dy_f
             )
             : msf * msf * (
-                (gu_r * u_r / mu_r - gu_l * u_l / mu_l) / cfg.dx_m +
-                (gv_n * v_n / mv_n - gv_s * v_s / mv_s) / cfg.dy_m
+                (gu_r * u_r / mu_r - gu_l * u_l / mu_l) / dx_f +
+                (gv_n * v_n / mv_n - gv_s * v_s / mv_s) / dy_f
             );
-        const double d_h = (hdiv_v + (om_hi - om_lo) / g.dzeta[k]) / fmax(g_s, 1e-4);
+        const float d_h = (hdiv_v + (om_hi - om_lo) / dz_k) / fmaxf(g_s, 1e-4f);
         om_lo = om_hi;
 
-        const double ap = c_ac / dz_s - GRAVITY / (2.0 * CP_D * thb);
-        const double am = c_ac / dz_s + GRAVITY / (2.0 * CP_D * thb);
-        const double wm_cur = wm_prev;
-        const double wm_nxt = (k + 1 < nz) ? static_cast<double>(w[static_cast<size_t>(k + 1) * col_stride + h_idx]) : 0.0;
+        const float grav_term = GRAVITY_F / (2.0f * CP_D_F * thb);
+        const float ap = c_ac / dz_s - grav_term;
+        const float am = c_ac / dz_s + grav_term;
+        const float wm_cur = wm_prev;
+        const float wm_nxt = (k + 1 < nz) ? w[static_cast<size_t>(k + 1) * col_stride + h_idx] : 0.0f;
         wm_prev = wm_nxt;
 
-        const double pi_m = static_cast<double>(pip[idx]);
-        const double pi_hat = pi_m + dts * (
-            static_cast<double>(rpi[idx]) - c_ac * d_h - omb * (ap * wm_nxt - am * wm_cur)
-        );
-        const double pi_eff = omb * pi_m + beta * pi_hat;
+        const float pi_m = pip[idx];
+        const float pi_hat = pi_m + dts * (rpi[idx] - c_ac * d_h - omb * (ap * wm_nxt - am * wm_cur));
+        const float pi_eff = omb * pi_m + beta * pi_hat;
 
         if (k > 0) {
-            // Overwrite pip[k-1] with pi_hat_prev (safe: pi_m[k-1] already consumed!)
-            pip[static_cast<size_t>(k - 1) * col_stride + h_idx] = static_cast<float>(pi_hat_prev);
+            pip[static_cast<size_t>(k - 1) * col_stride + h_idx] = pi_hat_prev;
 
             const size_t w_idx = static_cast<size_t>(k) * col_stride + h_idx;
-            const double z_w = g.zeta_w[k] + g.b_w[k] * hs;
-            const double g_w = 1.0 + g.db_w[k] * hs;
-            const double dz_w = g_w * 0.5 * (g.dzeta[k] + g.dzeta[k - 1]);
+            const float z_w = static_cast<float>(g.zeta_w[k]) + static_cast<float>(g.b_w[k]) * hs;
+            const float g_w = 1.0f + static_cast<float>(g.db_w[k]) * hs;
+            const float dz_km = static_cast<float>(g.dzeta[k - 1]);
+            const float dz_w = g_w * 0.5f * (dz_k + dz_km);
 
-            const double thb_w = eval_theta_bar(z_w, cfg.theta_sfc_k, cfg.n_ref_s);
+            const float thb_w = eval_theta_bar_f32(z_w, th_sfc_f, n_ref_f);
 
             const size_t idx_km = static_cast<size_t>(k - 1) * col_stride + h_idx;
-            double qvm, qhm, qvp, qhp;
-            const double vfm = moisture_load_scalar(cfg.has_moist, idx_km, qv, qc, qr, qi, qs, qg, qvm, qhm);
-            const double vfp = moisture_load_scalar(cfg.has_moist, idx,    qv, qc, qr, qi, qs, qg, qvp, qhp);
+            float qvm, qhm, qvp, qhp;
+            const float vfm = moisture_load_scalar_f(cfg.has_moist, idx_km, qv, qc, qr, qi, qs, qg, qvm, qhm);
+            const float vfp = moisture_load_scalar_f(cfg.has_moist, idx,    qv, qc, qr, qi, qs, qg, qvp, qhp);
 
-            const double wt = g.dzeta[k - 1] / (g.dzeta[k] + g.dzeta[k - 1]);
-            const double dthv_km = (thb_km + static_cast<double>(thp[idx_km])) * vfm - thb_km;
-            const double dthv_kp = (thb    + static_cast<double>(thp[idx]))    * vfp - thb;
-            const double dthv_w = (1.0 - wt) * dthv_km + wt * dthv_kp;
-            const double thv_w = thb_w + dthv_w;
-            const double buoy = GRAVITY * dthv_w / thb_w;
+            const float wt = dz_km / (dz_k + dz_km);
+            const float dthv_km = thp[idx_km] * vfm + thb_km * (vfm - 1.0f);
+            const float dthv_kp = thp[idx]    * vfp + thb    * (vfp - 1.0f);
+            const float dthv_w = (1.0f - wt) * dthv_km + wt * dthv_kp;
+            const float thv_w = thb_w + dthv_w;
+            const float buoy = GRAVITY_F * dthv_w / thb_w;
 
-            const double pw = dts * (CP_D * thv_w) / dz_w;
-            const double tau_sp = sponge_tau(z_w, cfg.z_top_m, cfg.sponge_depth_m, cfg.sponge_tau_max_s);
+            const float pw = dts * (CP_D_F * thv_w) / dz_w;
+            const float tau_sp = sponge_tau_f(
+                z_w, static_cast<float>(cfg.z_top_m), static_cast<float>(cfg.sponge_depth_m), static_cast<float>(cfg.sponge_tau_max_s)
+            );
 
-            const double A_k = -pw * dts * beta * beta * am_prev;
-            const double B_k = 1.0 + dts * tau_sp + pw * dts * beta * beta * (am + ap_prev);
-            const double C_k = (k < nz - 1) ? (-pw * dts * beta * beta * ap) : 0.0;
+            const float pw_b2 = pw * dts * beta * beta;
+            const float A_k = -pw_b2 * am_prev;
+            const float B_k = 1.0f + dts * tau_sp + pw_b2 * (am + ap_prev);
+            const float C_k = (k < nz - 1) ? (-pw_b2 * ap) : 0.0f;
 
-            double rhs_k = static_cast<double>(w[w_idx])
-                         + dts * (static_cast<double>(rw[w_idx]) + buoy)
-                         - pw * (pi_eff - pi_eff_prev);
+            float rhs_k = w[w_idx] + dts * (rw[w_idx] + buoy) - pw * (pi_eff - pi_eff_prev);
             if (k == 1) rhs_k -= A_k * w0_new;
 
             if (k == 1) {
@@ -1216,7 +1696,7 @@ __global__ void nh_acoustic_vert_implicit_kernel(
                 tri_d[w_idx] = rhs_k / B_k;
             } else {
                 const size_t wm_idx = static_cast<size_t>(k - 1) * col_stride + h_idx;
-                const double denom = B_k - A_k * tri_c[wm_idx];
+                const float denom = B_k - A_k * tri_c[wm_idx];
                 tri_c[w_idx] = C_k / denom;
                 tri_d[w_idx] = (rhs_k - A_k * tri_d[wm_idx]) / denom;
             }
@@ -1228,39 +1708,41 @@ __global__ void nh_acoustic_vert_implicit_kernel(
         pi_hat_prev = pi_hat;
         thb_km = thb;
     }
-    pip[static_cast<size_t>(nz - 1) * col_stride + h_idx] = static_cast<float>(pi_hat_prev);
+    pip[static_cast<size_t>(nz - 1) * col_stride + h_idx] = pi_hat_prev;
 
     // Pass 2: Backward substitution for w[nz-1..1], then update pi_p[nz-1..0] and theta_p[nz-1..0]
-    double w_above = 0.0; // w[nz] = 0
-    double thb_w_hi = eval_theta_bar(g.zeta_w[nz] + g.b_w[nz] * hs, cfg.theta_sfc_k, cfg.n_ref_s);
+    float w_above = 0.0f; // w[nz] = 0
+    float thb_w_hi = eval_theta_bar_f32(
+        static_cast<float>(g.zeta_w[nz]) + static_cast<float>(g.b_w[nz]) * hs, th_sfc_f, n_ref_f
+    );
     for (int32_t k = nz - 1; k >= 0; --k) {
-        double w_below = w0_new;
+        float w_below = w0_new;
         if (k > 0) {
             const size_t w_idx = static_cast<size_t>(k) * col_stride + h_idx;
-            w_below = tri_d[w_idx] - ((k < nz - 1) ? tri_c[w_idx] * w_above : 0.0);
-            w[w_idx] = static_cast<float>(w_below);
+            w_below = tri_d[w_idx] - ((k < nz - 1) ? tri_c[w_idx] * w_above : 0.0f);
+            w[w_idx] = w_below;
         }
 
         const size_t idx = static_cast<size_t>(k) * col_stride + h_idx;
-        const double z_s = g.zeta_s[k] + g.b_s[k] * hs;
-        const double g_s = 1.0 + g.db_s[k] * hs;
-        const double dz_s = g_s * g.dzeta[k];
-        double thb = 0.0, pib = 0.0;
-        eval_theta_pi_bar_pis(z_s, cfg.theta_sfc_k, pi_sfc, cfg.n_ref_s, thb, pib);
-        const double c_ac = (R_D / CV_D) * pib;
-        const double ap = c_ac / dz_s - GRAVITY / (2.0 * CP_D * thb);
-        const double am = c_ac / dz_s + GRAVITY / (2.0 * CP_D * thb);
+        const float z_s = static_cast<float>(g.zeta_s[k]) + static_cast<float>(g.b_s[k]) * hs;
+        const float g_s = 1.0f + static_cast<float>(g.db_s[k]) * hs;
+        const float dz_s = g_s * static_cast<float>(g.dzeta[k]);
+        float thb = 0.0f, pib = 0.0f;
+        eval_theta_pi_bar_f32(z_s, th_sfc_f, pi_sfc_f, n_ref_f, thb, pib);
+        const float c_ac = (R_D_F / CV_D_F) * pib;
+        const float grav_term = GRAVITY_F / (2.0f * CP_D_F * thb);
+        const float ap = c_ac / dz_s - grav_term;
+        const float am = c_ac / dz_s + grav_term;
 
-        const double pi_hat = static_cast<double>(pip[idx]);
-        const double pi_new = pi_hat - dts * beta * (ap * w_above - am * w_below);
-        pip[idx] = static_cast<float>(pi_new);
+        const float pi_hat = pip[idx];
+        pip[idx] = pi_hat - dts * beta * (ap * w_above - am * w_below);
 
         // Symplectic Forward-Backward vertical theta_bar advection using updated w^{m+1}
-        const double thb_w_lo = eval_theta_bar(g.zeta_w[k] + g.b_w[k] * hs, cfg.theta_sfc_k, cfg.n_ref_s);
-        const double w_avg = 0.5 * (w_above + w_below);
-        const double th_new = static_cast<double>(thp[idx])
-                            + dts * (static_cast<double>(rth[idx]) - w_avg * (thb_w_hi - thb_w_lo) / dz_s);
-        thp[idx] = static_cast<float>(th_new);
+        const float thb_w_lo = eval_theta_bar_f32(
+            static_cast<float>(g.zeta_w[k]) + static_cast<float>(g.b_w[k]) * hs, th_sfc_f, n_ref_f
+        );
+        const float w_avg = 0.5f * (w_above + w_below);
+        thp[idx] += dts * (rth[idx] - w_avg * (thb_w_hi - thb_w_lo) / dz_s);
 
         thb_w_hi = thb_w_lo;
         w_above = w_below;
@@ -1378,14 +1860,13 @@ __device__ inline void compute_fluxes_for_cell_f(
     fz_l_hi  = wz * fmaxf(0.0f, q_zl_ho);
 }
 
-__global__ void nh_tracer_cfl_kernel(
+__global__ void nh_tracer_cfl_h_kernel(
     NhGridConfig cfg,
     DeviceStaticGrid g,
     float dt_s,
     float pi_sfc_f,
     const float* u,
     const float* v,
-    const float* w,
     uint32_t* max_cfl_u32
 ) {
     const int32_t i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1400,11 +1881,8 @@ __global__ void nh_tracer_cfl_kernel(
         const float fx_l = face_flux_x_f(cfg, g, pi_sfc_f, u, k, j, i);
         const float fy_n = face_flux_y_f(cfg, g, pi_sfc_f, v, k, j + 1, i);
         const float fy_s = face_flux_y_f(cfg, g, pi_sfc_f, v, k, j, i);
-        const float fz_t = face_flux_z_f(cfg, g, pi_sfc_f, u, v, w, k + 1, j, i);
-        const float fz_b = face_flux_z_f(cfg, g, pi_sfc_f, u, v, w, k, j, i);
         const float out = (fmaxf(0.0f, fx_r) + fmaxf(0.0f, -fx_l)) / dx_f
-                        + (fmaxf(0.0f, fy_n) + fmaxf(0.0f, -fy_s)) / dy_f
-                        +  fmaxf(0.0f, fz_t) + fmaxf(0.0f, -fz_b);
+                        + (fmaxf(0.0f, fy_n) + fmaxf(0.0f, -fy_s)) / dy_f;
         cfl = (dt_s * out) / vol;
     }
     const unsigned int lane = threadIdx.x & 31;
@@ -1423,7 +1901,6 @@ __global__ void nh_tracer_fct_pass1_kernel(
     float pi_sfc_f,
     const float* u,
     const float* v,
-    const float* w,
     const float* q,
     float* q_low,
     float* r_out
@@ -1433,46 +1910,46 @@ __global__ void nh_tracer_fct_pass1_kernel(
     const int32_t k = blockIdx.z;
     if (k >= cfg.nz || j >= cfg.ny || i >= cfg.nx) return;
 
-    const size_t idx = static_cast<size_t>(k) * cfg.ny * cfg.nx + static_cast<size_t>(j) * cfg.nx + i;
+    const int32_t nz = cfg.nz, ny = cfg.ny, nx = cfg.nx;
+    const size_t idx = static_cast<size_t>(k) * ny * nx + static_cast<size_t>(j) * nx + i;
     const float dx_f = static_cast<float>(cfg.dx_m);
     const float dy_f = static_cast<float>(cfg.dy_m);
     const float vol = fmaxf(cell_mass_vol_f(cfg, g, pi_sfc_f, k, j, i), 1e-12f);
 
-    float fxl_low, fxl_hi, fyl_low, fyl_hi, fzl_low, fzl_hi;
-    float fxr_low, fxr_hi, fyr_low, fyr_hi, fzr_low, fzr_hi;
-    compute_fluxes_for_cell_f(cfg, g, pi_sfc_f, q, u, v, w, k, j, i, fxl_low, fxl_hi, fyl_low, fyl_hi, fzl_low, fzl_hi);
+    float fxl_low, fxl_hi, fyl_low, fyl_hi;
+    {
+        const float ux = face_flux_x_f(cfg, g, pi_sfc_f, u, k, j, i);
+        const float q_up = (ux >= 0.0f) ? read_s_f(q, k, j, i - 1, nz, ny, nx, cfg.bc_x, cfg.bc_y) : read_s_f(q, k, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y);
+        const float q_ho = horiz_face_val_x_f(q, k, j, i, ux, nz, ny, nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
+        fxl_low = ux * q_up;
+        fxl_hi  = ux * fmaxf(0.0f, q_ho);
+    }
+    {
+        const float vy = face_flux_y_f(cfg, g, pi_sfc_f, v, k, j, i);
+        const float q_up = (vy >= 0.0f) ? read_s_f(q, k, j - 1, i, nz, ny, nx, cfg.bc_x, cfg.bc_y) : read_s_f(q, k, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y);
+        const float q_ho = horiz_face_val_y_f(q, k, j, i, vy, nz, ny, nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
+        fyl_low = vy * q_up;
+        fyl_hi  = vy * fmaxf(0.0f, q_ho);
+    }
 
-    // Right / North / Top face fluxes
+    float fxr_low, fxr_hi, fyr_low, fyr_hi;
     {
         const float ux = face_flux_x_f(cfg, g, pi_sfc_f, u, k, j, i + 1);
-        const float q_up = (ux >= 0.0f)
-            ? read_s_f(q, k, j, i,     cfg.nz, cfg.ny, cfg.nx, cfg.bc_x, cfg.bc_y)
-            : read_s_f(q, k, j, i + 1, cfg.nz, cfg.ny, cfg.nx, cfg.bc_x, cfg.bc_y);
-        const float q_ho = horiz_face_val_x_f(q, k, j, i + 1, ux, cfg.nz, cfg.ny, cfg.nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
+        const float q_up = (ux >= 0.0f) ? read_s_f(q, k, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y) : read_s_f(q, k, j, i + 1, nz, ny, nx, cfg.bc_x, cfg.bc_y);
+        const float q_ho = horiz_face_val_x_f(q, k, j, i + 1, ux, nz, ny, nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
         fxr_low = ux * q_up;
         fxr_hi  = ux * fmaxf(0.0f, q_ho);
     }
     {
         const float vy = face_flux_y_f(cfg, g, pi_sfc_f, v, k, j + 1, i);
-        const float q_up = (vy >= 0.0f)
-            ? read_s_f(q, k, j,     i, cfg.nz, cfg.ny, cfg.nx, cfg.bc_x, cfg.bc_y)
-            : read_s_f(q, k, j + 1, i, cfg.nz, cfg.ny, cfg.nx, cfg.bc_x, cfg.bc_y);
-        const float q_ho = horiz_face_val_y_f(q, k, j + 1, i, vy, cfg.nz, cfg.ny, cfg.nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
+        const float q_up = (vy >= 0.0f) ? read_s_f(q, k, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y) : read_s_f(q, k, j + 1, i, nz, ny, nx, cfg.bc_x, cfg.bc_y);
+        const float q_ho = horiz_face_val_y_f(q, k, j + 1, i, vy, nz, ny, nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
         fyr_low = vy * q_up;
         fyr_hi  = vy * fmaxf(0.0f, q_ho);
     }
-    {
-        const float wz = face_flux_z_f(cfg, g, pi_sfc_f, u, v, w, k + 1, j, i);
-        const float q_up = (wz >= 0.0f)
-            ? read_s_f(q, k,     j, i, cfg.nz, cfg.ny, cfg.nx, cfg.bc_x, cfg.bc_y)
-            : read_s_f(q, k + 1, j, i, cfg.nz, cfg.ny, cfg.nx, cfg.bc_x, cfg.bc_y);
-        const float q_ho = vert_tvd_face_val_f(q, k + 1, j, i, wz, g.dzeta, cfg.nz, cfg.ny, cfg.nx, cfg.bc_x, cfg.bc_y);
-        fzr_low = wz * q_up;
-        fzr_hi  = wz * fmaxf(0.0f, q_ho);
-    }
 
     const float q0 = fmaxf(0.0f, q[idx]);
-    const float div_low = (fxr_low - fxl_low) / dx_f + (fyr_low - fyl_low) / dy_f + (fzr_low - fzl_low);
+    const float div_low = (fxr_low - fxl_low) / dx_f + (fyr_low - fyl_low) / dy_f;
     const float qlow_val = fmaxf(0.0f, q0 - (dt_q / vol) * div_low);
     q_low[idx] = qlow_val;
 
@@ -1480,13 +1957,10 @@ __global__ void nh_tracer_fct_pass1_kernel(
     const float ax_l = fxl_hi - fxl_low;
     const float ay_n = fyr_hi - fyr_low;
     const float ay_s = fyl_hi - fyl_low;
-    const float az_t = fzr_hi - fzr_low;
-    const float az_b = fzl_hi - fzl_low;
 
     const float p_out = dt_q * (
         (fmaxf(0.0f, ax_r) + fmaxf(0.0f, -ax_l)) / dx_f +
-        (fmaxf(0.0f, ay_n) + fmaxf(0.0f, -ay_s)) / dy_f +
-        fmaxf(0.0f, az_t) + fmaxf(0.0f, -az_b)
+        (fmaxf(0.0f, ay_n) + fmaxf(0.0f, -ay_s)) / dy_f
     );
     const float q_avail = vol * qlow_val;
     r_out[idx] = (p_out > 1e-24f) ? fminf(1.0f, 0.999999f * (q_avail / p_out)) : 1.0f;
@@ -1499,7 +1973,6 @@ __global__ void nh_tracer_fct_pass2_kernel(
     float pi_sfc_f,
     const float* u,
     const float* v,
-    const float* w,
     const float* q_old,
     const float* q_low,
     const float* r_out,
@@ -1542,30 +2015,133 @@ __global__ void nh_tracer_fct_pass2_kernel(
             : read_s_f(r_out, k, jface,     i, nz, ny, nx, cfg.bc_x, cfg.bc_y);
         return A * r_donor;
     };
-    auto limited_z = [&](int32_t kface) -> float {
-        if (kface <= 0 || kface >= nz) return 0.0f;
-        const float wz = face_flux_z_f(cfg, g, pi_sfc_f, u, v, w, kface, j, i);
-        const float q_up = (wz >= 0.0f)
-            ? read_s_f(q_old, kface - 1, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y)
-            : read_s_f(q_old, kface,     j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y);
-        const float q_ho = vert_tvd_face_val_f(q_old, kface, j, i, wz, g.dzeta, nz, ny, nx, cfg.bc_x, cfg.bc_y);
-        const float A = wz * (fmaxf(0.0f, q_ho) - q_up);
-        const float r_donor = (A >= 0.0f)
-            ? r_out[static_cast<size_t>(kface - 1) * ny * nx + j * nx + i]
-            : r_out[static_cast<size_t>(kface)     * ny * nx + j * nx + i];
-        return A * r_donor;
-    };
 
     const float ax_r = limited_x(i + 1);
     const float ax_l = limited_x(i);
     const float ay_n = limited_y(j + 1);
     const float ay_s = limited_y(j);
-    const float az_t = limited_z(k + 1);
-    const float az_b = limited_z(k);
 
-    const float div_anti = (ax_r - ax_l) / dx_f + (ay_n - ay_s) / dy_f + (az_t - az_b);
+    const float div_anti = (ax_r - ax_l) / dx_f + (ay_n - ay_s) / dy_f;
     const float qn = q_low[idx] - (dt_q / vol) * div_anti;
     q_new[idx] = fmaxf(0.0f, qn);
+}
+
+__global__ void nh_tracer_vert_column_kernel(
+    NhGridConfig cfg,
+    DeviceStaticGrid g,
+    float dt_s,
+    float pi_sfc_f,
+    const float* u,
+    const float* v,
+    const float* w,
+    float* q,
+    float* q_low_buf,
+    float* r_out_buf,
+    double* tri_c,
+    double* tri_d
+) {
+    const int32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int32_t j = blockIdx.y * blockDim.y + threadIdx.y;
+    if (j >= cfg.ny || i >= cfg.nx) return;
+
+    const int32_t nz = cfg.nz, ny = cfg.ny, nx = cfg.nx;
+    const size_t col_stride = static_cast<size_t>(ny) * nx;
+    const size_t col = static_cast<size_t>(j) * nx + i;
+
+    float col_cfl_z = 0.0f;
+    float fz_bot = 0.0f;
+    for (int32_t k = 0; k < nz; ++k) {
+        const size_t idx = static_cast<size_t>(k) * col_stride + col;
+        const float fz_top = (k < nz - 1) ? face_flux_z_f(cfg, g, pi_sfc_f, u, v, w, k + 1, j, i) : 0.0f;
+        tri_c[idx] = static_cast<double>(fz_top);
+        const float vol = fmaxf(cell_mass_vol_f(cfg, g, pi_sfc_f, k, j, i), 1e-12f);
+        const float cfl_k = dt_s * (fmaxf(0.0f, fz_top) + fmaxf(0.0f, -fz_bot)) / vol;
+        col_cfl_z = fmaxf(col_cfl_z, cfl_k);
+        fz_bot = fz_top;
+    }
+    if (col_cfl_z <= 1e-12f) return;
+
+    if (col_cfl_z <= 0.65f) {
+        // Exact 1D conservative positive-definite Koren-TVD Zalesak FCT on full dt_s
+        float fzl_low = 0.0f, fzl_hi = 0.0f;
+        for (int32_t k = 0; k < nz; ++k) {
+            const size_t idx = static_cast<size_t>(k) * col_stride + col;
+            const float fz_top = static_cast<float>(tri_c[idx]);
+            float fzr_low = 0.0f, fzr_hi = 0.0f;
+            if (k < nz - 1) {
+                const float q_up = (fz_top >= 0.0f)
+                    ? read_s_f(q, k, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y)
+                    : read_s_f(q, k + 1, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y);
+                const float q_ho = vert_tvd_face_val_f(q, k + 1, j, i, fz_top, g.dzeta, nz, ny, nx, cfg.bc_x, cfg.bc_y);
+                fzr_low = fz_top * q_up;
+                fzr_hi = fz_top * fmaxf(0.0f, q_ho);
+            }
+            const float vol = fmaxf(cell_mass_vol_f(cfg, g, pi_sfc_f, k, j, i), 1e-12f);
+            const float q0 = fmaxf(0.0f, q[idx]);
+            const float qlow_val = fmaxf(0.0f, q0 - (dt_s / vol) * (fzr_low - fzl_low));
+            q_low_buf[idx] = qlow_val;
+            const float az_t = fzr_hi - fzr_low;
+            const float az_b = fzl_hi - fzl_low;
+            const float p_out = dt_s * (fmaxf(0.0f, az_t) + fmaxf(0.0f, -az_b));
+            r_out_buf[idx] = (p_out > 1e-24f) ? fminf(1.0f, 0.999999f * ((vol * qlow_val) / p_out)) : 1.0f;
+            fzl_low = fzr_low;
+            fzl_hi = fzr_hi;
+        }
+        float az_b = 0.0f;
+        for (int32_t k = 0; k < nz; ++k) {
+            const size_t idx = static_cast<size_t>(k) * col_stride + col;
+            const float fz_top = static_cast<float>(tri_c[idx]);
+            float az_t = 0.0f;
+            if (k < nz - 1) {
+                const float q_up = (fz_top >= 0.0f)
+                    ? read_s_f(q, k, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y)
+                    : read_s_f(q, k + 1, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y);
+                const float q_ho = vert_tvd_face_val_f(q, k + 1, j, i, fz_top, g.dzeta, nz, ny, nx, cfg.bc_x, cfg.bc_y);
+                const float A = fz_top * (fmaxf(0.0f, q_ho) - q_up);
+                const float r_donor = (A >= 0.0f)
+                    ? r_out_buf[idx]
+                    : r_out_buf[static_cast<size_t>(k + 1) * col_stride + col];
+                az_t = A * r_donor;
+            }
+            const float vol = fmaxf(cell_mass_vol_f(cfg, g, pi_sfc_f, k, j, i), 1e-12f);
+            tri_d[idx] = static_cast<double>(fmaxf(0.0f, q_low_buf[idx] - (dt_s / vol) * (az_t - az_b)));
+            az_b = az_t;
+        }
+        for (int32_t k = 0; k < nz; ++k) {
+            const size_t idx = static_cast<size_t>(k) * col_stride + col;
+            q[idx] = static_cast<float>(tri_d[idx]);
+        }
+        return;
+    }
+
+    // Exact conservative, strictly column-diagonally-dominant backward-Euler M-matrix Thomas solve (CFL_z > 0.65)
+    double fz_bot_d = 0.0;
+    for (int32_t k = 0; k < nz; ++k) {
+        const size_t idx = static_cast<size_t>(k) * col_stride + col;
+        const double fz_top_d = (k < nz - 1) ? tri_c[idx] : 0.0;
+        const double vol = static_cast<double>(fmaxf(cell_mass_vol_f(cfg, g, pi_sfc_f, k, j, i), 1e-12f));
+        const double A_k = (k > 0) ? (-static_cast<double>(dt_s) * fmax(0.0, fz_bot_d)) : 0.0;
+        const double C_k = (k < nz - 1) ? (-static_cast<double>(dt_s) * fmax(0.0, -fz_top_d)) : 0.0;
+        const double B_k = vol + static_cast<double>(dt_s) * (fmax(0.0, fz_top_d) + fmax(0.0, -fz_bot_d));
+        const double rhs = vol * static_cast<double>(fmaxf(0.0f, q[idx]));
+        if (k == 0) {
+            tri_c[idx] = C_k / B_k;
+            tri_d[idx] = rhs / B_k;
+        } else {
+            const size_t idx_m = static_cast<size_t>(k - 1) * col_stride + col;
+            const double denom = B_k - A_k * tri_c[idx_m];
+            tri_c[idx] = (k < nz - 1) ? (C_k / denom) : 0.0;
+            tri_d[idx] = (rhs - A_k * tri_d[idx_m]) / denom;
+        }
+        fz_bot_d = fz_top_d;
+    }
+    double q_next = tri_d[static_cast<size_t>(nz - 1) * col_stride + col];
+    q[static_cast<size_t>(nz - 1) * col_stride + col] = fmaxf(0.0f, static_cast<float>(q_next));
+    for (int32_t k = nz - 2; k >= 0; --k) {
+        const size_t idx = static_cast<size_t>(k) * col_stride + col;
+        q_next = tri_d[idx] - tri_c[idx] * q_next;
+        q[idx] = fmaxf(0.0f, static_cast<float>(q_next));
+    }
 }
 
 __global__ void nh_sync_periodic_faces_kernel(
@@ -1626,8 +2202,9 @@ __global__ void nh_estimate_cs_max_kernel(
 inline int32_t advect_one_tracer(
     NhCudaHandle* h,
     float* q_ptr,
-    int32_t n_sub_q,
-    float dt_q,
+    float dt_full_s,
+    int32_t n_sub_h,
+    float dt_h,
     float pi_sfc_f
 );
 
@@ -1646,27 +2223,35 @@ inline DeviceStaticGrid static_view(const NhCudaHandle* h) {
 inline int32_t advect_one_tracer(
     NhCudaHandle* h,
     float* q_ptr,
-    int32_t n_sub_q,
-    float dt_q,
+    float dt_full_s,
+    int32_t n_sub_h,
+    float dt_h,
     float pi_sfc_f
 ) {
-    if (!q_ptr || dt_q <= 0.0f || n_sub_q < 1) return 0;
+    if (!q_ptr || dt_full_s <= 0.0f || n_sub_h < 1) return 0;
     const int32_t nz = h->cfg.nz, ny = h->cfg.ny, nx = h->cfg.nx;
     const DeviceStaticGrid g = static_view(h);
     dim3 b3(32, 8, 1);
     dim3 g3((nx + 31) / 32, (ny + 7) / 8, nz);
+    dim3 gcol((nx + 31) / 32, (ny + 7) / 8, 1);
 
-    for (int32_t s = 0; s < n_sub_q; ++s) {
+    for (int32_t s = 0; s < n_sub_h; ++s) {
         nh_tracer_fct_pass1_kernel<<<g3, b3>>>(
-            h->cfg, g, dt_q, pi_sfc_f, h->d_u, h->d_v, h->d_w, q_ptr, h->d_q_tmp, h->d_div
+            h->cfg, g, dt_h, pi_sfc_f, h->d_u, h->d_v, q_ptr, h->d_q_tmp, h->d_div
         );
         CUDA_CHECK(cudaGetLastError());
         nh_tracer_fct_pass2_kernel<<<g3, b3>>>(
-            h->cfg, g, dt_q, pi_sfc_f, h->d_u, h->d_v, h->d_w, q_ptr, h->d_q_tmp, h->d_div, h->d_q_tmp
+            h->cfg, g, dt_h, pi_sfc_f, h->d_u, h->d_v, q_ptr, h->d_q_tmp, h->d_div, h->d_q_tmp
         );
         CUDA_CHECK(cudaGetLastError());
         CUDA_CHECK(cudaMemcpy(q_ptr, h->d_q_tmp, h->n_s * sizeof(float), cudaMemcpyDeviceToDevice));
     }
+
+    nh_tracer_vert_column_kernel<<<gcol, b3>>>(
+        h->cfg, g, dt_full_s, pi_sfc_f, h->d_u, h->d_v, h->d_w, q_ptr,
+        h->d_q_tmp, h->d_div, h->d_tri_c, h->d_tri_d
+    );
+    CUDA_CHECK(cudaGetLastError());
     return 0;
 }
 
@@ -2076,8 +2661,9 @@ NhCudaHandle* nh_cuda_create(
 
     CUDA_CHECK_PTR(cudaMalloc(&h->d_div, h->n_s * sizeof(float)));
     CUDA_CHECK_PTR(cudaMalloc(&h->d_q_tmp, h->n_s * sizeof(float)));
-    CUDA_CHECK_PTR(cudaMalloc(&h->d_tri_c, h->n_w * sizeof(double)));
-    CUDA_CHECK_PTR(cudaMalloc(&h->d_tri_d, h->n_w * sizeof(double)));
+    const size_t n_tri = max(h->n_w, max(h->n_u, h->n_v));
+    CUDA_CHECK_PTR(cudaMalloc(&h->d_tri_c, n_tri * sizeof(double)));
+    CUDA_CHECK_PTR(cudaMalloc(&h->d_tri_d, n_tri * sizeof(double)));
     CUDA_CHECK_PTR(cudaMalloc(&h->d_max_u32, sizeof(uint32_t)));
 
     if (cfg->has_moist) {
@@ -2272,6 +2858,10 @@ int32_t nh_cuda_step_rk3(NhCudaHandle* h, double dt_s, int32_t n_substeps) {
         }
         float cs_val = 0.0f;
         memcpy(&cs_val, &cs_u32, sizeof(float));
+        if (!isfinite(cs_val) || cs_val > 2500.0f) {
+            snprintf(g_last_error, sizeof(g_last_error), "Acoustic speed cs*msf out of physical bounds: %.2f m/s", cs_val);
+            return -1;
+        }
         if (cs_val > 10.0f) cs_msf_max = static_cast<double>(cs_val);
     }
 
@@ -2279,23 +2869,25 @@ int32_t nh_cuda_step_rk3(NhCudaHandle* h, double dt_s, int32_t n_substeps) {
 
     const double rk_dt[3] = {dt_s / 3.0, dt_s / 2.0, dt_s};
     const double dmin = fmin(h->cfg.dx_m, h->cfg.dy_m);
+    const float pi_sfc_f = static_cast<float>(pow(h->cfg.p_sfc_pa / P0_PA, KAPPA));
 
     for (int stage = 0; stage < 3; ++stage) {
         const double tau_stage = rk_dt[stage];
+        const float tau_stage_f = static_cast<float>(tau_stage);
 
         // 1. Evaluate slow tendencies from current stage state (U^n, U^*, U^{**}).
         nh_slow_scalar_kernel<<<grid_s, block>>>(
-            h->cfg, g, h->d_u, h->d_v, h->d_w, h->d_thp, h->d_pip,
+            h->cfg, g, tau_stage_f, h->d_u, h->d_v, h->d_w, h->d_thp, h->d_pip,
             h->d_lbc_thp, h->d_lbc_pip, h->d_iau_thp, h->d_iau_pip, h->d_rth, h->d_rpi
         );
         nh_slow_u_kernel<<<grid_u, block>>>(
-            h->cfg, g, h->d_u, h->d_v, h->d_w, h->d_lbc_u, h->d_iau_u, h->d_ru
+            h->cfg, g, tau_stage_f, h->d_u, h->d_v, h->d_w, h->d_lbc_u, h->d_iau_u, h->d_ru
         );
         nh_slow_v_kernel<<<grid_v, block>>>(
-            h->cfg, g, h->d_u, h->d_v, h->d_w, h->d_lbc_v, h->d_iau_v, h->d_rv
+            h->cfg, g, tau_stage_f, h->d_u, h->d_v, h->d_w, h->d_lbc_v, h->d_iau_v, h->d_rv
         );
         nh_slow_w_kernel<<<grid_w, block>>>(
-            h->cfg, g, h->d_u, h->d_v, h->d_w, h->d_rw
+            h->cfg, g, tau_stage_f, h->d_u, h->d_v, h->d_w, h->d_rw
         );
         CUDA_CHECK(cudaGetLastError());
 
@@ -2316,8 +2908,19 @@ int32_t nh_cuda_step_rk3(NhCudaHandle* h, double dt_s, int32_t n_substeps) {
         if (ns <= 0) {
             ns = static_cast<int32_t>(ceil((tau_stage * cs_msf_max) / (0.38 * dmin)));
             if (ns < 1) ns = 1;
+            if (ns > 256) {
+                snprintf(
+                    g_last_error,
+                    sizeof(g_last_error),
+                    "Acoustic substep count ns=%d exceeded safety cap (256), cs_msf_max=%.2f",
+                    ns,
+                    cs_msf_max
+                );
+                return -1;
+            }
         }
         const double dts = tau_stage / static_cast<double>(ns);
+        const float dts_f = static_cast<float>(dts);
 
         for (int32_t m = 0; m < ns; ++m) {
             if (h->cfg.div_damp_coeff > 0.0) {
@@ -2329,11 +2932,11 @@ int32_t nh_cuda_step_rk3(NhCudaHandle* h, double dt_s, int32_t n_substeps) {
                 if (save_polar_snapshot(h, h->d_v, ny + 1, nx, 1, 1) != 0) return -1;
             }
             nh_acoustic_u_kernel<<<grid_u, block>>>(
-                h->cfg, g, dts, h->d_ru, h->d_thp, h->d_pip, h->d_div,
+                h->cfg, g, dts_f, h->d_ru, h->d_thp, h->d_pip, h->d_div,
                 h->d_qv, h->d_qc, h->d_qr, h->d_qi, h->d_qs, h->d_qg, h->d_u
             );
             nh_acoustic_v_kernel<<<grid_v, block>>>(
-                h->cfg, g, dts, h->d_rv, h->d_thp, h->d_pip, h->d_div,
+                h->cfg, g, dts_f, h->d_rv, h->d_thp, h->d_pip, h->d_div,
                 h->d_qv, h->d_qc, h->d_qr, h->d_qi, h->d_qs, h->d_qg, h->d_v
             );
             CUDA_CHECK(cudaGetLastError());
@@ -2352,9 +2955,10 @@ int32_t nh_cuda_step_rk3(NhCudaHandle* h, double dt_s, int32_t n_substeps) {
             }
 
             nh_acoustic_vert_implicit_kernel<<<grid_col, block>>>(
-                h->cfg, g, dts, h->d_u, h->d_v, h->d_rw, h->d_rth, h->d_rpi,
+                h->cfg, g, dts_f, pi_sfc_f, h->d_u, h->d_v, h->d_rw, h->d_rth, h->d_rpi,
                 h->d_qv, h->d_qc, h->d_qr, h->d_qi, h->d_qs, h->d_qg,
-                h->d_w, h->d_thp, h->d_pip, h->d_tri_c, h->d_tri_d
+                h->d_w, h->d_thp, h->d_pip,
+                reinterpret_cast<float*>(h->d_tri_c), reinterpret_cast<float*>(h->d_tri_d)
             );
             CUDA_CHECK(cudaGetLastError());
 
@@ -2364,34 +2968,70 @@ int32_t nh_cuda_step_rk3(NhCudaHandle* h, double dt_s, int32_t n_substeps) {
                 if (filter_polar_field(h, h->d_pip, ny, nx, 0, 0, 2) != 0) return -1;
             }
         }
+
+        // 2b. IEVA column-implicit residual vertical advection where |CFL_z| > 0.45
+        const dim3 grid_col_u(((nx + 1) + 31) / 32, (ny + 7) / 8, 1);
+        const dim3 grid_col_v((nx + 31) / 32, ((ny + 1) + 7) / 8, 1);
+        nh_ieva_vert_advect_scalar_kernel<<<grid_col, block>>>(
+            h->cfg, g, tau_stage_f, h->d_u, h->d_v, h->d_w, h->d_thp, h->d_pip, h->d_tri_c, h->d_tri_d
+        );
+        nh_ieva_vert_advect_u_kernel<<<grid_col_u, block>>>(
+            h->cfg, g, tau_stage_f, h->d_v, h->d_w, h->d_u, h->d_tri_c, h->d_tri_d
+        );
+        nh_ieva_vert_advect_v_kernel<<<grid_col_v, block>>>(
+            h->cfg, g, tau_stage_f, h->d_u, h->d_w, h->d_v, h->d_tri_c, h->d_tri_d
+        );
+        nh_ieva_vert_advect_w_kernel<<<grid_col, block>>>(
+            h->cfg, g, tau_stage_f, h->d_u, h->d_v, h->d_w, h->d_tri_c, h->d_tri_d
+        );
+        CUDA_CHECK(cudaGetLastError());
+        if (h->cfg.bc_x == 1 || h->cfg.bc_y == 1) {
+            nh_sync_periodic_faces_kernel<<<grid_per, 256>>>(h->cfg, h->d_u, h->d_v);
+            CUDA_CHECK(cudaGetLastError());
+        }
     }
 
-    // 3. Conservative positive-definite FCT advection of all 6 moist species on full dt_s.
+    // 3. Conservative positive-definite 2D horizontal FCT + 1D vertical conservative column transport on full dt_s.
     if (h->cfg.has_moist) {
         const float pi_sfc_f = static_cast<float>(pow(h->cfg.p_sfc_pa / P0_PA, KAPPA));
         CUDA_CHECK(cudaMemset(h->d_max_u32, 0, sizeof(uint32_t)));
         dim3 b_cfl(32, 8, 1);
         dim3 g_cfl((h->cfg.nx + 31) / 32, (h->cfg.ny + 7) / 8, h->cfg.nz);
-        nh_tracer_cfl_kernel<<<g_cfl, b_cfl>>>(
-            h->cfg, g, static_cast<float>(dt_s), pi_sfc_f, h->d_u, h->d_v, h->d_w, h->d_max_u32
+        nh_tracer_cfl_h_kernel<<<g_cfl, b_cfl>>>(
+            h->cfg, g, static_cast<float>(dt_s), pi_sfc_f, h->d_u, h->d_v, h->d_max_u32
         );
         CUDA_CHECK(cudaGetLastError());
 
         uint32_t cfl_u32 = 0;
         CUDA_CHECK(cudaMemcpy(&cfl_u32, h->d_max_u32, sizeof(uint32_t), cudaMemcpyDeviceToHost));
-        float cfl_max = 0.0f;
-        memcpy(&cfl_max, &cfl_u32, sizeof(float));
+        float cfl_h_max = 0.0f;
+        memcpy(&cfl_h_max, &cfl_u32, sizeof(float));
 
-        int32_t n_sub_q = static_cast<int32_t>(ceil(static_cast<double>(cfl_max) / 0.70));
-        if (n_sub_q < 1) n_sub_q = 1;
-        const float dt_q = static_cast<float>(dt_s / static_cast<double>(n_sub_q));
+        if (!isfinite(cfl_h_max)) {
+            set_error("Non-finite horizontal tracer CFL detected");
+            return -1;
+        }
+        int32_t n_sub_h = static_cast<int32_t>(ceil(static_cast<double>(cfl_h_max) / 0.70));
+        if (n_sub_h < 1) n_sub_h = 1;
+        if (n_sub_h > 64) {
+            snprintf(
+                g_last_error,
+                sizeof(g_last_error),
+                "Horizontal tracer substep count n_sub_h=%d exceeded safety cap (64), cfl_h_max=%.3f",
+                n_sub_h,
+                cfl_h_max
+            );
+            return -1;
+        }
+        const float dt_full_f = static_cast<float>(dt_s);
+        const float dt_h = static_cast<float>(dt_s / static_cast<double>(n_sub_h));
 
-        if (advect_one_tracer(h, h->d_qv, n_sub_q, dt_q, pi_sfc_f) != 0) return -1;
-        if (advect_one_tracer(h, h->d_qc, n_sub_q, dt_q, pi_sfc_f) != 0) return -1;
-        if (advect_one_tracer(h, h->d_qr, n_sub_q, dt_q, pi_sfc_f) != 0) return -1;
-        if (advect_one_tracer(h, h->d_qi, n_sub_q, dt_q, pi_sfc_f) != 0) return -1;
-        if (advect_one_tracer(h, h->d_qs, n_sub_q, dt_q, pi_sfc_f) != 0) return -1;
-        if (advect_one_tracer(h, h->d_qg, n_sub_q, dt_q, pi_sfc_f) != 0) return -1;
+        if (advect_one_tracer(h, h->d_qv, dt_full_f, n_sub_h, dt_h, pi_sfc_f) != 0) return -1;
+        if (advect_one_tracer(h, h->d_qc, dt_full_f, n_sub_h, dt_h, pi_sfc_f) != 0) return -1;
+        if (advect_one_tracer(h, h->d_qr, dt_full_f, n_sub_h, dt_h, pi_sfc_f) != 0) return -1;
+        if (advect_one_tracer(h, h->d_qi, dt_full_f, n_sub_h, dt_h, pi_sfc_f) != 0) return -1;
+        if (advect_one_tracer(h, h->d_qs, dt_full_f, n_sub_h, dt_h, pi_sfc_f) != 0) return -1;
+        if (advect_one_tracer(h, h->d_qg, dt_full_f, n_sub_h, dt_h, pi_sfc_f) != 0) return -1;
     }
 
     CUDA_CHECK(cudaDeviceSynchronize());
