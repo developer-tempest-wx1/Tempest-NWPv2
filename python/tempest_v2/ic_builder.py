@@ -41,8 +41,16 @@ from tempest_v2.static_fields import (
 
 logger = logging.getLogger("tempest_v2.ic_builder")
 
-DEFAULT_COPERNICUS_ROOT = Path("/mnt/d/AI/weer-ai/Tempest/COPERNICUS_DEM")
-DEFAULT_GEBCO_ROOT = Path("/mnt/d/AI/weer-ai/Tempest/bathymetrie")
+DEFAULT_COPERNICUS_ROOT = (
+    STATIC_DIR / "copernicus_dem_raw"
+    if (STATIC_DIR / "copernicus_dem_raw").exists()
+    else Path("/mnt/d/AI/weer-ai/Tempest/COPERNICUS_DEM")
+)
+DEFAULT_GEBCO_ROOT = (
+    STATIC_DIR / "bathymetry_raw"
+    if (STATIC_DIR / "bathymetry_raw").exists()
+    else Path("/mnt/d/AI/weer-ai/Tempest/bathymetrie")
+)
 
 
 def stagger_uv(u_c: np.ndarray, v_c: np.ndarray, *, periodic_x: bool = False) -> Tuple[np.ndarray, np.ndarray]:
