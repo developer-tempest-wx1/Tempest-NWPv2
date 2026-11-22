@@ -7,7 +7,28 @@ import datetime
 import json
 import logging
 import sys
+import time
 from pathlib import Path
+
+try:
+    from tqdm import tqdm as _tqdm
+except ImportError:  # pragma: no cover - optional terminal progress bar
+    _tqdm = None
+
+
+class _TqdmLoggingHandler(logging.Handler):
+    """Route log lines via tqdm.write so live progress bars never get torn."""
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            msg = self.format(record)
+            if _tqdm is not None:
+                _tqdm.write(msg, file=sys.stderr)
+            else:
+                sys.stderr.write(msg + "\n")
+            sys.stderr.flush()
+        except Exception:
+            self.handleError(record)
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 PY_ROOT = PROJECT_ROOT / "python"
@@ -72,10 +93,24 @@ def main() -> None:
     parser.add_argument("--ensemble-members", type=int, default=0, help="0=CF only, 51=CF + 50 perturbed members")
     parser.add_argument("--ensemble-hours", type=float, default=None, help="Ensemble forecast length [h]")
     parser.add_argument("--ensemble-seed", type=int, default=None)
+    parser.add_argument("--no-progress", action="store_true", help="Disable tqdm progress bars")
+    parser.add_argument(
+        "--quiet-steps",
+        action="store_true",
+        help="Suppress per-step CLI log lines (keep phase/output logs and tqdm bar)",
+    )
     args = parser.parse_args()
 
-    logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+        handlers=[_TqdmLoggingHandler()],
+        force=True,
+    )
+    logger = logging.getLogger("tempest_v2.cli")
     cyc_rst_hours = tuple(float(h.strip()) for h in args.cycle_restart_hours.split(",") if h.strip())
+    show_progress = not args.no_progress
+    log_steps = not args.quiet_steps
 
     sfc_grib = args.sfc_grib
     pl_grib = args.pl_grib
@@ -129,6 +164,8 @@ def main() -> None:
             enable_ocean_si3=use_ocean,
             include_3d_diagnostics=include_3d_diag,
             osisaf_wx1_path=args.osisaf_wx1,
+            show_progress=show_progress,
+            log_steps=log_steps,
         )
         printable = {
             "run_dir": str(summary.get("run_dir")),
@@ -174,6 +211,8 @@ def main() -> None:
             enable_ocean_si3=use_ocean,
             include_3d_diagnostics=include_3d_diag,
             osisaf_wx1_path=args.osisaf_wx1,
+            show_progress=show_progress,
+            log_steps=log_steps,
         )
         printable = {
             "run_dir": str(summary.get("run_dir")),
@@ -187,8 +226,11 @@ def main() -> None:
         print(json.dumps(printable, indent=2, default=str))
         return
 
+    logger.info("=== Single-Domain Mode [%s] | nz=%d | hours=%.2fh ===", args.mode, args.nz, args.hours)
+    t_prep0 = time.perf_counter()
     spec = get_domain_spec(args.mode, nz=args.nz)
     hs_m, sstatic = build_domain_static_fields(spec)
+    logger.info("[%s] Building initial conditions from %s...", spec.name, args.ic_source)
     if args.ic_source == "restart" and args.restart_in is not None:
         state_3d, surf_state, meta = load_tempest_restart_wx1(args.restart_in)
         init_dt = datetime.datetime.fromisoformat(meta["valid_time_utc"].replace("Z", "+00:00"))
@@ -201,15 +243,19 @@ def main() -> None:
         )
     else:
         raise SystemExit("Specify --sfc-grib/--pl-grib, --aurora-ic, --restart-in, or --download-live")
+    logger.info("[%s] Static & IC ready in %.2fs (init=%s)", spec.name, time.perf_counter() - t_prep0, init_dt.isoformat())
 
     da_report = {}
     iau_f = None
     if args.enable_da and obs_dir_eff.exists():
+        logger.info("[%s] Loading WX-1 DA observations from %s...", spec.name, obs_dir_eff)
         obs_list, stn_rows = load_station_obs_wx1(obs_dir_eff, spec, valid_time_utc=init_dt)
+        logger.info("[%s] Loaded %d DA observations across %d surface stations", spec.name, len(obs_list), len(stn_rows))
         if obs_list:
             da_report["verify_bg"] = verify_against_stations(spec, state_3d, surf_state, hs_m, stn_rows)
+            use_iau = not (spec.is_spherical and spec.nz * spec.ny * spec.nx >= 50_000_000)
             state_3d, surf_state, iau_f, vres = run_domain_3dvar(
-                spec, state_3d, surf_state, hs_m, sstatic["lsm"], obs_list, obs_dir=obs_dir_eff
+                spec, state_3d, surf_state, hs_m, sstatic["lsm"], obs_list, obs_dir=obs_dir_eff, compute_iau=use_iau
             )
             da_report["var3d"] = {"j0": vres.initial_cost_j0, "jf": vres.final_cost_j, "iters": vres.iterations}
             da_report["verify_ana"] = verify_against_stations(spec, state_3d, surf_state, hs_m, stn_rows)
@@ -236,6 +282,8 @@ def main() -> None:
         obs_dir=obs_dir_eff if args.enable_da else None,
         ocean_restart_out=(args.outdir / f"restart_ocean_{spec.name}.wx1") if use_ocean else None,
         include_3d_diagnostics=include_3d_diag,
+        show_progress=show_progress,
+        log_steps=log_steps,
     )
     print(
         json.dumps(

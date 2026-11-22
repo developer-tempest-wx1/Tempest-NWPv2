@@ -6,7 +6,7 @@ import ctypes
 import math
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import numpy as np
 
@@ -1048,6 +1048,8 @@ class NonHydrostaticGPUSolver:
         run_dyn: bool,
         run_phys: bool,
         phys_dt_s: Optional[float] = None,
+        on_step: Optional[Callable[[int, bool], None]] = None,
+        on_tile: Optional[Callable[[int, int], None]] = None,
     ) -> None:
         if self._state_host is None:
             raise RuntimeError("upload_state must be called before stepping multi-tile solver")
@@ -1060,10 +1062,11 @@ class NonHydrostaticGPUSolver:
                     self.upload_surface(self._surface_state_host)
 
         dt_p = float(dt_s if phys_dt_s is None else phys_dt_s)
+        n_tiles = len(self._tiles)
 
         # Path A: All tile handles permanently resident in GPU VRAM
         if self._tile_handles:
-            for _ in range(n_steps):
+            for step_i in range(n_steps):
                 eff_substeps = int(n_substeps)
                 if run_dyn and eff_substeps <= 0:
                     cs_max_u32 = 0
@@ -1076,7 +1079,7 @@ class NonHydrostaticGPUSolver:
                         eff_substeps = -cs_max_u32
 
                 next_state = {k: np.empty_like(v) for k, v in self._state_host.items()}
-                for h, tile in zip(self._tile_handles, self._tiles):
+                for t_idx, (h, tile) in enumerate(zip(self._tile_handles, self._tiles)):
                     if run_dyn:
                         self._raise_if_err(
                             self.lib.nh_cuda_step_rk3(h, float(dt_s), eff_substeps),
@@ -1092,6 +1095,8 @@ class NonHydrostaticGPUSolver:
                     self._raise_if_err(self.lib.nh_cuda_download_state(h, ctypes.byref(dst_ptrs)), "tile download")
                     del kept_d
                     self._write_tile_interior(next_state, t_state, tile)
+                    if on_tile is not None:
+                        on_tile(t_idx + 1, n_tiles)
 
                 self._state_host = next_state
                 for h, tile in zip(self._tile_handles, self._tiles):
@@ -1102,13 +1107,15 @@ class NonHydrostaticGPUSolver:
 
                 if run_phys:
                     self._advance_host_clock(dt_p)
+                if on_step is not None:
+                    on_step(step_i + 1, run_phys)
             return
 
         # Path B: Out-of-core tiling (reusing persistent shape handles with 0 cudaMalloc/cudaFree)
         inplace_1d = self.nt_x == 1 and all(
             self._tiles[idx + 1].pj0 >= self._tiles[idx].j0 for idx in range(len(self._tiles) - 1)
         )
-        for _ in range(n_steps):
+        for step_i in range(n_steps):
             eff_substeps = int(n_substeps)
             if run_dyn and eff_substeps <= 0:
                 cs_u32 = self._estimate_host_cs_u32()
@@ -1240,33 +1247,56 @@ class NonHydrostaticGPUSolver:
                 finally:
                     if not reused:
                         self.lib.nh_cuda_destroy(h)
+                if on_tile is not None:
+                    on_tile(t_idx + 1, n_tiles)
             self._state_host = next_state
             if run_phys and next_surf is not None:
                 self._surface_state_host = next_surf
                 self._advance_host_clock(dt_p)
+            if on_step is not None:
+                on_step(step_i + 1, run_phys)
 
-    def step_rk3(self, dt_s: float, n_steps: int = 1, n_substeps: int = 0) -> None:
+    def step_rk3(
+        self,
+        dt_s: float,
+        n_steps: int = 1,
+        n_substeps: int = 0,
+        *,
+        on_step: Optional[Callable[[int, bool], None]] = None,
+        on_tile: Optional[Callable[[int, int], None]] = None,
+    ) -> None:
         if len(self._tiles) == 1:
-            for _ in range(n_steps):
+            for step_i in range(n_steps):
                 self._raise_if_err(
                     self.lib.nh_cuda_step_rk3(self._handle, float(dt_s), int(n_substeps)),
                     "step_rk3",
                 )
+                if on_step is not None:
+                    on_step(step_i + 1, False)
             return
-        self._run_multi_tile(dt_s, n_steps, n_substeps, run_dyn=True, run_phys=False)
+        self._run_multi_tile(dt_s, n_steps, n_substeps, run_dyn=True, run_phys=False, on_step=on_step, on_tile=on_tile)
 
-    def step_physics(self, dt_s: float, n_steps: int = 1) -> None:
+    def step_physics(
+        self,
+        dt_s: float,
+        n_steps: int = 1,
+        *,
+        on_step: Optional[Callable[[int, bool], None]] = None,
+        on_tile: Optional[Callable[[int, int], None]] = None,
+    ) -> None:
         if self._pcfg is None:
             self.set_physics_config()
         if len(self._tiles) == 1:
-            for _ in range(n_steps):
+            for step_i in range(n_steps):
                 self._raise_if_err(
                     self.lib.nh_cuda_step_physics(self._handle, float(dt_s)),
                     "step_physics",
                 )
                 self._advance_host_clock(dt_s)
+                if on_step is not None:
+                    on_step(step_i + 1, True)
             return
-        self._run_multi_tile(dt_s, n_steps, 0, run_dyn=False, run_phys=True)
+        self._run_multi_tile(dt_s, n_steps, 0, run_dyn=False, run_phys=True, on_step=on_step, on_tile=on_tile)
 
     def step_full(
         self,
@@ -1276,6 +1306,8 @@ class NonHydrostaticGPUSolver:
         *,
         physics_every: int = 1,
         flush_physics: bool = False,
+        on_step: Optional[Callable[[int, bool], None]] = None,
+        on_tile: Optional[Callable[[int, int], None]] = None,
     ) -> None:
         """Advance coupled dynamics (split-explicit RK3 + FCT) + GPU physics suite.
 
@@ -1292,7 +1324,8 @@ class NonHydrostaticGPUSolver:
                     "step_rk3",
                 )
                 self._phys_accum_steps += 1
-                if self._phys_accum_steps >= phys_cadence or (flush_physics and idx == n_steps - 1):
+                ran_phys = bool(self._phys_accum_steps >= phys_cadence or (flush_physics and idx == n_steps - 1))
+                if ran_phys:
                     dt_phys = float(dt_s) * self._phys_accum_steps
                     self._raise_if_err(
                         self.lib.nh_cuda_step_physics(self._handle, dt_phys),
@@ -1300,15 +1333,19 @@ class NonHydrostaticGPUSolver:
                     )
                     self._advance_host_clock(dt_phys)
                     self._phys_accum_steps = 0
+                if on_step is not None:
+                    on_step(idx + 1, ran_phys)
             return
 
         for idx in range(n_steps):
             self._phys_accum_steps += 1
             due = (self._phys_accum_steps >= phys_cadence) or (flush_physics and idx == n_steps - 1)
             dt_phys = float(dt_s) * self._phys_accum_steps if due else None
-            self._run_multi_tile(dt_s, 1, n_substeps, run_dyn=True, run_phys=due, phys_dt_s=dt_phys)
+            self._run_multi_tile(dt_s, 1, n_substeps, run_dyn=True, run_phys=due, phys_dt_s=dt_phys, on_tile=on_tile)
             if due:
                 self._phys_accum_steps = 0
+            if on_step is not None:
+                on_step(idx + 1, due)
 
     def download_state(self, *, copy: bool = True) -> Dict[str, np.ndarray]:
         if len(self._tiles) == 1:

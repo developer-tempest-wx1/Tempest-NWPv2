@@ -29,6 +29,11 @@ import numpy as np
 import wx1
 import xarray as xr
 
+try:
+    from tqdm import tqdm as _tqdm
+except ImportError:  # pragma: no cover - optional terminal progress bar
+    _tqdm = None
+
 from tempest_v2.da.balance import BalanceOperator
 from tempest_v2.da.var3d import RecursiveSpatialFilter
 from tempest_v2.ic_builder import stagger_uv
@@ -355,6 +360,8 @@ def run_ensemble_forecast(
     theta_sfc_ref: float = 288.15,
     p_sfc_ref: float = 101_325.0,
     n_ref_hz: float = 0.01,
+    show_progress: bool = True,
+    log_steps: bool = False,
 ) -> Dict[str, Any]:
     """Execute a classical M-member ensemble (`cf` + `pf001..pf{M-1:03d}`) and write WX-1 stats."""
     from tempest_v2.runner import forecast_output_schedule_hours, run_domain_forecast
@@ -398,126 +405,159 @@ def run_ensemble_forecast(
     member_files_by_hour: Dict[float, List[Path]] = {hr: [] for hr in hrs}
     member_summaries: List[Dict[str, Any]] = []
 
-    for m_idx in range(cfg.n_members):
-        m_name = member_label(m_idx)
-        m_dir = ens_root / m_name
-        m_dir.mkdir(parents=True, exist_ok=True)
+    logger.info(
+        "[%s] Starting %d-member ensemble (hours=%.2fh, grid=%dx%dx%d)",
+        spec.name,
+        int(cfg.n_members),
+        float(forecast_hours),
+        spec.nz,
+        spec.ny,
+        spec.nx,
+    )
+    member_iter = range(cfg.n_members)
+    pbar = (
+        _tqdm(member_iter, total=cfg.n_members, desc=f"[{spec.name}] Ensemble", unit="member", dynamic_ncols=True)
+        if (show_progress and _tqdm is not None and cfg.n_members > 0)
+        else None
+    )
+    try:
+        for m_idx in (pbar if pbar is not None else member_iter):
+            m_name = member_label(m_idx)
+            m_dir = ens_root / m_name
+            m_dir.mkdir(parents=True, exist_ok=True)
+            if pbar is not None:
+                pbar.set_postfix_str(f"member={m_name}", refresh=False)
 
-        # Member 0 = deterministic Control Forecast (`cf`); reuse precomputed CF files when available
-        reused_cf = False
-        if m_idx == 0 and existing_cf_outputs is not None:
-            matched: List[Tuple[float, Path]] = []
+            # Member 0 = deterministic Control Forecast (`cf`); reuse precomputed CF files when available
+            reused_cf = False
+            if m_idx == 0 and existing_cf_outputs is not None:
+                matched: List[Tuple[float, Path]] = []
+                for hr in hrs:
+                    src = existing_cf_outputs.get(hr)
+                    if src is None:
+                        for k_hr, v_path in existing_cf_outputs.items():
+                            if abs(float(k_hr) - float(hr)) < 5e-3:
+                                src = v_path
+                                break
+                    if src is not None and Path(src).exists():
+                        matched.append((hr, Path(src)))
+                if len(matched) == len(hrs):
+                    for hr, src_p in matched:
+                        dst_p = m_dir / src_p.name
+                        if src_p.resolve() != dst_p.resolve():
+                            shutil.copy2(src_p, dst_p)
+                        member_files_by_hour[hr].append(dst_p)
+                    reused_cf = True
+                    logger.info("[%s] Ensemble member %d/%d (%s): reused CF output", spec.name, m_idx + 1, cfg.n_members, m_name)
+                    member_summaries.append(
+                        {
+                            "member_idx": 0,
+                            "member_name": "cf",
+                            "is_control": True,
+                            "reused_control_run": True,
+                            "elapsed_s": 0.0,
+                            "outputs": [str(member_files_by_hour[hr][-1]) for hr in hrs],
+                        }
+                    )
+
+            if reused_cf:
+                continue
+
+            logger.info("[%s] Running ensemble member %d/%d (%s)...", spec.name, m_idx + 1, cfg.n_members, m_name)
+            pert = generate_balanced_member_perturbation(
+                m_idx,
+                spec,
+                hs_m,
+                base_state_3d,
+                base_surf_state,
+                surface_static,
+                cfg,
+                balance_op=balance_op,
+                spatial_filter=spatial_filter,
+            )
+
+            # Combine DA IAU forcing + smooth stochastic tendency forcing
+            eff_iau: Optional[Dict[str, np.ndarray]] = None
+            eff_iau_dur = 0.0
+            stoch = pert["stoch_iau"]
+            if base_iau_forcing is not None and stoch is not None:
+                eff_iau = {
+                    k: (
+                        np.asarray(base_iau_forcing.get(k, 0.0), dtype=np.float32)
+                        + np.asarray(stoch.get(k, 0.0), dtype=np.float32)
+                    ).astype(np.float32)
+                    for k in ("u", "v", "w", "theta_p", "pi_p")
+                }
+                eff_iau_dur = max(float(base_iau_duration_s), float(cfg.stoch_forcing_duration_s))
+            elif stoch is not None:
+                eff_iau = stoch
+                eff_iau_dur = float(cfg.stoch_forcing_duration_s)
+            elif base_iau_forcing is not None:
+                eff_iau = base_iau_forcing
+                eff_iau_dur = float(base_iau_duration_s)
+
+            res_m = run_domain_forecast(
+                spec,
+                hs_m,
+                surface_static,
+                pert["state_3d"],
+                pert["surf_state"],
+                init_dt,
+                forecast_hours=forecast_hours,
+                dt_s=dt_s,
+                physics_every=physics_every,
+                lbc_interpolator=lbc_interpolator,
+                iau_forcing=eff_iau,
+                iau_duration_s=eff_iau_dur,
+                output_dir=m_dir,
+                output_hours=hrs,
+                enable_physics=enable_physics,
+                rad_interval_s=rad_interval_s,
+                cloud_num_land=float(pert["cloud_num_land"]),
+                cloud_num_sea=float(pert["cloud_num_sea"]),
+                static_overrides=pert["static_overrides"] or None,
+                theta_sfc_ref=theta_sfc_ref,
+                p_sfc_ref=p_sfc_ref,
+                n_ref_hz=n_ref_hz,
+                show_progress=False,
+                log_steps=log_steps,
+            )
+
+            expected_files: List[Path] = []
             for hr in hrs:
-                src = existing_cf_outputs.get(hr)
-                if src is None:
-                    for k_hr, v_path in existing_cf_outputs.items():
-                        if abs(float(k_hr) - float(hr)) < 5e-3:
-                            src = v_path
-                            break
-                if src is not None and Path(src).exists():
-                    matched.append((hr, Path(src)))
-            if len(matched) == len(hrs):
-                for hr, src_p in matched:
-                    dst_p = m_dir / src_p.name
-                    if src_p.resolve() != dst_p.resolve():
-                        shutil.copy2(src_p, dst_p)
-                    member_files_by_hour[hr].append(dst_p)
-                reused_cf = True
-                member_summaries.append(
-                    {
-                        "member_idx": 0,
-                        "member_name": "cf",
-                        "is_control": True,
-                        "reused_control_run": True,
-                        "elapsed_s": 0.0,
-                        "outputs": [str(member_files_by_hour[hr][-1]) for hr in hrs],
-                    }
-                )
+                fp = m_dir / f"forecast_{spec.name}_T+{_lead_tag(hr)}h.wx1"
+                if not fp.exists():
+                    raise FileNotFoundError(f"Expected ensemble member output missing: {fp}")
+                member_files_by_hour[hr].append(fp)
+                expected_files.append(fp)
 
-        if reused_cf:
-            continue
+            logger.info(
+                "[%s] Ensemble member %d/%d (%s) done in %.2fs",
+                spec.name,
+                m_idx + 1,
+                cfg.n_members,
+                m_name,
+                float(res_m["elapsed_s"]),
+            )
+            member_summaries.append(
+                {
+                    "member_idx": m_idx,
+                    "member_name": m_name,
+                    "is_control": bool(pert["is_control"]),
+                    "reused_control_run": False,
+                    "elapsed_s": float(res_m["elapsed_s"]),
+                    "cloud_num_land": float(pert["cloud_num_land"]),
+                    "cloud_num_sea": float(pert["cloud_num_sea"]),
+                    "outputs": [str(p) for p in expected_files],
+                }
+            )
 
-        pert = generate_balanced_member_perturbation(
-            m_idx,
-            spec,
-            hs_m,
-            base_state_3d,
-            base_surf_state,
-            surface_static,
-            cfg,
-            balance_op=balance_op,
-            spatial_filter=spatial_filter,
-        )
-
-        # Combine DA IAU forcing + smooth stochastic tendency forcing
-        eff_iau: Optional[Dict[str, np.ndarray]] = None
-        eff_iau_dur = 0.0
-        stoch = pert["stoch_iau"]
-        if base_iau_forcing is not None and stoch is not None:
-            eff_iau = {
-                k: (
-                    np.asarray(base_iau_forcing.get(k, 0.0), dtype=np.float32)
-                    + np.asarray(stoch.get(k, 0.0), dtype=np.float32)
-                ).astype(np.float32)
-                for k in ("u", "v", "w", "theta_p", "pi_p")
-            }
-            eff_iau_dur = max(float(base_iau_duration_s), float(cfg.stoch_forcing_duration_s))
-        elif stoch is not None:
-            eff_iau = stoch
-            eff_iau_dur = float(cfg.stoch_forcing_duration_s)
-        elif base_iau_forcing is not None:
-            eff_iau = base_iau_forcing
-            eff_iau_dur = float(base_iau_duration_s)
-
-        res_m = run_domain_forecast(
-            spec,
-            hs_m,
-            surface_static,
-            pert["state_3d"],
-            pert["surf_state"],
-            init_dt,
-            forecast_hours=forecast_hours,
-            dt_s=dt_s,
-            physics_every=physics_every,
-            lbc_interpolator=lbc_interpolator,
-            iau_forcing=eff_iau,
-            iau_duration_s=eff_iau_dur,
-            output_dir=m_dir,
-            output_hours=hrs,
-            enable_physics=enable_physics,
-            rad_interval_s=rad_interval_s,
-            cloud_num_land=float(pert["cloud_num_land"]),
-            cloud_num_sea=float(pert["cloud_num_sea"]),
-            static_overrides=pert["static_overrides"] or None,
-            theta_sfc_ref=theta_sfc_ref,
-            p_sfc_ref=p_sfc_ref,
-            n_ref_hz=n_ref_hz,
-        )
-
-        expected_files: List[Path] = []
-        for hr in hrs:
-            fp = m_dir / f"forecast_{spec.name}_T+{_lead_tag(hr)}h.wx1"
-            if not fp.exists():
-                raise FileNotFoundError(f"Expected ensemble member output missing: {fp}")
-            member_files_by_hour[hr].append(fp)
-            expected_files.append(fp)
-
-        member_summaries.append(
-            {
-                "member_idx": m_idx,
-                "member_name": m_name,
-                "is_control": bool(pert["is_control"]),
-                "reused_control_run": False,
-                "elapsed_s": float(res_m["elapsed_s"]),
-                "cloud_num_land": float(pert["cloud_num_land"]),
-                "cloud_num_sea": float(pert["cloud_num_sea"]),
-                "outputs": [str(p) for p in expected_files],
-            }
-        )
-
-        # Free host buffers + GPU allocations between members cleanly
-        del pert, eff_iau, res_m
-        gc.collect()
+            # Free host buffers + GPU allocations between members cleanly
+            del pert, eff_iau, res_m
+            gc.collect()
+    finally:
+        if pbar is not None:
+            pbar.close()
 
     stats_paths: List[Path] = []
     for hr in hrs:

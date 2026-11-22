@@ -8,6 +8,7 @@ from __future__ import annotations
 import datetime
 import logging
 import math
+import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
 
@@ -651,6 +652,7 @@ def run_domain_3dvar(
     compute_iau: bool = True,
 ) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], Optional[Dict[str, np.ndarray]], Var3DResult]:
     """Run balanced 3D-Var / 4D-FGAT + Radar LHN + OSI-SAF cryosphere update and return analysis + IAU forcing."""
+    t0_var = time.perf_counter()
     hs = np.asarray(hs_m, dtype=np.float64)
 
     z_0 = float(spec.vertical.zeta_s[0]) + float(spec.vertical.B_s[0]) * hs
@@ -758,6 +760,19 @@ def run_domain_3dvar(
             c_spec, c_hs, theta_sfc_ref=theta_sfc_ref, p_sfc_ref=p_sfc_ref, n_ref_hz=n_ref_hz
         )
         cfg = Var3DConfig(max_iterations=max_iterations, use_balance=True, iau_window_sec=iau_tau_sec)
+        logger.info(
+            "[%s] Running Multi-Incremental 3D-Var/4D-FGAT | grid=%dx%dx%d -> coarse %dx%dx%d (stride=%d) | obs=%d | fgat=%s",
+            spec.name,
+            spec.nz,
+            spec.ny,
+            spec.nx,
+            c_spec.nz,
+            c_spec.ny,
+            c_spec.nx,
+            stride,
+            len(obs_list),
+            c_traj is not None,
+        )
         c_res = solve_3dvar_pcg(c_bg, obs_list, c_hop, c_filter, cfg, balance_op=c_bal, land_mask=c_lsm, trajectory=c_traj)
 
         # Memory-frugal separable 1D float32 prolongation one variable at a time (no simultaneous 5-var fine_inc/updated_c copies)
@@ -867,6 +882,15 @@ def run_domain_3dvar(
             spec, hs, theta_sfc_ref=theta_sfc_ref, p_sfc_ref=p_sfc_ref, n_ref_hz=n_ref_hz
         )
         cfg = Var3DConfig(max_iterations=max_iterations, use_balance=True, iau_window_sec=iau_tau_sec)
+        logger.info(
+            "[%s] Running 3D-Var/4D-FGAT | grid=%dx%dx%d | obs=%d | fgat=%s",
+            spec.name,
+            spec.nz,
+            spec.ny,
+            spec.nx,
+            len(obs_list),
+            eff_traj is not None,
+        )
         res = solve_3dvar_pcg(
             bg_centered,
             obs_list,
@@ -997,6 +1021,16 @@ def run_domain_3dvar(
             iau_forcing["theta_p"] = (iau_forcing["theta_p"] + dth_lhn).astype(np.float32)
         ana_state["qv"] = np.clip(ana_state["qv"] + dqv_lhn * float(iau_tau_sec), 0.0, 0.045).astype(np.float32)
 
+    logger.info(
+        "[%s] 3D-Var/4D-FGAT done in %.2fs | J0=%.2f -> Jf=%.2f | iters=%d | converged=%s | iau=%s",
+        spec.name,
+        time.perf_counter() - t0_var,
+        res.initial_cost_j0,
+        res.final_cost_j,
+        res.iterations,
+        res.converged,
+        iau_forcing is not None,
+    )
     return ana_state, ana_surf, iau_forcing, res
 
 

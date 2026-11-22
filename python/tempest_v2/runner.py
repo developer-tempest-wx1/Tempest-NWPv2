@@ -22,6 +22,11 @@ import numpy as np
 import xarray as xr
 import wx1
 
+try:
+    from tqdm import tqdm as _tqdm
+except ImportError:  # pragma: no cover - optional terminal progress bar
+    _tqdm = None
+
 from tempest_v2.cuda_bridge import NonHydrostaticGPUSolver
 from tempest_v2.diagnostics import (
     STANDARD_PLEV_PA,
@@ -431,6 +436,8 @@ def run_domain_forecast(
     ocean_restart_in: Optional[Path | str] = None,
     ocean_restart_out: Optional[Path | str] = None,
     include_3d_diagnostics: bool = True,
+    show_progress: bool = True,
+    log_steps: bool = True,
 ) -> Dict[str, Any]:
     """Integrate one nest on GPU with optional NEMO+SI3 coupling, Davies LBCs, IAU, WX-1 outputs & restart."""
     init_dt = (
@@ -490,6 +497,7 @@ def run_domain_forecast(
     lbc_paths: List[Path] = []
     cycle_restart_paths: List[Path] = []
     t0_wall = time.perf_counter()
+    pbar = None
 
     try:
         cur_state = state_3d
@@ -497,14 +505,18 @@ def run_domain_forecast(
         cur_oce_state: Optional[Dict[str, np.ndarray]] = None
 
         if ocean_solver is not None:
+            t_oce_init = time.perf_counter()
             if ocean_restart_in is not None and Path(ocean_restart_in).is_file():
+                logger.info("[%s] Loading coupled NEMO+SI3 restart: %s", spec.name, ocean_restart_in)
                 cur_oce_state, _ = NemoSi3GPUSolver.load_restart_wx1(ocean_restart_in)
             else:
+                logger.info("[%s] Initializing coupled NEMO 5.0.2 + SI3 (%d z-levels)...", spec.name, int(ocean_nz))
                 cur_oce_state = ocean_solver.init_from_atmosphere_and_osisaf(
                     cur_surf, osisaf_wx1_path=osisaf_wx1_path, obs_dir=obs_dir
                 )
             ocean_solver.upload_state(cur_oce_state)
             cur_surf = ocean_solver.couple_to_surface_state(cur_oce_state, cur_surf)
+            logger.info("[%s] Ocean+SI3 ready in %.2fs", spec.name, time.perf_counter() - t_oce_init)
 
         use_zero_copy = (spec.nz * spec.ny * spec.nx >= 20_000_000) and len(solver._tiles) > 1
         solver.upload_state(cur_state, copy=not use_zero_copy)
@@ -590,6 +602,67 @@ def run_domain_forecast(
         prev_out_step = 0
         prev_out_precip = prev_oce_rain.astype(np.float64) + prev_oce_snow.astype(np.float64)
 
+        logger.info(
+            "[%s] Starting forecast | grid=%dx%dx%d | tiles=%d (shared=%s) | dt=%.1fs | steps=%d (%.2fh) | physics=%s (every=%d) | ocean_si3=%s | outputs=%d",
+            spec.name,
+            spec.nz,
+            spec.ny,
+            spec.nx,
+            solver.num_tiles,
+            bool(getattr(solver, "_shared_tile_handle", None) is not None or getattr(solver, "_tile_handles", None)),
+            float(dt_s),
+            total_steps,
+            float(forecast_hours),
+            "on" if enable_physics else "off",
+            int(physics_every),
+            "on" if ocean_solver is not None else "off",
+            len(out_step_map),
+        )
+        pbar = (
+            _tqdm(total=total_steps, desc=f"[{spec.name}]", unit="step", dynamic_ncols=True, mininterval=0.2)
+            if (show_progress and _tqdm is not None and total_steps > 0)
+            else None
+        )
+        cur_step = [0]
+        step_t0 = [time.perf_counter()]
+
+        def _on_tile(t_idx: int, n_tiles: int) -> None:
+            if pbar is not None:
+                next_h = ((cur_step[0] + 1) * float(dt_s)) / 3600.0
+                pbar.set_postfix_str(
+                    f"T+{next_h:05.2f}h/{float(forecast_hours):.1f}h | tile {t_idx}/{n_tiles}",
+                    refresh=True,
+                )
+
+        def _on_step(_local_i: int, ran_phys: bool) -> None:
+            step_elapsed = time.perf_counter() - step_t0[0]
+            step_t0[0] = time.perf_counter()
+            cur_step[0] += 1
+            s_cur = cur_step[0]
+            lead_h = (s_cur * float(dt_s)) / 3600.0
+            pct = 100.0 * s_cur / max(1, total_steps)
+            v_dt_step = init_dt + datetime.timedelta(seconds=s_cur * float(dt_s))
+            mode_tag = "dyn+phys" if ran_phys else "dyn"
+            if pbar is not None:
+                pbar.update(1)
+                pbar.set_postfix_str(
+                    f"T+{lead_h:05.2f}h/{float(forecast_hours):.1f}h | {mode_tag} | {step_elapsed:.2f}s/step",
+                    refresh=False,
+                )
+            if log_steps:
+                logger.info(
+                    "[%s] Step %d/%d (%.1f%%) | T+%05.2fh/%05.2fh | valid=%s | %s | %.2fs",
+                    spec.name,
+                    s_cur,
+                    total_steps,
+                    pct,
+                    lead_h,
+                    float(forecast_hours),
+                    v_dt_step.strftime("%Y-%m-%d %H:%MZ"),
+                    mode_tag,
+                    step_elapsed,
+                )
+
         def _handle_step_events(step_idx: int) -> None:
             nonlocal cur_state, cur_surf, cur_oce_state, iau_active
             nonlocal prev_oce_step, prev_oce_rain, prev_oce_snow, prev_out_step, prev_out_precip
@@ -612,6 +685,13 @@ def run_domain_forecast(
                 and (step_idx in cpl_step_set or step_idx in out_step_map or step_idx == total_steps)
             ):
                 dt_cpl = (step_idx - prev_oce_step) * float(dt_s)
+                t_cpl0 = time.perf_counter()
+                logger.info(
+                    "[%s] Coupling NEMO+SI3 at T+%05.2fh (dt_cpl=%.0fs)...",
+                    spec.name,
+                    sim_sec / 3600.0,
+                    dt_cpl,
+                )
                 mslp_pa = compute_mslp_pa(
                     spec, hs_m, cur_state, theta_sfc_ref=theta_sfc_ref, p_sfc_ref=p_sfc_ref, n_ref_hz=n_ref_hz
                 )
@@ -635,9 +715,18 @@ def run_domain_forecast(
                     + np.asarray(cur_surf.get("graupel_acc", np.zeros_like(prev_oce_snow)), dtype=np.float32)
                 ).copy()
                 prev_oce_step = step_idx
+                logger.info("[%s] Ocean+SI3 coupled in %.2fs", spec.name, time.perf_counter() - t_cpl0)
 
             if step_idx in child_step_map and lbc_export_child is not None:
                 c_spec, c_hs, lbc_dir_c, _ = lbc_export_child
+                t_lbc0 = time.perf_counter()
+                logger.info(
+                    "[%s] Exporting LBC step %d for %s at T+%05.2fh...",
+                    spec.name,
+                    child_step_map[step_idx],
+                    c_spec.name,
+                    sim_sec / 3600.0,
+                )
                 lp = export_child_lbc_step(
                     lbc_dir_c,
                     child_step_map[step_idx],
@@ -651,11 +740,14 @@ def run_domain_forecast(
                     include_hydrometeors=False,
                 )
                 lbc_paths.append(lp)
+                logger.info("[%s] Saved LBC %s (%.2fs)", spec.name, lp.name, time.perf_counter() - t_lbc0)
 
             if step_idx in out_step_map and out_dir is not None:
                 hr = out_step_map[step_idx]
                 tag = f"{int(round(hr)):03d}" if abs(hr - round(hr)) < 1e-4 else f"{hr:06.2f}"
                 fp = out_dir / f"forecast_{spec.name}_T+{tag}h.wx1"
+                t_wx0 = time.perf_counter()
+                logger.info("[%s] Writing WX-1 forecast %s (T+%sh)...", spec.name, fp.name, tag)
                 write_forecast_wx1(
                     fp,
                     v_dt,
@@ -673,6 +765,7 @@ def run_domain_forecast(
                     interval_s=max(0.0, (step_idx - prev_out_step) * float(dt_s)),
                 )
                 out_paths.append(fp)
+                logger.info("[%s] Wrote %s in %.2fs", spec.name, fp.name, time.perf_counter() - t_wx0)
                 prev_out_precip = (
                     np.asarray(cur_surf.get("rain_acc", np.zeros((spec.ny, spec.nx))), dtype=np.float64)
                     + np.asarray(cur_surf.get("snow_acc", np.zeros((spec.ny, spec.nx))), dtype=np.float64)
@@ -697,17 +790,21 @@ def run_domain_forecast(
                 )
                 cycle_restart_paths.append(rp)
                 if ocean_solver is not None and cur_oce_state is not None:
-                    ocean_solver.save_restart_wx1(
+                    orp = ocean_solver.save_restart_wx1(
                         cyc_dir / f"{spec.name}_ocean_cycle_f{tag}_{v_dt:%Y%m%d_%H%M}Z.wx1",
                         v_dt,
                         cur_oce_state,
                         sim_time_sec=sim_sec,
                     )
+                    logger.info("[%s] Saved cycle restarts: %s & %s", spec.name, rp.name, orp.name)
+                else:
+                    logger.info("[%s] Saved cycle restart: %s", spec.name, rp.name)
 
             if iau_active and step_idx >= iau_off_step and step_idx < total_steps:
                 zero_iau = {k: np.zeros_like(v) for k, v in iau_forcing.items()}  # type: ignore[union-attr]
                 solver.set_iau_forcing(zero_iau)
                 iau_active = False
+                logger.info("[%s] IAU warm-up completed at step %d (T+%05.2fh)", spec.name, step_idx, sim_sec / 3600.0)
 
         _handle_step_events(0)
 
@@ -720,15 +817,18 @@ def run_domain_forecast(
                 t_mid = 0.5 * (s0 + s1) * float(dt_s)
                 solver.set_lbc_target(_lbc_dict_to_staggered(lbc_interpolator.get_lbc_at_time(t_mid), state_3d))
 
+            step_t0[0] = time.perf_counter()
             if enable_physics:
                 solver.step_full(
                     float(dt_s),
                     n_steps=n_seg,
                     physics_every=physics_every,
                     flush_physics=(s1 == total_steps),
+                    on_step=_on_step,
+                    on_tile=_on_tile,
                 )
             else:
-                solver.step_rk3(float(dt_s), n_steps=n_seg)
+                solver.step_rk3(float(dt_s), n_steps=n_seg, on_step=_on_step, on_tile=_on_tile)
             _handle_step_events(s1)
 
         if total_steps == 0:
@@ -750,6 +850,7 @@ def run_domain_forecast(
                 p_sfc_ref=p_sfc_ref,
                 n_ref_hz=n_ref_hz,
             )
+            logger.info("[%s] Saved final restart: %s", spec.name, restart_out)
 
         ocean_restart_path: Optional[Path] = None
         if ocean_restart_out is not None and ocean_solver is not None and cur_oce_state is not None:
@@ -759,8 +860,18 @@ def run_domain_forecast(
                 cur_oce_state,
                 sim_time_sec=total_steps * float(dt_s),
             )
+            logger.info("[%s] Saved final ocean restart: %s", spec.name, ocean_restart_path)
 
         elapsed_s = time.perf_counter() - t0_wall
+        logger.info(
+            "[%s] Forecast finished: %d steps (%.2fh) in %.2fs | outputs=%d | lbcs=%d",
+            spec.name,
+            total_steps,
+            float(forecast_hours),
+            elapsed_s,
+            len(out_paths),
+            len(lbc_paths),
+        )
         return {
             "state_3d": cur_state,
             "surf_state": cur_surf,
@@ -776,6 +887,8 @@ def run_domain_forecast(
             "cycle_restart_paths": cycle_restart_paths,
         }
     finally:
+        if pbar is not None:
+            pbar.close()
         solver.close()
         if ocean_solver is not None:
             ocean_solver.close()
@@ -852,7 +965,14 @@ def _run_d3_da(
     da_metrics: Dict[str, Any] = {}
     iau_d3 = None
     if enable_da and obs_dir is not None and Path(obs_dir).exists():
+        logger.info("[%s] Loading WX-1 DA observations from %s...", d3_spec.name, obs_dir)
         obs_list, stn_rows = load_station_obs_wx1(obs_dir, d3_spec, valid_time_utc=init_dt)
+        logger.info(
+            "[%s] Loaded %d DA observations across %d surface stations",
+            d3_spec.name,
+            len(obs_list),
+            len(stn_rows),
+        )
         if obs_list:
             da_metrics["verify_bg"] = verify_against_stations(d3_spec, st_d3, sf_d3, hs_d3, stn_rows)
             use_iau = not (d3_spec.is_spherical and d3_spec.nz * d3_spec.ny * d3_spec.nx >= 50_000_000)
@@ -866,6 +986,8 @@ def _run_d3_da(
                 "converged": var_res.converged,
             }
             da_metrics["verify_ana"] = verify_against_stations(d3_spec, st_d3, sf_d3, hs_d3, stn_rows)
+        else:
+            logger.info("[%s] No in-domain DA observations found; skipping 3D-Var.", d3_spec.name)
     return st_d3, sf_d3, iau_d3, da_metrics
 
 
@@ -903,6 +1025,7 @@ def _run_pipeline_ensemble(
     sched: List[float],
     init_dt: datetime.datetime,
     ens_dir: Path,
+    show_progress: bool = True,
 ) -> Optional[Dict[str, Any]]:
     if int(ensemble_members) <= 0:
         return None
@@ -918,6 +1041,13 @@ def _run_pipeline_ensemble(
     ens_cfg = EnsembleConfig(
         n_members=int(ensemble_members),
         seed=int(ensemble_seed) if ensemble_seed is not None else int(init_dt.strftime("%Y%m%d%H")),
+    )
+    logger.info(
+        "=== Ensemble Phase [%s]: %d members (CF + %d perturbed) for %.2fh ===",
+        spec_e.name,
+        int(ensemble_members),
+        max(0, int(ensemble_members) - 1),
+        ens_hours,
     )
     return run_ensemble_forecast(
         spec_e,
@@ -936,6 +1066,8 @@ def _run_pipeline_ensemble(
         base_iau_duration_s=900.0 if iau_e is not None else 0.0,
         output_hours=ens_sched,
         existing_cf_outputs=cf_map if cf_map else None,
+        show_progress=show_progress,
+        log_steps=False,
     )
 
 
@@ -976,13 +1108,18 @@ def run_two_nest_pipeline(
     d3_ocean_restart_in: Optional[Path | str] = None,
     d2_static: Optional[Tuple[np.ndarray, Dict[str, np.ndarray]]] = None,
     d3_static: Optional[Tuple[np.ndarray, Dict[str, np.ndarray]]] = None,
+    show_progress: bool = True,
+    log_steps: bool = True,
 ) -> Dict[str, Any]:
     """Run operational D2 (7.5 km Europe) -> WX-1 LBC -> D3 (1.5 km Benelux+DE) pipeline."""
     t0_pipe = time.perf_counter()
+    logger.info("=== Tempest-NWP v2 Pipeline [D2 -> D3] | nz=%d | hours=%.2fh ===", int(nz), float(forecast_hours))
     d2_spec = d2_spec if d2_spec is not None else get_domain_spec("d2", nz=nz)
     d3_spec = d3_spec if d3_spec is not None else get_domain_spec("d3", nz=nz)
     hs_d2, ss_d2 = _resolve_static(d2_spec, d2_static)
     hs_d3, ss_d3 = _resolve_static(d3_spec, d3_static)
+
+    logger.info("[d3] Building initial conditions from %s...", ic_source)
 
     st_d3, sf_d3, init_dt = _load_domain_ic(
         d3_spec,
@@ -1039,6 +1176,7 @@ def run_two_nest_pipeline(
 
     sched = forecast_output_schedule_hours(forecast_hours, ecmwf_schedule=ecmwf_schedule, hourly=True)
 
+    logger.info("=== Phase 1/2: Europe D2 (%dx%dx%d) DA & Forecast ===", d2_spec.nz, d2_spec.ny, d2_spec.nx)
     st_d2, sf_d2, iau_d2, da_d2 = _run_d3_da(
         d2_spec, st_d2, sf_d2, hs_d2, ss_d2, init_dt, obs_dir, enable_da
     )
@@ -1069,8 +1207,11 @@ def run_two_nest_pipeline(
         ocean_restart_in=d2_ocean_restart_in,
         ocean_restart_out=d2_ocean_out,
         include_3d_diagnostics=include_3d_diagnostics,
+        show_progress=show_progress,
+        log_steps=log_steps,
     )
 
+    logger.info("=== Phase 2/2: Benelux+DE D3 (%dx%dx%d) DA & Forecast ===", d3_spec.nz, d3_spec.ny, d3_spec.nx)
     st_d3, sf_d3, iau_d3, da_metrics = _run_d3_da(
         d3_spec, st_d3, sf_d3, hs_d3, ss_d3, init_dt, obs_dir, enable_da
     )
@@ -1104,6 +1245,8 @@ def run_two_nest_pipeline(
         ocean_restart_in=d3_ocean_restart_in,
         ocean_restart_out=d3_ocean_out,
         include_3d_diagnostics=include_3d_diagnostics,
+        show_progress=show_progress,
+        log_steps=log_steps,
     )
 
     if enable_da and obs_dir is not None and da_metrics.get("verify_bg"):
@@ -1127,6 +1270,7 @@ def run_two_nest_pipeline(
         sched=sched,
         init_dt=init_dt,
         ens_dir=ens_dir,
+        show_progress=show_progress,
     )
 
     if layout is not None and manifest_path is not None:
@@ -1152,6 +1296,7 @@ def run_two_nest_pipeline(
             "wall_time_s": float(time.perf_counter() - t0_pipe),
         }
         manifest_path.write_text(json.dumps(manifest, indent=2))
+    logger.info("=== Tempest-NWP v2 Pipeline [D2 -> D3] finished in %.2fs ===", float(time.perf_counter() - t0_pipe))
 
     return {
         "d2": res_d2,
@@ -1209,20 +1354,35 @@ def run_three_nest_pipeline(
     d1_static: Optional[Tuple[np.ndarray, Dict[str, np.ndarray]]] = None,
     d2_static: Optional[Tuple[np.ndarray, Dict[str, np.ndarray]]] = None,
     d3_static: Optional[Tuple[np.ndarray, Dict[str, np.ndarray]]] = None,
+    show_progress: bool = True,
+    log_steps: bool = True,
 ) -> Dict[str, Any]:
     """Run coupled global D1 (0.25 deg) -> regional D2 (7.5 km) -> D3 (1.5 km) pipeline with NEMO+SI3 & 3D diagnostics."""
     import gc
     from tempest_v2.ic_builder import _CFGRIB_CACHE
 
     t0_pipe = time.perf_counter()
+    d1_hrs = max(float(forecast_hours), float(d1_forecast_hours)) if d1_forecast_hours is not None else float(forecast_hours)
+    logger.info(
+        "=== Tempest-NWP v2 Pipeline [D1 -> D2 -> D3] | nz=%d | d1=%.2fh | d2/d3=%.2fh | da=%s | ocean_si3=%s ===",
+        int(nz),
+        d1_hrs,
+        float(forecast_hours),
+        enable_da,
+        enable_ocean_si3,
+    )
+    t_prep = time.perf_counter()
     d1_spec = d1_spec if d1_spec is not None else get_domain_spec("d1", nz=nz)
     d2_spec = d2_spec if d2_spec is not None else get_domain_spec("d2", nz=nz)
     d3_spec = d3_spec if d3_spec is not None else get_domain_spec("d3", nz=nz)
     hs_d1, ss_d1 = _resolve_static(d1_spec, d1_static)
     hs_d2, ss_d2 = _resolve_static(d2_spec, d2_static)
     hs_d3, ss_d3 = _resolve_static(d3_spec, d3_static)
+    logger.info("Static terrain/soil/land-use fields ready for D1/D2/D3 in %.2fs", time.perf_counter() - t_prep)
 
     # Load D1 first (sequential domain lifecycle so D1, D2, D3 137-layer states never coexist in RAM)
+    logger.info("=== Phase 1/3: Global D1 (%dx%dx%d) IC -> DA -> NEMO+SI3 Forecast ===", d1_spec.nz, d1_spec.ny, d1_spec.nx)
+    t_ic1 = time.perf_counter()
     st_d1, sf_d1, init_dt = _load_domain_ic(
         d1_spec,
         hs_d1,
@@ -1238,6 +1398,7 @@ def run_three_nest_pipeline(
         with wx1.open_dataset(restart_path) as rds:
             init_dt = datetime.datetime.fromisoformat(str(rds.attrs["valid_time_utc"]).replace("Z", "+00:00"))
     assert init_dt is not None
+    logger.info("[d1] Initial conditions ready in %.2fs (init=%s)", time.perf_counter() - t_ic1, init_dt.isoformat())
 
     if run_dir is not None:
         layout = _ensure_run_layout_dirs(Path(run_dir))
@@ -1247,6 +1408,7 @@ def run_three_nest_pipeline(
         layout = create_run_layout(Path(outdir), init_dt, run_tag=run_tag)
 
     out_root = layout["run_dir"]
+    logger.info("Run output directory: %s", out_root)
     lbc_d2_dir = layout["d1"] / "lbc_d2"
     lbc_d3_dir = layout["d2"] / "lbc_d3"
     cyc_dir = layout["restarts"]
@@ -1254,7 +1416,6 @@ def run_three_nest_pipeline(
     d2_ocean_out = (layout["ocean"] / f"restart_ocean_{d2_spec.name}.wx1") if enable_ocean_si3 else None
     d3_ocean_out = (layout["ocean"] / f"restart_ocean_{d3_spec.name}.wx1") if enable_ocean_si3 else None
 
-    d1_hrs = max(float(forecast_hours), float(d1_forecast_hours)) if d1_forecast_hours is not None else float(forecast_hours)
     sched_d1 = forecast_output_schedule_hours(d1_hrs, ecmwf_schedule=ecmwf_schedule, hourly=True)
     sched = forecast_output_schedule_hours(forecast_hours, ecmwf_schedule=ecmwf_schedule, hourly=True)
     ens_dom_key = ensemble_domain.strip().lower()
@@ -1289,6 +1450,8 @@ def run_three_nest_pipeline(
         ocean_restart_in=d1_ocean_restart_in,
         ocean_restart_out=d1_ocean_out,
         include_3d_diagnostics=include_3d_diagnostics,
+        show_progress=show_progress,
+        log_steps=log_steps,
     )
     del iau_d1
     if not (int(ensemble_members) > 0 and ens_dom_key == "d1"):
@@ -1297,8 +1460,11 @@ def run_three_nest_pipeline(
             res_d1["state_3d"] = {}
             res_d1["ocean_state"] = None
         gc.collect()
+        logger.info("[d1] Freed host 3D state before loading D2.")
 
     # 2. Regional Europe D2 driven by D1 LBCs + balanced 3D-Var/4D-FGAT -> LBCs for Benelux+DE D3
+    logger.info("=== Phase 2/3: Europe D2 (%dx%dx%d) IC -> DA -> Forecast ===", d2_spec.nz, d2_spec.ny, d2_spec.nx)
+    t_ic2 = time.perf_counter()
     st_d2, sf_d2, _ = _load_domain_ic(
         d2_spec,
         hs_d2,
@@ -1310,6 +1476,7 @@ def run_three_nest_pipeline(
         aurora_wx1_path=aurora_wx1_path,
         allow_zero_restart_fallback=True,
     )
+    logger.info("[d2] Initial conditions ready in %.2fs", time.perf_counter() - t_ic2)
     st_d2, sf_d2, iau_d2, da_d2 = _run_d3_da(
         d2_spec, st_d2, sf_d2, hs_d2, ss_d2, init_dt, obs_dir, enable_da
     )
@@ -1341,6 +1508,8 @@ def run_three_nest_pipeline(
         ocean_restart_in=d2_ocean_restart_in,
         ocean_restart_out=d2_ocean_out,
         include_3d_diagnostics=include_3d_diagnostics,
+        show_progress=show_progress,
+        log_steps=log_steps,
     )
     del iau_d2
     if not (int(ensemble_members) > 0 and ens_dom_key == "d2"):
@@ -1349,8 +1518,11 @@ def run_three_nest_pipeline(
             res_d2["state_3d"] = {}
             res_d2["ocean_state"] = None
         gc.collect()
+        logger.info("[d2] Freed host 3D state before loading D3.")
 
     # 3. Balanced 3D-Var/4D-FGAT + Radar LHN + IAU on 1.5 km D3
+    logger.info("=== Phase 3/3: Benelux+DE D3 (%dx%dx%d) IC -> DA -> Forecast ===", d3_spec.nz, d3_spec.ny, d3_spec.nx)
+    t_ic3 = time.perf_counter()
     st_d3, sf_d3, _ = _load_domain_ic(
         d3_spec,
         hs_d3,
@@ -1363,6 +1535,7 @@ def run_three_nest_pipeline(
     )
     _CFGRIB_CACHE.clear()
     gc.collect()
+    logger.info("[d3] Initial conditions ready in %.2fs", time.perf_counter() - t_ic3)
 
     st_d3, sf_d3, iau_d3, da_metrics = _run_d3_da(
         d3_spec, st_d3, sf_d3, hs_d3, ss_d3, init_dt, obs_dir, enable_da
@@ -1400,6 +1573,8 @@ def run_three_nest_pipeline(
         ocean_restart_in=d3_ocean_restart_in,
         ocean_restart_out=d3_ocean_out,
         include_3d_diagnostics=include_3d_diagnostics,
+        show_progress=show_progress,
+        log_steps=log_steps,
     )
 
     if enable_da and obs_dir is not None and da_metrics.get("verify_bg"):
@@ -1427,9 +1602,11 @@ def run_three_nest_pipeline(
         sched=sched,
         init_dt=init_dt,
         ens_dir=layout["ensemble"],
+        show_progress=show_progress,
     )
 
     manifest_path = out_root / "manifest.json"
+    wall_total = float(time.perf_counter() - t0_pipe)
     manifest = {
         "init_time_utc": init_dt.isoformat(),
         "ic_source": ic_source,
@@ -1452,9 +1629,10 @@ def run_three_nest_pipeline(
         "da": da_metrics,
         "ensemble": ens_summary,
         "cycle_restart_paths": [str(p) for p in cyc_list],
-        "wall_time_s": float(time.perf_counter() - t0_pipe),
+        "wall_time_s": wall_total,
     }
     manifest_path.write_text(json.dumps(manifest, indent=2))
+    logger.info("=== Tempest-NWP v2 Pipeline [D1 -> D2 -> D3] finished in %.2fs | manifest=%s ===", wall_total, manifest_path)
 
     return {
         "d1": res_d1,
