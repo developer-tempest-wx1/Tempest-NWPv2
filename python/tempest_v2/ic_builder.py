@@ -26,6 +26,7 @@ from tempest_v2.bathymetry import load_bathymetry, prepare_bathymetry_on_2d_grid
 from tempest_v2.cuda_bridge import NonHydrostaticGPUSolver
 from tempest_v2.hwsd22_soil import sample_hwsd22_on_grid
 from tempest_v2.projection import (
+    CP_D,
     GRAVITY_M_S2,
     KAPPA,
     P0_PA,
@@ -318,6 +319,22 @@ def _read_cfgrib_var_map(grib_path: Path) -> Dict[str, Tuple[xr.DataArray, np.nd
     return found
 
 
+def _q_from_dewpoint_pa(
+    td_k: np.ndarray,
+    p_pa: np.ndarray,
+    t_k: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Convert 2 m dewpoint temperature [K] and surface pressure [Pa] to specific humidity [kg/kg] via Bolton/Magnus."""
+    td_eff = np.asarray(td_k, dtype=np.float64)
+    if t_k is not None:
+        td_eff = np.minimum(td_eff, np.asarray(t_k, dtype=np.float64))
+    tc = np.clip(td_eff - 273.15, -90.0, 60.0)
+    es = 611.2 * np.exp((17.67 * tc) / (tc + 243.5))
+    p_safe = np.maximum(np.asarray(p_pa, dtype=np.float64), 1000.0)
+    es = np.minimum(es, 0.90 * p_safe)
+    return np.clip((0.62198 * es) / np.maximum(p_safe - 0.37802 * es, 100.0), 1e-7, 0.04)
+
+
 def _vertical_map_isobaric_to_klemp(
     spec: DomainSpec,
     hs_m: np.ndarray,
@@ -363,7 +380,7 @@ def _vertical_map_isobaric_to_klemp(
     b_s = spec.vertical.B_s[:, None, None].astype(np.float64)
     hs_2d = np.asarray(hs_m, dtype=np.float64)
     n2 = float(n_ref_hz) * float(n_ref_hz)
-    g2_cp = (GRAVITY_M_S2 * GRAVITY_M_S2) / (1004.64 * float(theta_sfc_ref) * max(n2, 1e-12))
+    g2_cp = (GRAVITY_M_S2 * GRAVITY_M_S2) / (CP_D * float(theta_sfc_ref) * max(n2, 1e-12))
     pi_sfc = (float(p_sfc_ref) / P0_PA) ** KAPPA
 
     chunk_ny = 64
@@ -404,6 +421,20 @@ def _vertical_map_isobaric_to_klemp(
             th_abv = t_top / ((np.maximum(p_abv, 1.0) / P0_PA) ** KAPPA)
             p_i = np.where(above, p_abv, p_i)
             th_i = np.where(above, th_abv, th_i)
+
+        below = zt_b < zs_b[0:1, :]
+        if np.any(below):
+            gamma_std = 0.0065  # Standard tropospheric lapse rate [K/m]
+            dz_down = np.maximum(0.0, zs_b[0:1, :] - zt_b)
+            t_bot = np.maximum(180.0, th_b[0:1, :] * ((p_levels_pa[0] / P0_PA) ** KAPPA))
+            q_bot = np.clip(q_b[0:1, :], 0.0, 0.04)
+            tv_bot = t_bot * (1.0 + 0.608 * q_bot)
+            tv_bel = np.maximum(180.0, tv_bot + gamma_std * dz_down)
+            t_bel = np.maximum(180.0, t_bot + gamma_std * dz_down)
+            p_bel = p_levels_pa[0] * np.power(tv_bel / tv_bot, GRAVITY_M_S2 / (R_D * gamma_std))
+            th_bel = t_bel / np.power(np.maximum(p_bel, 10.0) / P0_PA, KAPPA)
+            p_i = np.where(below, p_bel, p_i)
+            th_i = np.where(below, th_bel, th_i)
 
         pi_i = np.power(np.maximum(p_i, 10.0) / P0_PA, KAPPA)
         theta_p_out[:, j0:j1, :] = (th_i.reshape(nz, ny_c, nx) - theta_bar_c).astype(np.float32)
@@ -521,6 +552,8 @@ def ecmwf_grib_to_domain_state(
 
     msl_h = _get_sfc(("msl", "mslp"), 101_325.0)
     t2m_h = _get_sfc(("t2m", "2t"), 285.0)
+    d2m_key = next((k for k in ("d2m", "2d") if k in sfc_vars), None)
+    d2m_h = _get_sfc((d2m_key,), float(np.mean(t2m_h))) if d2m_key is not None else None
     skt_h = _get_sfc(("skt", "t"), float(np.mean(t2m_h)))
     sd_h = _get_sfc(("sd", "snow"), 0.0)
     # ECMWF IFS GRIB2 snow depth is in meters of water equivalent -> kg/m^2 = mm
@@ -549,6 +582,10 @@ def ecmwf_grib_to_domain_state(
     surf = _empty_surface_state_for_spec(spec)
     surf["t_skin"] = np.clip(skt_h, 210.0, 330.0).astype(np.float32)
     surf["t2m"] = np.clip(t2m_h, 210.0, 330.0).astype(np.float32)
+    if d2m_h is not None:
+        surf["q2m"] = _q_from_dewpoint_pa(d2m_h, ps_child, t_k=t2m_h).astype(np.float32)
+    else:
+        surf["q2m"] = np.clip(state_3d["qv"][0], 1e-7, 0.04).astype(np.float32)
     surf["snow_swe"] = sd_h.astype(np.float32)
     surf["sst_bulk"] = np.clip(skt_h, 271.15, 310.0).astype(np.float32)
     surf["lake_tbot"] = np.clip(skt_h - 1.5, 273.15, 305.0).astype(np.float32)
