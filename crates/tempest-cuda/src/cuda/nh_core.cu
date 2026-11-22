@@ -1312,7 +1312,7 @@ __global__ void nh_ieva_vert_advect_w_kernel(
 }
 
 // ---------------------------------------------------------------------------
-// Kernel 2: 3D Divergence (for acoustic divergence damping) + acoustic horiz step
+// Kernel 2: Horizontal Divergence (for symmetric acoustic divergence damping) + acoustic horiz step
 // ---------------------------------------------------------------------------
 __global__ void nh_compute_div_kernel(
     NhGridConfig cfg,
@@ -1371,12 +1371,13 @@ __global__ void nh_compute_div_kernel(
             (gv_n * v_n / mv_n - gv_s * v_s / mv_s) / dy_f
         );
 
-    float gz_lo = 0.0f, gz_hi = 0.0f;
-    compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, k,     j, i, gz_lo);
-    compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, k + 1, j, i, gz_hi);
-    const float vdiv = (gz_hi - gz_lo) / static_cast<float>(g.dzeta[k]);
-
-    div3d[idx] = (hdiv + vdiv) / fmaxf(g_s, 1e-4f);
+    // Strictly symmetric negative-semi-definite horizontal acoustic divergence damping:
+    // Including vertical divergence vdiv = d(G*zeta_dot)/dzeta in div3d while applying grad(div3d)
+    // only to horizontal (u, v) produces an asymmetric operator with positive anti-damping eigenvalue
+    // +0.5 * nu_div * |kx * kz| on anisotropic NWP grids (dx >> dz) and explicit c_div*(|dh|/dz) blowup
+    // over steep terrain. Vertical acoustic modes are damped by off-centered HEVI (beta > 0.5).
+    (void)w;
+    div3d[idx] = hdiv / fmaxf(g_s, 1e-4f);
 }
 
 __global__ void nh_acoustic_u_kernel(

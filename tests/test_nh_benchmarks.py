@@ -553,3 +553,70 @@ def test_clear_iau_forcing_frees_buffers_and_matches_zero() -> None:
     st_clr = _run_case(True)
     for key in ("u", "v", "w", "theta_p", "pi_p", "qv"):
         assert np.max(np.abs(st_ref[key] - st_clr[key])) == 0.0, f"IAU clear mismatch on '{key}'"
+
+
+def test_steep_terrain_137_layer_divergence_damping_stability() -> None:
+    """Steep >3000m/cell cliff on 137 stretched layers remains stable with div_damp_coeff=0.04 across acoustic substep counts."""
+    nz, ny, nx = 137, 32, 40
+    dx = dy = 27_800.0
+    vgrid = VerticalGrid(nz=nz, z_top_m=31_000.0, stretch_power=1.5, terrain_decay_power=2.5)
+
+    jj, ii = np.meshgrid(np.arange(ny, dtype=np.float64), np.arange(nx, dtype=np.float64), indexing="ij")
+    # Build a steep 5,800 m ridge with a sharp >3,300 m 1-cell cliff (mirrors Andes/Himalayas at 0.25 deg)
+    ridge = 5800.0 * np.exp(-(((jj - 16.0) / 3.5) ** 2)) * (1.0 / (1.0 + np.exp(-2.8 * (ii - 18.0))))
+    hs = ridge * np.where((ii >= 14) & (ii <= 26), 1.0, np.exp(-(((ii - 20.0) / 6.0) ** 2)))
+    assert float(np.max(hs)) > 5500.0
+    assert float(np.max(np.abs(np.diff(hs, axis=1)))) > 3000.0
+    vgrid.check_jacobian_positive(hs)
+
+    _, z_s, _ = vgrid.heights_3d(hs)
+    ref = VerticalGrid.reference_state(z_s, theta_sfc_k=288.15, p_sfc_pa=101_325.0, brunt_vaisala_hz=0.01)
+    bg = VerticalGrid.reference_state(z_s, theta_sfc_k=292.0, p_sfc_pa=101_325.0, brunt_vaisala_hz=0.011)
+    thp0 = (bg["theta_bar"] - ref["theta_bar"]).astype(np.float32)
+    pip0 = (bg["pi_bar"] - ref["pi_bar"]).astype(np.float32)
+
+    for n_sub in (0, 16):
+        solver = NonHydrostaticGPUSolver(
+            vgrid,
+            dx,
+            dy,
+            hs,
+            has_moist=True,
+            has_physics=False,
+            bc_x=2,
+            bc_y=2,
+            use_coriolis=True,
+            is_spherical=True,
+            theta_sfc_k=288.15,
+            p_sfc_pa=101_325.0,
+            n_ref_s=0.01,
+            beta_offcenter=0.55,
+            div_damp_coeff=0.04,
+            hyperdiff_coeff=0.005,
+            sponge_depth_m=6000.0,
+            sponge_tau_max_s=0.01,
+            lbc_rim_width=4,
+            lbc_tau_max_s=0.01,
+        )
+        try:
+            st = solver.empty_state()
+            st["u"][:] = 15.0
+            st["v"][:] = 5.0
+            st["theta_p"][:] = thp0
+            st["pi_p"][:] = pip0
+            st["qv"][:] = 0.005
+            lbc = {k: st[k].copy() for k in ("u", "v", "w", "theta_p", "pi_p", "qv")}
+            solver.upload_state(st)
+            solver.set_lbc_target(lbc)
+            solver.step_rk3(dt_s=60.0, n_steps=15, n_substeps=n_sub)
+            out = solver.download_state()
+        finally:
+            solver.close()
+
+        for key in ("u", "v", "w", "theta_p", "pi_p", "qv"):
+            assert np.all(np.isfinite(out[key])), f"Non-finite '{key}' for n_sub={n_sub}"
+        assert float(np.max(np.abs(out["u"]))) < 80.0, f"Unstable |u|={np.max(np.abs(out['u'])):.2f} for n_sub={n_sub}"
+        assert float(np.max(np.abs(out["v"]))) < 80.0, f"Unstable |v|={np.max(np.abs(out['v'])):.2f} for n_sub={n_sub}"
+        assert float(np.max(np.abs(out["w"]))) < 20.0, f"Unstable |w|={np.max(np.abs(out['w'])):.2f} for n_sub={n_sub}"
+        assert float(np.min(out["qv"])) >= 0.0, f"Negative qv={np.min(out['qv']):.3e} for n_sub={n_sub}"
+

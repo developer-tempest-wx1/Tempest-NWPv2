@@ -142,6 +142,14 @@ def build_domain_static_fields(
                 elev2d = itp_e(np.column_stack([spec.lat2d.ravel(), tgt_lon.ravel()])).reshape(ny, nx)
                 hs_m = np.maximum(elev2d, 0.0).astype(np.float64)
                 lsm_frac = np.where(elev2d > 0.0, 1.0, 0.0).astype(np.float32)
+                # 1-pass 2*dx Shapiro filter matching D2/D3 Copernicus DEM path (keeps ocean = 0.0 m, wraps periodic longitude)
+                w_s = 0.125
+                hs_pad_y = np.pad(hs_m, ((1, 1), (0, 0)), mode="edge")
+                hs_pad = np.pad(hs_pad_y, ((0, 0), (1, 1)), mode="wrap" if spec.is_periodic_lon else "edge")
+                hs_filt = (1.0 - 4.0 * w_s) * hs_m + w_s * (
+                    hs_pad[:-2, 1:-1] + hs_pad[2:, 1:-1] + hs_pad[1:-1, :-2] + hs_pad[1:-1, 2:]
+                )
+                hs_m = np.where(lsm_frac >= 0.05, hs_filt, 0.0)
                 lake_frac = np.zeros((ny, nx), dtype=np.float32)
                 oro_std = np.zeros((ny, nx), dtype=np.float32)
                 used_fast_global_gebco = True
