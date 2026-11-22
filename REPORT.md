@@ -197,4 +197,99 @@ Alle Fase-3 benchmarks zijn identiek uitgevoerd op een **NW-Europa `7,5 km` subg
 3. **DA `--da-strict-timeslots` herintroduceren ná fix #1:** Scheid de missing-epoch-guard (`YYYYMMDD_HHMMZ` dir-check + `±3h` venster) van variantie-inflatie in `bg_check` (toets outliers op ongeïnflateerde `sigma_o`), en vervang meervoudige Euler-FGAT-stappen door een 2e orde semi-Lagrangiaanse interpolatie over korte intervallen.
 4. **Landwind & nachtelijke schuifmenging (`LFAKETREE` + `nh_pbl_momentum_*`):** `W10 land` (`+1.7..+2.3 m/s`) en te zwakke `200–300 m` LLJ vereisen onderzoek naar `km` in stabiele omstandigheden en logaritmische ruwheidsverhoging over laag grasland/akkerbouw.
 5. **Shuell MSLP-reductie + `sea_ice_thick` + `50r2`-eenhedenguards:** Verkleint berg-MSLP-bias (`+1.6 hPa` boven `800 m`), activeert warmtegeleiding door zee-ijsdikte in `nh_physics.cu:1062` en beveiligt `tp`/`tcc`-readers voor ECMWF 50r2.
-6. **Gerichte D3 (`1,5 km`) verificatie:** Na combinatie van `--pbl-last --cy46-physics` (en bij voorkeur na fix #1/#2) verifiëren op een kort Benelux `1,5 km` venster + 4-tile `720×720×137` geheugentest tegen KNMI HARMONIE Cy46.
+6. **Gerichte D3 (`1,5 km` of `2,5 km`) verificatie:** Nu Optie 3 (IC-clamp + `q2m` + `d_lbc_qv`) is opgelost, verifiëren tegen KNMI HARMONIE Cy46 en live `06Z`-stations.
+
+---
+
+## 7. Addendum — Optie 3 kernfixes, 2,5 km analyse, CPU FP64, versnelling & opslagformaten
+
+### 7.1 Optie 3: Oplossen van kernbugs uit Fase 2 (`5527ebb`, `18ac6f6`)
+
+Beide in Fase 2 blootgelegde kernfouten zijn opgelost en geverifieerd (Cargo `3/3`, pytest `53/53`, en echte 6-uurs Europa-D2 verificatie op `65×400×520`, `2026-11-22 00Z → 06Z`, `dt = 20 s`, `physics_every = 5`, `--pbl-last --cy46-physics`, gekoppelde NEMO+SI3):
+
+1. **Bug #1 (`5527ebb`, [`ic_builder.py`](file:///home/j_ord/AI/Tempest/Tempest-NWPv2-kopie/python/tempest_v2/ic_builder.py)):**
+   - Verving de `1000 hPa`-klem (`wt = np.clip(..., 0.0, 1.0)`) in `_vertical_map_isobaric_to_klemp` bij `z < z_1000` door vochtig-hydrostatische neerwaartse extrapolatie (`γ = 0.0065 K/m` met virtuele temperatuur), en verving `1004.64` door `CP_D`.
+   - Initialisering van `surf["q2m"]` toegevoegd via `_q_from_dewpoint_pa` vanuit ECMWF `2d`/`d2m` (fallback `qv[0]`).
+2. **Bug #2 (`18ac6f6`, [`nh_internal.cuh`](file:///home/j_ord/AI/Tempest/Tempest-NWPv2-kopie/crates/tempest-cuda/src/cuda/nh_internal.cuh), [`nh_core.cu`](file:///home/j_ord/AI/Tempest/Tempest-NWPv2-kopie/crates/tempest-cuda/src/cuda/nh_core.cu), [`cuda_bridge.py`](file:///home/j_ord/AI/Tempest/Tempest-NWPv2-kopie/python/tempest_v2/cuda_bridge.py), [`runner.py`](file:///home/j_ord/AI/Tempest/Tempest-NWPv2-kopie/python/tempest_v2/runner.py)):**
+   - Open tracer-randfluxen toegevoegd voor `bc == 2` (`face_flux_x_f`/`y_f`, 1e-orde upwind aan de domeinbuitenzijde van Pass 1 consistent met Pass 2).
+   - `d_lbc_qv` buffer (met backward-compatible `has_lbc_qv` vlag wanneer `qv == NULL`) en exponentieel positief-definiete Davies-relaxatiekernel `nh_lbc_relax_qv_kernel` toegevoegd na horizontale/verticale FCT-advectie van `qv`, plus VRAM-schatter `+1` veld (`D2 137×400×520` met IAU blijft **1×1 tile**: `4188 MiB <= 4350 MiB`).
+
+| Metriek (`65×400×520`, `2026-11-22 00Z → 06Z`) | Vóór fixes (Fase 2 §4.4) | Ná Optie 3 (`18ac6f6`) | Verbetering |
+|---|---|---|---|
+| **T+00h EC MSLP** binnen (`n=172.800`) Bias / RMSE (`r`) | `-3.95` / `7.42 hPa` (`0.6921`) | **`+0.112` / `0.560 hPa` (`0.9979`)** | **13,2× lagere RMSE** |
+| **T+00h EC MSLP** Benelux Bias / RMSE (`r`) | `-7.09` / `8.98 hPa` (`0.2771`) | **`-0.029` / `0.068 hPa` (`0.9967`)** | **132× lagere RMSE** |
+| **T+00h EC MSLP** hogedruk `>1015 hPa` Bias / RMSE | `-8.10 hPa` (`-15.36 hPa` piek) | **`+0.248` / `0.755 hPa`** | Hogedruk-afknijping weg |
+| **T+00h EC Td2m** binnen Bias / RMSE (`r`) | `-74.00` / `74.21 K` | **`+0.005` / `0.017 K` (`1.0000`)** | `q2m=0` volledig verholpen |
+| **T+06h Westrand-TCWV** `i=[0,1,5,10,20,40]` `[kg/m²]` | `[0.10, 0.16, 0.54, 1.06, 2.13, 9.82]` | **`[13.22, 13.24, 13.36, 13.47, 13.31, 14.57]`** *(EC: `[12.60..14.13]`)* | **Droge westrand 100% weg** |
+| **T+06h EC Td2m** binnen Bias / RMSE (`r`) | `-0.47` / `2.12 K` (`0.9302`) | **`-0.072` / `1.089 K` (`0.9802`)** | RMSE gehalveerd |
+| **T+06h EC MSLP / Benelux** Bias / RMSE | `-1.08/1.63` · `-1.49/1.54 hPa` | **`-0.984/1.602` · `-1.418/1.467 hPa`** | Lager drukverloop |
+| **T+06h EC T2m** (binnen / land / zee) RMSE | `1.14 / 1.42 / 0.65 K` | **`1.122 / 1.397 / 0.618 K`** *(bias `-0.16/-0.03/-0.32`)* | Verbeterd op alle maskers |
+| **T+06h EC Z500 / Z850** Bias / RMSE | `-15.34/18.51` · `-11.74/14.39 m` | **`-13.73/17.27` · `-10.71/13.59 m`** | Rest (~`-11..-14 m`) door vaste `00Z` LBC's |
+| **T+06h HARMONIE Cy46** `MSLP / T2m / Td2m` RMSE (Bias) | `1.210 (-1.12) / 1.173 (+0.11)` / — | **`1.061 (-0.96) / 1.149 (+0.056) / 1.179 (+0.020)`** | Sterke overeenkomst; restpunt: `W10 land +1.72 m/s` |
+| **Geheugen tijdens 1080 stappen** (`RSS / Swap / VRAM`) | — | **`2524.8 MB` vlak · `0.0 MB` swap · `3077 MiB` vlak** | `dt_step` `0.52→2.32 s` puur thermisch (`88.3°C / 772 MHz`) |
+
+---
+
+### 7.2 D3 Domeinanalyse: 2,5 km vs. 1,5 km op RTX 3060 (6 GB VRAM)
+
+Gemeten direct met [`cuda_bridge.py`](file:///home/j_ord/AI/Tempest/Tempest-NWPv2-kopie/python/tempest_v2/cuda_bridge.py) en volledige gekoppelde dynamica+fysica (`--pbl-last --cy46-physics`, `physics_every=5`) op de RTX 3060 Laptop (`live 85% budget = 4350 MiB` uit `5118 MiB` vrij):
+
+| Configuratie | Rooster (`nz×ny×nx`) | Nesting-ratio t.o.v. D2 | Totaal VRAM (`+qv`) | Tiles (IAU / na IAU) | `dt` | Gemeten stapduur (warm, 10 stappen) | Geschatte 6u-run |
+|---|---|---|---|---|---|---|---|
+| **D3 `1,5 km` (`nz=137`)** *(huidig)* | `137×720×720` (`71,0M`) | `5:1` (groot) | `9976` (`10247`) MiB | **`2×2` (4 tiles)** | `4,0 s` (5400 st.) | `9,89 s/stap` *(eerder gemeten bij `86.7°C`, `~7,7 GB` PCIe/stap)* | **~14,8 uur** (tot `20–30u` thermisch) |
+| **D3 `1,5 km` (`nz=90`)** | `90×720×720` (`46,7M`) | `5:1` | `6630` (`6808`) MiB | `1×2` (2 tiles) | `4,0 s` (5400 st.) | *(niet getimed; wel nog 2-tile PCIe-kopie)* | *(niet gemeten)* |
+| **D3 `2,5 km` (`nz=137`)** | `137×432×432` (`25,6M`) | **`3:1`** *(ideaal)* | `3673` (`3771`) MiB | **`1×1` (1 tile!)** | **`6,0 s`** (3600 st.) | **`0,985 s/stap`** *(VRAM `4228 MiB`)* | **59,1 min** *(**~15× sneller**)* |
+| **D3 `2,5 km` (`nz=90`)** | `90×432×432` (`16,8M`) | **`3:1`** *(ideaal)* | `2469` (`2533`) MiB | **`1×1` (1 tile!)** | **`6,0 s`** (3600 st.) | **`0,624 s/stap`** *(VRAM `3190 MiB`)* | **37,5 min** *(**~24× sneller**)* |
+| **D2 `7,5 km` (`nz=137`)** | `137×400×520` (`28,5M`) | — | `4079` (`4188`) MiB | `1×1` (1 tile) | `20,0 s` (1080 st.) | **`1,128 s/stap`** *(VRAM `4602 MiB`)* | **20,3 min** (koud) → `~36 min` (thermisch) |
+
+**Meteorologische conclusie:** `2,5 km` (`432×432`) dekt exact hetzelfde Benelux+W-DE gebied (`1080×1080 km`), matcht KNMI HARMONIE/UWC-West (`2,5 km`), geeft de klassieke `3:1` nesting-verhouding vanaf `7,5 km` D2, en past in **één enkele GPU-tile**. Alleen voor zeer kleinschalige convectieve cellen of steile dalwind in Alpen/Ardennen biedt `1,5 km` meer detail.
+
+---
+
+### 7.3 CPU FP64-prestatie-inschatting (`Intel Core i5-12500H`, 12 threads, `23 GiB` RAM)
+
+Tempest-NWP v2 heeft momenteel geen CPU-dynamica-oplosser (`crates/tempest-core` bevat alleen constanten, geodesie en thermodynamica). Om een eerlijke CPU FP64-looptijd te bepalen zijn echte OpenMP-microbenchmarks (`gcc -O3 -fopenmp -march=native`) op deze exacte machine gedraaid op een `7,12M`-cellen grid (`137×200×260`, buiten 18 MB L3-cache):
+- **Gemeten bandbreedte (`STREAM FP64 triad`):** **`17,34 GB/s`** (12 threads)
+- **Gemeten 3D 7-punts+WENO stencil (`float64`):** `1,48 ns/cel`
+- **Gemeten strided verticale Thomas-solver (`k`-lus over `[nz,ny,nx]`):** `2,35 ns/cel`
+
+Rekenend met ~`5,5 KB/cel` aan geheugenverkeer per volledige RK3+HEVI+IEVA+FCT-stap in FP64 (en ~`280 B/cel` voor de ~35 actieve 3D `float64`-arrays + Python/statiek/NEMO overhead):
+
+| Domein (`nz=137`) | Host-RAM nodig (FP64) | Past in `23 GiB` WSL-RAM? | Bandbreedte-ondergrens | Realistische CPU FP64-tijd | Schatting 6u / 120u |
+|---|---|---|---|---|---|
+| **D2 `7,5 km` (`400×520`)** | `~8,0 GB` arrays (`~10–12 GB` totaal) | Ja | `~9 s/stap` | **`~12–18 s/stap`** | **3,5–5,5 uur** (`6u`) · **~3–4,5 dagen** (`120u`) |
+| **D3 `2,5 km` (`432×432`)** | `~7,2 GB` arrays (`~9–11 GB` totaal) | Ja | `~8 s/stap` | **`~11–16 s/stap`** | **11–16 uur** (`6u`) · ~`9–13 dagen` (`120u`) |
+| **D3 `1,5 km` (`720×720`)** | `~19,9 GB` arrays (`~26–30 GB` totaal) | **Nee — gaat swappen!** | `~22,5 s/stap` *(zonder swap)* | **`~30–45 s/stap`** *(veel trager met swap)* | **45–68 uur** (`6u`, theoretisch zonder swap) |
+
+CPU FP64 is dus ruwweg **10–16× trager** op D2/D3-2,5 km dan de (thermisch gelimiteerde) RTX 3060, en op D3 `1,5 km` loopt `23 GiB` RAM bovendien vol.
+
+---
+
+### 7.4 Gerangschikte GPU-versnellingskansen (zonder fysicaverlies)
+
+1. **`2,5 km` 1-tile voor D3 (~15× sneller) en optioneel `nz = 90` (~1,58× extra):** Vermijdt de ~`7,7 GB/stap` CPU↔GPU PCIe-kopieën over 4 tiles plus ruimere `dt` (`6 s` vs `4 s`).
+2. **`d_tri_c/d_tri_d` en `nh_ieva_vert_advect_*` van `double` naar `float`:** De RTX 3060 (GA106) heeft een **1:64 FP64/FP32-verhouding**. Deze velden omzetten naar `float` bespaart direct `228 MiB` VRAM op D2 (`137×400×520`) en versnelt de 3×3 IEVA- en 4 PBL-Thomas-sweeps merkbaar.
+3. **IEVA global short-circuit als `max(|CFL_z|) <= 0.45`:** In [`nh_core.cu:2988-3003`](file:///home/j_ord/AI/Tempest/Tempest-NWPv2-kopie/crates/tempest-cuda/src/cuda/nh_core.cu#L2988) draaien nu bij elke RK-stage (3×/stap) alle kolomsweeps van `nh_ieva_vert_advect_{scalar,u,v}_kernel` de volledige scanlus. Met een simpele reductievlag kan dit volledig overgeslagen worden in rustige atmosferische kolommen.
+4. **1× per stap `moisture_load` voorberekenen in `d_q_tmp`:** Nu leest [`moisture_load_scalar_f`](file:///home/j_ord/AI/Tempest/Tempest-NWPv2-kopie/crates/tempest-cuda/src/cuda/nh_core.cu#L114) tijdens ~6 akoestische substeps × 3 stages × (`u`, `v`, `vert_implicit`) alle 6 vochtarrays (~`10–12 GB/stap` onnodig VRAM-verkeer op D2).
+5. **Pointer-swap in `advect_one_tracer` + skippen van lege hydrometeoren (`qr/qi/qs/qg`):** Verwijder de 6 D2D `cudaMemcpy`'s per stap en sla FCT over als `max(q) == 0`.
+6. **Pinned host-buffers + async CUDA streams** voor 4-tile modus (alleen relevant voor `1,5 km`) en betere laptopkoeling (houdt klok op `1600–1890 MHz` i.p.v. `390–900 MHz` throttling rond `88–89°C` — ruim `2×` winst op D2).
+
+---
+
+### 7.5 Opslagformaten: WX-1 vs. NetCDF4 vs. Zarr v3 vs. GRIB2
+
+Direct gemeten op hetzelfde echte D2-vochtige dataset (`4` 3D-velden `65×400×520` + `4` 2D-velden `400×520`, `219,65 MB` oncomprimeerde `float32`):
+
+| Formaat & Chunk-topologie | Bestandsgrootte (Compressie) | Schrijftijd | Lees volledige 3D | Lees 1 horizontale kaart (`z=0`) | Lees 1 verticale kolom (`65` lagen) | Lossless? (`max_err`) |
+|---|---|---|---|---|---|---|
+| **WX-1 `zstd_shuffle` `[1,400,520]`** | `107,39 MB` (2,05×) | `2,17 s` | `0,098 s` | **`3,52 ms`** *(snelste)* | `29,47 ms` | **Ja (`0.0`)** |
+| **WX-1 `zstd_shuffle` `[8,100,130]`** | `107,91 MB` (2,04×) | `2,13 s` | `0,053 s` | `7,16 ms` | **`4,57 ms`** *(snelste)* | **Ja (`0.0`)** |
+| NetCDF4 `zlib=4` `[1,400,520]` | `105,72 MB` (2,08×) | `2,93 s` | `0,137 s` | `6,57 ms` | `106,17 ms` *(23× trager)* | Ja (`0.0`) |
+| NetCDF4 `zlib=4` `[8,100,130]` | `104,96 MB` (2,09×) | `2,86 s` | `0,151 s` | `19,37 ms` | `10,58 ms` | Ja (`0.0`) |
+| Zarr v3 `zstd` `[1,400,520]` | `141,80 MB` (1,55×) *(vele losse chunk-bestanden)* | **`0,266 s`** | **`0,049 s`** | `4,24 ms` | `39,50 ms` | Ja (`0.0`) |
+| Zarr v3 `zstd` `[8,100,130]` | `140,70 MB` (1,56×) | `0,453 s` | `0,092 s` | `11,47 ms` | `7,74 ms` | Ja (`0.0`) |
+| GRIB2 `grid_simple` 16-bit *(1→4 vars geschat)* | `~108,21 MB` | `~0,45 s` *(`0,114 s`/var)* | `~0,35 s` *(`0,088 s`/var)* | 1 bericht | Full scan! | **Nee (`4,88e-4`, lossy)** |
+| GRIB2 `grid_ccsds` 16-bit *(1→4 vars geschat)* | **`~66,60 MB`** | `~0,76 s` *(`0,190 s`/var)* | `~0,80 s` *(`0,200 s`/var)* | 1 bericht | Full scan! | **Nee (`4,88e-4`, lossy)** |
+
+**Conclusie (conform `AGENTS.md` Regel 2):** Vervang **WX-1 niet** als interne backbone. Voor prognostische checkpoints, LBC's en model-I/O scoort WX-1 het best over de hele linie: één enkel compact bestand, even groot als NetCDF4 (`-24%` kleiner dan standaard Zarr v3), sneller bij zowel horizontale kaarten (`3,52 ms`) als verticale soundings (`4,57 ms`) en 100% verliesvrij (`max_err = 0.0`) — iets waar 16-bit GRIB2 afvalt door kwantisatieverlies en gebrek aan kolom-chunking. `NetCDF4` of `GRIB2` heeft uitsluitend nut als *optionele eind-export* voor externe tools (Metview, Panoply, QGIS, CDO).
+
