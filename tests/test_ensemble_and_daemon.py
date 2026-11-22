@@ -556,3 +556,51 @@ def test_daemon_config_passthrough_and_nz137_stratospheric_restart(tmp_path: Pat
     assert captured["pbl_last"] is True
     assert captured["cy46_physics"] is True
 
+
+def test_daemon_cold_start_ecmwf_kwargs_and_latest_fallback(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Daemon passes run_date/run_time (never target_time) and falls back to latest step-0 when cycle isn't live yet."""
+    import tempest_v2.ingest_ecmwf as ingest_ecmwf
+    from tempest_v2.daemon import run_single_cycle
+
+    calls: list[dict[str, Any]] = []
+
+    def _fake_download(**kwargs: Any) -> tuple[Path, Path, str]:
+        calls.append(dict(kwargs))
+        assert "target_time" not in kwargs
+        if kwargs.get("run_date") is not None:
+            raise RuntimeError("404 Not Found")
+        out_d = Path(kwargs["output_dir"])
+        out_d.mkdir(parents=True, exist_ok=True)
+        sfc = out_d / "sfc_latest.grib2"
+        pl = out_d / "pl_latest.grib2"
+        sfc.write_bytes(b"grib")
+        pl.write_bytes(b"grib")
+        return sfc, pl, "0p25"
+
+    monkeypatch.setattr(ingest_ecmwf, "download_ecmwf_cold_start", _fake_download)
+
+    captured: Dict[str, Any] = {}
+
+    def _capture_pipeline(**kwargs: Any) -> Dict[str, Any]:
+        captured.update(kwargs)
+        return {"da": {}}
+
+    cfg = DaemonConfig(
+        runs_root=tmp_path / "runs",
+        enable_da=False,
+        enable_radar=False,
+        enable_notifier=False,
+    )
+    init_18 = datetime.datetime(2026, 11, 22, 18, 0, tzinfo=datetime.timezone.utc)
+    res = run_single_cycle(cfg, init_18, pipeline_fn=_capture_pipeline)
+
+    assert len(calls) == 2
+    assert calls[0]["run_date"] == "2026-11-22" and calls[0]["run_time"] == 18
+    assert calls[1].get("run_date") is None and calls[1].get("run_time") is None
+    assert Path(captured["sfc_grib"]).name == "sfc_latest.grib2"
+    assert Path(captured["pl_grib"]).name == "pl_latest.grib2"
+    assert res["ic_source"] == "ecmwf"
+
+

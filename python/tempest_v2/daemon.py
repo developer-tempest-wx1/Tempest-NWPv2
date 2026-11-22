@@ -284,12 +284,29 @@ def run_single_cycle(
         else:
             from tempest_v2.ingest_ecmwf import download_ecmwf_cold_start
 
-            sfc_grib, pl_grib, _ = download_ecmwf_cold_start(
-                target_time=init_dt,
-                step=0,
-                prefer_0p1=False,
-                output_dir=layout["config"] / "raw_ecmwf",
-            )
+            raw_ecmwf_dir = layout["config"] / "raw_ecmwf"
+            if init_dt.hour in (0, 6, 12, 18):
+                try:
+                    sfc_grib, pl_grib, _ = download_ecmwf_cold_start(
+                        step=0,
+                        prefer_0p1=False,
+                        output_dir=raw_ecmwf_dir,
+                        run_date=init_dt.strftime("%Y-%m-%d"),
+                        run_time=init_dt.hour,
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "[%s] ECMWF cycle %s not available yet (%s); falling back to latest published ECMWF step-0 analysis.",
+                        run_id,
+                        init_dt.strftime("%Y-%m-%d %HZ"),
+                        exc,
+                    )
+            if sfc_grib is None or pl_grib is None:
+                sfc_grib, pl_grib, _ = download_ecmwf_cold_start(
+                    step=0,
+                    prefer_0p1=False,
+                    output_dir=raw_ecmwf_dir,
+                )
 
     # 2. Observation & Radar QPE ingest into isolated cycle obs/ directory
     obs_dir_used: Optional[Path] = None
