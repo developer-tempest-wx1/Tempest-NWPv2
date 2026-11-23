@@ -109,6 +109,11 @@ def main() -> None:
     parser.add_argument("--lbc-cache-dir", type=Path, default=None, help="Shared GRIB2 cache dir across LAM domains")
     parser.add_argument("--era5-cache-dir", type=Path, default=None, help="Shared ARCO-ERA5 regional WX-1 cache dir for --mode lam_era5_hindcast")
     parser.add_argument("--era5-land-soil", type=Path, default=None, help="Optional 9 km ERA5-Land soil/skin/snow file (.wx1/.nc/.grib2)")
+    parser.add_argument(
+        "--stream-era5-lbc",
+        action="store_true",
+        help="Stream ERA5 LBC time steps directly into rim-packed LBC .wx1 without intermediate era5_0p25_*.wx1 cache",
+    )
     parser.add_argument("--init-time", type=str, default=None, help="Optional UTC ISO init time (e.g. 2026-11-22T18:00Z)")
     parser.add_argument(
         "--dt-lam",
@@ -308,6 +313,7 @@ def main() -> None:
             lbc_dir=args.lbc_dir,
             era5_cache_dir=args.era5_cache_dir,
             lbc_interval_hours=lbc_int_h,
+            stream_lbc=args.stream_era5_lbc,
             enable_ocean_si3=use_ocean,
             include_3d_diagnostics=include_3d_diag,
             osisaf_wx1_path=args.osisaf_wx1,

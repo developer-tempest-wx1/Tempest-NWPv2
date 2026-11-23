@@ -13,11 +13,14 @@ import wx1
 
 from tempest_v2.knmi_verify import (
     _bilinear_sample_latlon_2d,
+    _knmi_vv_code_to_meters,
+    _normalize_knmi_station_id,
     compute_continuous_stats,
     compute_fog_contingency,
     compute_fractions_skill_score,
     compute_skill_score_vs_ifs,
     compute_wind_dir_stats_deg,
+    load_knmi_stations,
     sample_ifs_grib_at_stations,
     verify_run_against_knmi,
 )
@@ -112,7 +115,16 @@ def _write_synthetic_knmi_nc(
     return path
 
 
-def _write_synthetic_wx1(path: Path, spec, valid_dt: datetime.datetime, lead_h: float, t2m_c: float, mslp_hpa: float) -> None:
+def _write_synthetic_wx1(
+    path: Path,
+    spec,
+    valid_dt: datetime.datetime,
+    lead_h: float,
+    t2m_c: float,
+    mslp_hpa: float,
+    *,
+    tcc_frac: float = 0.5,
+) -> None:
     ny, nx = spec.ny, spec.nx
     shape = (ny, nx)
     rain = np.zeros(shape, dtype=np.float32)
@@ -134,6 +146,7 @@ def _write_synthetic_wx1(path: Path, spec, valid_dt: datetime.datetime, lead_h: 
             "gust10m": (("y", "x"), np.full(shape, 8.0, dtype=np.float32)),
             "vis_m": (("y", "x"), np.full(shape, 600.0 if lead_h > 0 else 5000.0, dtype=np.float32)),
             "sw_down": (("y", "x"), np.full(shape, 250.0, dtype=np.float32)),
+            "tcc": (("y", "x"), np.full(shape, float(tcc_frac), dtype=np.float32)),
             "precip_rate": (("y", "x"), pr_si),
             "rain_acc": (("y", "x"), rain),
             "snow_acc": (("y", "x"), np.zeros(shape, dtype=np.float32)),
@@ -401,3 +414,112 @@ def test_fractions_skill_score_roberts_lean_and_radar_pipeline(tmp_path: Path) -
     assert res["radar_fss"] is not None
     assert res["radar_fss"]["overall"]["n_hours"] == 1
     assert res["radar_fss"]["overall"]["thresholds"]["0.1mm"]["scales"]["10km"]["fss"] > 0.5
+
+
+def _write_synthetic_knmi_hourly_validated_nc(path: Path, valid_dt: datetime.datetime, *, fog_step: bool) -> Path:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    epoch = datetime.datetime(1950, 1, 1, tzinfo=datetime.timezone.utc)
+    sec_1950 = (valid_dt - epoch).total_seconds()
+    stns = [
+        ("0-20000-0-06260", "DE BILT", 52.100, 5.183, 1.9),
+        ("0-20000-0-06203", "P11-B", 52.360, 3.342, 41.8),
+        ("0-20000-0-06290", "TWENTHE", 52.750, 6.897, 16.0),
+        ("0-20000-0-06280", "EELDE", 53.125, 6.585, 5.2),
+    ]
+    n = len(stns)
+    with nc.Dataset(path, "w") as ds:
+        ds.createDimension("station", n)
+        ds.createDimension("time", 1)
+        v_id = ds.createVariable("station", "S15", ("station",))
+        v_nm = ds.createVariable("stationname", "S15", ("station",))
+        v_lat = ds.createVariable("lat", "f8", ("station",))
+        v_lon = ds.createVariable("lon", "f8", ("station",))
+        v_h = ds.createVariable("height", "f8", ("station",))
+        v_t = ds.createVariable("time", "f8", ("time",))
+
+        def _v2(name: str, vals: list[float]) -> None:
+            v = ds.createVariable(name, "f8", ("station", "time"))
+            v[:, 0] = vals
+
+        v_id[:] = np.array([s[0].encode() for s in stns], dtype="S15")
+        v_nm[:] = np.array([s[1].ljust(15)[:15].encode() for s in stns], dtype="S15")
+        v_lat[:] = [s[2] for s in stns]
+        v_lon[:] = [s[3] for s in stns]
+        v_h[:] = [s[4] for s in stns]
+        v_t[:] = [sec_1950]
+
+        _v2("T", [2.0, 6.0, 2.0, 1.5])
+        _v2("TD", [1.5, 4.0, 1.0, 1.0])
+        _v2("U", [96.0, 82.0, 90.0, 95.0])
+        _v2("P", [1016.0, 1015.0, 1016.0, 1016.0])
+        _v2("FF", [5.0, np.nan, 4.0, 5.0])
+        _v2("FH", [4.0, 9.0, 4.0, 5.0])
+        _v2("FX", [7.0, 12.0, 6.0, 7.0])
+        _v2("DD", [270.0, 990.0, 0.0, 270.0])  # 990=variable, 0=calm -> both must become NaN
+        _v2("RH", [1.4 if fog_step else 0.0, 0.0, 0.2, 0.4])
+        _v2("Q", [108.0, 72.0, 108.0, 108.0])  # 108 J/cm^2 == 300.0 W/m^2
+        _v2("N", [4.0, 8.0, 9.0, 2.0])  # 9=obscured -> NaN
+        _v2("VV", [9.0 if fog_step else 50.0, 80.0, 10.0, np.nan])  # 9=950m, 10=1050m, Eelde NaN->W1
+        _v2("W1", [1.0 if fog_step else 0.0, 0.0, 0.0, 1.0 if fog_step else 0.0])
+    return path
+
+
+def test_knmi_hourly_validated_loader_tcc_and_auto_source(tmp_path: Path) -> None:
+    assert _normalize_knmi_station_id("0-20000-0-06260") == "06260"
+    assert _normalize_knmi_station_id("06260") == "06260"
+    assert _knmi_vv_code_to_meters(9.0) == pytest.approx(950.0)
+    assert _knmi_vv_code_to_meters(10.0) == pytest.approx(1050.0)
+    assert _knmi_vv_code_to_meters(50.0) == pytest.approx(5500.0)
+    assert _knmi_vv_code_to_meters(83.0) == pytest.approx(47500.0)
+    assert np.isnan(_knmi_vv_code_to_meters(52.0))
+
+    spec = get_domain_spec("lam_bnl_ns_de_2p5km", nz=16)
+    t0 = datetime.datetime(2024, 1, 15, 12, 0, tzinfo=datetime.timezone.utc)
+    t1 = datetime.datetime(2024, 1, 15, 13, 0, tzinfo=datetime.timezone.utc)
+
+    cache_dir = tmp_path / "knmi_cache"
+    nc0 = _write_synthetic_knmi_hourly_validated_nc(
+        cache_dir / f"hourly-observations-validated-{t0:%Y%m%d-%H}.nc", t0, fog_step=False
+    )
+    nc1 = _write_synthetic_knmi_hourly_validated_nc(
+        cache_dir / f"hourly-observations-validated-{t1:%Y%m%d-%H}.nc", t1, fog_step=True
+    )
+
+    stns = {r["station_id"]: r for r in load_knmi_stations(nc1)}
+    assert set(stns.keys()) == {"06260", "06203", "06290", "06280"}
+    assert stns["06203"]["is_offshore"] is True
+    assert stns["06203"]["ws10_ms"] == pytest.approx(9.0)  # FF=NaN fell back to FH=9.0
+    assert np.isnan(stns["06203"]["wd10_deg"])  # DD=990 variable rejected
+    assert np.isnan(stns["06290"]["wd10_deg"])  # DD=0 calm rejected
+    assert stns["06260"]["sw_down_wm2"] == pytest.approx(300.0)
+    assert stns["06260"]["tcc"] == pytest.approx(0.5)
+    assert np.isnan(stns["06290"]["tcc"])  # N=9 obscured rejected
+    assert stns["06260"]["vis_m"] == pytest.approx(950.0)
+    assert stns["06290"]["vis_m"] == pytest.approx(1050.0)
+    assert stns["06280"]["vis_m"] == pytest.approx(500.0)  # VV=NaN fell back to W1=1
+    assert stns["06260"]["precip_1h_mm"] == pytest.approx(1.4)
+
+    run_dir = tmp_path / "run_hv"
+    _write_synthetic_wx1(run_dir / "d3" / f"forecast_{spec.name}_T+000h.wx1", spec, t0, 0.0, t2m_c=2.0, mslp_hpa=1016.0, tcc_frac=0.5)
+    _write_synthetic_wx1(run_dir / "d3" / f"forecast_{spec.name}_T+001h.wx1", spec, t1, 1.0, t2m_c=2.0, mslp_hpa=1016.0, tcc_frac=0.5)
+
+    res = verify_run_against_knmi(
+        run_dir,
+        outdir=tmp_path / "out_hv",
+        knmi_cache_dir=cache_dir,
+        obs_source="auto",
+        independent_after_hour=1.0,
+        make_maps=False,
+    )
+    assert res["verified_hours"] == 2
+    assert res["obs_sources_used"] == ["hourly-validated"]
+    # T+1h: model tcc=0.5 vs obs [De Bilt 0.5, Twenthe NaN, Eelde 0.25] -> n=2, mean mod-obs = +0.125
+    assert res["hourly"][1]["land"]["tcc"]["n"] == 2
+    assert res["hourly"][1]["land"]["tcc"]["bias"] == pytest.approx(0.125, abs=1e-4)
+    # T+1h fog (<1000m): mod_vis=600m at all 3 land stations; obs fog at De Bilt (950m) & Eelde (500m via W1) -> H=2, FA=1
+    assert res["hourly"][1]["land"]["fog"]["hits"] == 2
+    assert res["hourly"][1]["land"]["fog"]["false_alarms"] == 1
+    assert res["hourly"][1]["land"]["precip"]["obs_mean"] == pytest.approx((1.4 + 0.2 + 0.4) / 3.0, abs=1e-4)
+    csv_txt = Path(res["artifacts"]["hourly_csv"]).read_text(encoding="utf-8")
+    assert "land_tcc_bias" in csv_txt and "land_tcc_rmse" in csv_txt
+

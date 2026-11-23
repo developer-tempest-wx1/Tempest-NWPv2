@@ -248,3 +248,80 @@ def test_download_era5_land_soil_cds_requires_valid_client(tmp_path: Path, monke
             spec,
             tmp_path / "cds_cache",
         )
+
+
+def test_prepare_era5_lbc_series_streaming_and_cached_skip(tmp_path: Path) -> None:
+    spec = _small_bnl_spec()
+    hs_m = np.zeros((spec.ny, spec.nx), dtype=np.float64)
+    t0 = datetime.datetime(2024, 1, 15, 0, 0, tzinfo=datetime.timezone.utc)
+    t1 = datetime.datetime(2024, 1, 15, 1, 0, tzinfo=datetime.timezone.utc)
+    t2 = datetime.datetime(2024, 1, 15, 2, 0, tzinfo=datetime.timezone.utc)
+    ds_syn = _build_synthetic_arco_era5_ds([t0, t1, t2])
+
+    lbc_dir = tmp_path / "lbc_stream"
+    cache_dir = tmp_path / "era5_cache_stream"
+    prep = prepare_era5_lbc_series(
+        spec,
+        hs_m,
+        t0,
+        forecast_hours=2.0,
+        lbc_dir=lbc_dir,
+        lbc_interval_hours=1.0,
+        era5_cache_dir=cache_dir,
+        rim_width=4,
+        era5_ds=ds_syn,
+        stream_lbc=True,
+    )
+    assert prep["streamed_lbc"] is True
+    assert len(prep["lbc_paths"]) == 3
+    assert len(prep["era5_wx1_paths"]) == 1  # only IC written to era5_cache
+    assert list(cache_dir.glob("*.wx1")) == [prep["ic_wx1"]]
+
+    interp = LBCInterpolator(lbc_dir, spec.name)
+    lbc_mid = interp.get_lbc_at_time(3600.0)
+    assert np.all(np.isfinite(lbc_mid["theta_p"]))
+
+    # Re-running with era5_ds=None reuses cached IC + cached LBC WX-1s with zero remote access
+    prep_cached = prepare_era5_lbc_series(
+        spec,
+        hs_m,
+        t0,
+        forecast_hours=2.0,
+        lbc_dir=lbc_dir,
+        lbc_interval_hours=1.0,
+        era5_cache_dir=cache_dir,
+        rim_width=4,
+        era5_ds=None,
+        stream_lbc=True,
+    )
+    assert prep_cached["lbc_paths"] == prep["lbc_paths"]
+
+
+def test_select_era5_cases_ranking(tmp_path: Path) -> None:
+    import gzip
+    import sys
+
+    scripts_dir = str(Path(__file__).resolve().parents[1] / "scripts")
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    from select_era5_cases import rank_knmi_cases
+
+    csv_gz = tmp_path / "knmi_uur_2025.csv.gz"
+    rows = ["STN,YYYYMMDD,HH,FH,FX,T,RH,S,O,M"]
+    for hh in range(1, 25):
+        # 20250110: widespread radiation fog (M=1), light wind (FH=20 -> 2.0 m/s), dry
+        rows.append(f"260,20250110,{hh},20.0,30.0,15.0,0.0,0.0,0.0,1.0")
+        # 20250215: winter storm (FX=320 -> 32.0 m/s, FH=180 -> 18.0 m/s), wet
+        rows.append(f"260,20250215,{hh},180.0,320.0,80.0,12.0,0.0,1.0,0.0")
+        # 20250620: clear spring/summer high diurnal range (8 C .. 26 C = 18 C), completely dry
+        t_val = 80.0 + (180.0 if 10 <= hh <= 16 else 0.0)
+        rows.append(f"260,20250620,{hh},40.0,70.0,{t_val:.1f},0.0,0.0,0.0,0.0")
+    with gzip.open(csv_gz, "wt", encoding="utf-8") as fh:
+        fh.write("\n".join(rows) + "\n")
+
+    ranked = rank_knmi_cases(tmp_path, regime="all", top=2, max_date="2026-11-12")
+    assert ranked["radiation_fog"][0]["date"] == "2025-01-10"
+    assert ranked["storm"][0]["date"] == "2025-02-15"
+    assert ranked["clear_diurnal"][0]["date"] == "2025-06-20"
+    assert ranked["rain"][0]["date"] == "2025-02-15"
+

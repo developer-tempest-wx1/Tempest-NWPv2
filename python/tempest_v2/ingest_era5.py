@@ -44,6 +44,11 @@ _ARCO_3D_VAR_MAP: Tuple[Tuple[str, str, str], ...] = (
     ("v_component_of_wind", "v", "m s**-1"),
 )
 
+_ARCO_2D_LBC_MAP: Tuple[Tuple[str, str, str], ...] = (
+    ("mean_sea_level_pressure", "msl", "Pa"),
+    ("2m_temperature", "t2m", "K"),
+)
+
 _ARCO_2D_BASE_MAP: Tuple[Tuple[str, str, str], ...] = (
     ("mean_sea_level_pressure", "msl", "Pa"),
     ("surface_pressure", "sp", "Pa"),
@@ -160,14 +165,18 @@ def _slice_era5_bbox(
     *,
     pad_deg: float = 2.5,
     include_soil: bool = True,
+    lbc_only: bool = False,
 ) -> xr.Dataset:
     """Extract a validated, compact regional ERA5 `xr.Dataset` at `valid_dt` with short standard names."""
     v_dt = _to_utc(valid_dt)
     t_target = np.datetime64(v_dt.replace(tzinfo=None), "s")
 
-    var_pairs: List[Tuple[str, str, str]] = list(_ARCO_3D_VAR_MAP) + list(_ARCO_2D_BASE_MAP)
-    if include_soil:
-        var_pairs.extend(_ARCO_2D_SOIL_MAP)
+    if lbc_only:
+        var_pairs: List[Tuple[str, str, str]] = list(_ARCO_3D_VAR_MAP) + list(_ARCO_2D_LBC_MAP)
+    else:
+        var_pairs = list(_ARCO_3D_VAR_MAP) + list(_ARCO_2D_BASE_MAP)
+        if include_soil:
+            var_pairs.extend(_ARCO_2D_SOIL_MAP)
 
     # Support datasets already keyed by short names (e.g. unit fixtures) or ARCO long names
     need_vars: List[Tuple[str, str, str]] = []
@@ -394,6 +403,89 @@ def download_era5_land_soil_cds(
     return out_path
 
 
+def _era5_dataset_to_thermo_grid(
+    ds: xr.Dataset,
+    spec: DomainSpec,
+    hs_m: np.ndarray,
+    *,
+    theta_sfc_ref: float = 288.15,
+    p_sfc_ref: float = 101_325.0,
+    n_ref_hz: float = 0.01,
+) -> Tuple[Dict[str, np.ndarray], Dict[str, Any], datetime.datetime]:
+    """Decode an ERA5 `xr.Dataset` snapshot onto target `spec` 3D C-grid state plus regridded surface dict."""
+    raw_v = str(ds.attrs.get("valid_time_utc", "")).strip()
+    valid_dt = (
+        _to_utc(datetime.datetime.fromisoformat(raw_v.replace("Z", "+00:00")))
+        if raw_v
+        else datetime.datetime.now(datetime.timezone.utc).replace(minute=0, second=0, microsecond=0)
+    )
+    p_levels_pa = np.asarray(ds["level"].values, dtype=np.float64) * 100.0
+    lats = np.asarray(ds["latitude"].values, dtype=np.float64)
+    lons = np.asarray(ds["longitude"].values, dtype=np.float64)
+
+    def _arr3(name: str) -> np.ndarray:
+        arr = np.asarray(ds[name].values, dtype=np.float64)
+        while arr.ndim > 3:
+            arr = arr[0]
+        return arr
+
+    t_h = _regrid_latlon_field(_arr3("t"), lats, lons, spec, fill_nan_value=260.0)
+    u_geo_h = _regrid_latlon_field(_arr3("u"), lats, lons, spec, fill_nan_value=0.0)
+    v_geo_h = _regrid_latlon_field(_arr3("v"), lats, lons, spec, fill_nan_value=0.0)
+    q_h = np.clip(_regrid_latlon_field(_arr3("q"), lats, lons, spec, fill_nan_value=1e-4), 1e-7, 0.04)
+    z_h = _regrid_latlon_field(_arr3("z") / GRAVITY_M_S2, lats, lons, spec, fill_nan_value=0.0)
+
+    def _arr2(name: str) -> Optional[np.ndarray]:
+        if name not in ds:
+            return None
+        arr = np.asarray(ds[name].values, dtype=np.float64)
+        while arr.ndim > 2:
+            arr = arr[0]
+        return arr
+
+    t2m_raw = _arr2("t2m")
+    msl_raw = _arr2("msl")
+    sp_raw = _arr2("sp")
+    t2m_h = _regrid_latlon_field(t2m_raw, lats, lons, spec, fill_nan_value=285.0) if t2m_raw is not None else np.full((spec.ny, spec.nx), 285.0, dtype=np.float64)
+    msl_h = (
+        _regrid_latlon_field(msl_raw, lats, lons, spec, fill_nan_value=101_325.0)
+        if msl_raw is not None
+        else _regrid_latlon_field(sp_raw, lats, lons, spec, fill_nan_value=101_325.0)
+    )
+
+    hs = np.asarray(hs_m, dtype=np.float64)
+    ps_child = msl_h * np.exp(-(GRAVITY_M_S2 * hs) / (R_D * np.maximum(t2m_h, 200.0)))
+
+    state_3d = _vertical_map_isobaric_to_klemp(
+        spec,
+        hs,
+        p_levels_pa,
+        z_h,
+        t_h,
+        u_geo_h,
+        v_geo_h,
+        q_h,
+        ps_child,
+        theta_sfc_ref=theta_sfc_ref,
+        p_sfc_ref=p_sfc_ref,
+        n_ref_hz=n_ref_hz,
+    )
+
+    sfc_raw_bundle: Dict[str, Any] = {
+        "lats": lats,
+        "lons": lons,
+        "t2m_h": t2m_h,
+        "msl_h": msl_h,
+        "ps_child": ps_child,
+    }
+    for k in ("d2m", "u10", "v10", "skt", "sst", "siconc", "sd", "lsm", "stl1", "stl2", "stl3", "stl4", "swvl1", "swvl2", "swvl3", "swvl4"):
+        v2 = _arr2(k)
+        if v2 is not None:
+            sfc_raw_bundle[k] = v2
+
+    return state_3d, sfc_raw_bundle, valid_dt
+
+
 def _era5_wx1_to_thermo_grid(
     era5_wx1_path: Path | str,
     spec: DomainSpec,
@@ -405,77 +497,14 @@ def _era5_wx1_to_thermo_grid(
 ) -> Tuple[Dict[str, np.ndarray], Dict[str, Any], datetime.datetime]:
     """Decode ERA5 `.wx1` snapshot onto target `spec` 3D C-grid state plus regridded surface dict."""
     with wx1.open_dataset(Path(era5_wx1_path)) as ds:
-        raw_v = str(ds.attrs.get("valid_time_utc", "")).strip()
-        valid_dt = (
-            _to_utc(datetime.datetime.fromisoformat(raw_v.replace("Z", "+00:00")))
-            if raw_v
-            else datetime.datetime.now(datetime.timezone.utc).replace(minute=0, second=0, microsecond=0)
-        )
-        p_levels_pa = np.asarray(ds["level"].values, dtype=np.float64) * 100.0
-        lats = np.asarray(ds["latitude"].values, dtype=np.float64)
-        lons = np.asarray(ds["longitude"].values, dtype=np.float64)
-
-        def _arr3(name: str) -> np.ndarray:
-            arr = np.asarray(ds[name].values, dtype=np.float64)
-            while arr.ndim > 3:
-                arr = arr[0]
-            return arr
-
-        t_h = _regrid_latlon_field(_arr3("t"), lats, lons, spec, fill_nan_value=260.0)
-        u_geo_h = _regrid_latlon_field(_arr3("u"), lats, lons, spec, fill_nan_value=0.0)
-        v_geo_h = _regrid_latlon_field(_arr3("v"), lats, lons, spec, fill_nan_value=0.0)
-        q_h = np.clip(_regrid_latlon_field(_arr3("q"), lats, lons, spec, fill_nan_value=1e-4), 1e-7, 0.04)
-        z_h = _regrid_latlon_field(_arr3("z") / GRAVITY_M_S2, lats, lons, spec, fill_nan_value=0.0)
-
-        def _arr2(name: str) -> Optional[np.ndarray]:
-            if name not in ds:
-                return None
-            arr = np.asarray(ds[name].values, dtype=np.float64)
-            while arr.ndim > 2:
-                arr = arr[0]
-            return arr
-
-        t2m_raw = _arr2("t2m")
-        msl_raw = _arr2("msl")
-        sp_raw = _arr2("sp")
-        t2m_h = _regrid_latlon_field(t2m_raw, lats, lons, spec, fill_nan_value=285.0) if t2m_raw is not None else np.full((spec.ny, spec.nx), 285.0, dtype=np.float64)
-        msl_h = (
-            _regrid_latlon_field(msl_raw, lats, lons, spec, fill_nan_value=101_325.0)
-            if msl_raw is not None
-            else _regrid_latlon_field(sp_raw, lats, lons, spec, fill_nan_value=101_325.0)
-        )
-
-        hs = np.asarray(hs_m, dtype=np.float64)
-        ps_child = msl_h * np.exp(-(GRAVITY_M_S2 * hs) / (R_D * np.maximum(t2m_h, 200.0)))
-
-        state_3d = _vertical_map_isobaric_to_klemp(
+        return _era5_dataset_to_thermo_grid(
+            ds,
             spec,
-            hs,
-            p_levels_pa,
-            z_h,
-            t_h,
-            u_geo_h,
-            v_geo_h,
-            q_h,
-            ps_child,
+            hs_m,
             theta_sfc_ref=theta_sfc_ref,
             p_sfc_ref=p_sfc_ref,
             n_ref_hz=n_ref_hz,
         )
-
-        sfc_raw_bundle: Dict[str, Any] = {
-            "lats": lats,
-            "lons": lons,
-            "t2m_h": t2m_h,
-            "msl_h": msl_h,
-            "ps_child": ps_child,
-        }
-        for k in ("d2m", "u10", "v10", "skt", "sst", "siconc", "sd", "lsm", "stl1", "stl2", "stl3", "stl4", "swvl1", "swvl2", "swvl3", "swvl4"):
-            v2 = _arr2(k)
-            if v2 is not None:
-                sfc_raw_bundle[k] = v2
-
-    return state_3d, sfc_raw_bundle, valid_dt
 
 
 def _load_era5_land_soil_maps(path: Path | str) -> Tuple[Dict[str, np.ndarray], np.ndarray, np.ndarray]:
@@ -634,34 +663,21 @@ def era5_wx1_to_domain_state(
     return state_3d, surf, valid_dt
 
 
-def era5_wx1_to_lbc_wx1(
-    era5_wx1_path: Path | str,
+def _write_lbc_wx1_from_state(
+    state_3d: Dict[str, np.ndarray],
+    ps_child: np.ndarray,
     child_spec: DomainSpec,
-    child_hs_m: np.ndarray,
     output_dir: Path | str,
     step_index: int,
     sim_time_sec: float,
     valid_time_utc: datetime.datetime,
     *,
     rim_width: int = 16,
-    theta_sfc_ref: float = 288.15,
-    p_sfc_ref: float = 101_325.0,
-    n_ref_hz: float = 0.01,
 ) -> Path:
-    """Convert one ARCO-ERA5 WX-1 regional snapshot into a rim-packed Tempest WX-1 LBC file."""
     out_dir = Path(output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     out_path = out_dir / f"lbc_{child_spec.name}_step_{int(step_index):04d}.wx1"
-
-    state_3d, sb, _ = _era5_wx1_to_thermo_grid(
-        era5_wx1_path,
-        child_spec,
-        child_hs_m,
-        theta_sfc_ref=theta_sfc_ref,
-        p_sfc_ref=p_sfc_ref,
-        n_ref_hz=n_ref_hz,
-    )
-    data_vars, extra_coords, rim_info = _extract_rim_packed_lbc(child_spec, state_3d, sb["ps_child"], rim_width)
+    data_vars, extra_coords, rim_info = _extract_rim_packed_lbc(child_spec, state_3d, ps_child, rim_width)
 
     v_dt = _to_utc(valid_time_utc)
     t_coord = np.array([np.datetime64(int(v_dt.timestamp()), "s")], dtype="datetime64[s]")
@@ -712,6 +728,76 @@ def era5_wx1_to_lbc_wx1(
     return out_path
 
 
+def era5_dataset_to_lbc_wx1(
+    era5_ds_reg: xr.Dataset,
+    child_spec: DomainSpec,
+    child_hs_m: np.ndarray,
+    output_dir: Path | str,
+    step_index: int,
+    sim_time_sec: float,
+    valid_time_utc: datetime.datetime,
+    *,
+    rim_width: int = 16,
+    theta_sfc_ref: float = 288.15,
+    p_sfc_ref: float = 101_325.0,
+    n_ref_hz: float = 0.01,
+) -> Path:
+    """Convert an in-memory sliced ERA5 `xr.Dataset` directly into a rim-packed WX-1 LBC file."""
+    state_3d, sb, _ = _era5_dataset_to_thermo_grid(
+        era5_ds_reg,
+        child_spec,
+        child_hs_m,
+        theta_sfc_ref=theta_sfc_ref,
+        p_sfc_ref=p_sfc_ref,
+        n_ref_hz=n_ref_hz,
+    )
+    return _write_lbc_wx1_from_state(
+        state_3d,
+        sb["ps_child"],
+        child_spec,
+        output_dir,
+        step_index,
+        sim_time_sec,
+        valid_time_utc,
+        rim_width=rim_width,
+    )
+
+
+def era5_wx1_to_lbc_wx1(
+    era5_wx1_path: Path | str,
+    child_spec: DomainSpec,
+    child_hs_m: np.ndarray,
+    output_dir: Path | str,
+    step_index: int,
+    sim_time_sec: float,
+    valid_time_utc: datetime.datetime,
+    *,
+    rim_width: int = 16,
+    theta_sfc_ref: float = 288.15,
+    p_sfc_ref: float = 101_325.0,
+    n_ref_hz: float = 0.01,
+) -> Path:
+    """Convert one ARCO-ERA5 WX-1 regional snapshot into a rim-packed Tempest WX-1 LBC file."""
+    state_3d, sb, _ = _era5_wx1_to_thermo_grid(
+        era5_wx1_path,
+        child_spec,
+        child_hs_m,
+        theta_sfc_ref=theta_sfc_ref,
+        p_sfc_ref=p_sfc_ref,
+        n_ref_hz=n_ref_hz,
+    )
+    return _write_lbc_wx1_from_state(
+        state_3d,
+        sb["ps_child"],
+        child_spec,
+        output_dir,
+        step_index,
+        sim_time_sec,
+        valid_time_utc,
+        rim_width=rim_width,
+    )
+
+
 def prepare_era5_lbc_series(
     child_spec: DomainSpec,
     child_hs_m: np.ndarray,
@@ -724,8 +810,9 @@ def prepare_era5_lbc_series(
     zarr_url: str = ARCO_ERA5_ZARR_URL,
     rim_width: int = 16,
     era5_ds: Optional[xr.Dataset] = None,
+    stream_lbc: bool = False,
 ) -> Dict[str, Any]:
-    """Fetch/cache ARCO-ERA5 regional snapshots across `[init_utc, +forecast_hours]` and build LBC WX-1s."""
+    """Fetch/cache ARCO-ERA5 IC + LBC WX-1 series (optionally streaming LBCs without intermediate WX-1s)."""
     init_dt = _to_utc(init_utc)
     if float(lbc_interval_hours) <= 0.0:
         raise ValueError(f"lbc_interval_hours must be positive, got {lbc_interval_hours}")
@@ -752,35 +839,86 @@ def prepare_era5_lbc_series(
     for idx, lead_h in enumerate(step_hrs):
         v_dt = init_dt + datetime.timedelta(hours=float(lead_h))
         sim_sec = float(lead_h) * 3600.0
-        include_soil = idx == 0
         era5_p = eff_cache / f"era5_0p25_{v_dt:%Y%m%d_%H}Z.wx1"
         lbc_p = out_lbc_dir / f"lbc_{child_spec.name}_step_{idx:04d}.wx1"
+        lbc_ready = _cached_lbc_wx1_matches(lbc_p, child_spec, v_dt, sim_sec)
 
-        if not _era5_wx1_cache_valid(era5_p, child_spec, v_dt, require_soil=include_soil):
-            if opened_ds is None:
-                opened_ds = open_arco_era5_dataset(zarr_url=zarr_url)
-            era5_p = fetch_era5_snapshot_wx1(
-                v_dt,
-                child_spec,
-                eff_cache,
-                zarr_url=zarr_url,
-                include_soil=include_soil,
-                era5_ds=opened_ds,
-            )
+        if idx == 0:
+            if not _era5_wx1_cache_valid(era5_p, child_spec, v_dt, require_soil=True):
+                if opened_ds is None:
+                    opened_ds = open_arco_era5_dataset(zarr_url=zarr_url)
+                era5_p = fetch_era5_snapshot_wx1(
+                    v_dt,
+                    child_spec,
+                    eff_cache,
+                    zarr_url=zarr_url,
+                    include_soil=True,
+                    era5_ds=opened_ds,
+                )
+            era5_paths.append(era5_p)
+            if not lbc_ready:
+                lbc_p = era5_wx1_to_lbc_wx1(
+                    era5_p,
+                    child_spec,
+                    child_hs_m,
+                    out_lbc_dir,
+                    idx,
+                    sim_sec,
+                    v_dt,
+                    rim_width=rim_width,
+                )
+        elif not lbc_ready:
+            if _era5_wx1_cache_valid(era5_p, child_spec, v_dt, require_soil=False):
+                era5_paths.append(era5_p)
+                lbc_p = era5_wx1_to_lbc_wx1(
+                    era5_p,
+                    child_spec,
+                    child_hs_m,
+                    out_lbc_dir,
+                    idx,
+                    sim_sec,
+                    v_dt,
+                    rim_width=rim_width,
+                )
+            elif stream_lbc:
+                if opened_ds is None:
+                    opened_ds = open_arco_era5_dataset(zarr_url=zarr_url)
+                ds_reg = _slice_era5_bbox(opened_ds, child_spec, v_dt, include_soil=False, lbc_only=True)
+                lbc_p = era5_dataset_to_lbc_wx1(
+                    ds_reg,
+                    child_spec,
+                    child_hs_m,
+                    out_lbc_dir,
+                    idx,
+                    sim_sec,
+                    v_dt,
+                    rim_width=rim_width,
+                )
+            else:
+                if opened_ds is None:
+                    opened_ds = open_arco_era5_dataset(zarr_url=zarr_url)
+                era5_p = fetch_era5_snapshot_wx1(
+                    v_dt,
+                    child_spec,
+                    eff_cache,
+                    zarr_url=zarr_url,
+                    include_soil=False,
+                    era5_ds=opened_ds,
+                )
+                era5_paths.append(era5_p)
+                lbc_p = era5_wx1_to_lbc_wx1(
+                    era5_p,
+                    child_spec,
+                    child_hs_m,
+                    out_lbc_dir,
+                    idx,
+                    sim_sec,
+                    v_dt,
+                    rim_width=rim_width,
+                )
+        elif not stream_lbc and _era5_wx1_cache_valid(era5_p, child_spec, v_dt, require_soil=False):
+            era5_paths.append(era5_p)
 
-        if not _cached_lbc_wx1_matches(lbc_p, child_spec, v_dt, sim_sec):
-            lbc_p = era5_wx1_to_lbc_wx1(
-                era5_p,
-                child_spec,
-                child_hs_m,
-                out_lbc_dir,
-                idx,
-                sim_sec,
-                v_dt,
-                rim_width=rim_width,
-            )
-
-        era5_paths.append(era5_p)
         lbc_paths.append(lbc_p)
         valid_times_utc.append(v_dt.isoformat())
 
@@ -790,4 +928,5 @@ def prepare_era5_lbc_series(
         "era5_wx1_paths": era5_paths,
         "valid_times_utc": valid_times_utc,
         "lbc_interval_hours": float(lbc_interval_hours),
+        "streamed_lbc": bool(stream_lbc),
     }

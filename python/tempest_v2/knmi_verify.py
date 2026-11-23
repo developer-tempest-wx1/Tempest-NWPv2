@@ -46,6 +46,9 @@ logger = logging.getLogger("tempest_v2.knmi_verify")
 _LEAD_RE = re.compile(r"_T\+([0-9]+(?:\.[0-9]+)?)h\.wx1$")
 _IFS_SFC_RE = re.compile(r"(\d{8})_(\d{2})Z_sfc_step(\d+)")
 
+HOURLY_VALIDATED_DATASET = "hourly-in-situ-meteorological-observations-validated"
+HOURLY_VALIDATED_VERSION = "1.0"
+
 # WMO IDs of Dutch North Sea platforms / buoys that do not represent inland land stations
 _OFFSHORE_STATION_IDS = frozenset(
     {
@@ -77,6 +80,7 @@ _OFFSHORE_KEYWORDS = (
     "f16",
     "j6",
     "p11",
+    "a12",
     "awg",
     "d15",
     "q1",
@@ -95,6 +99,44 @@ def _to_utc(dt: datetime.datetime) -> datetime.datetime:
 def _snap_10min_utc(dt: datetime.datetime) -> datetime.datetime:
     u = _to_utc(dt)
     return u.replace(minute=(u.minute // 10) * 10, second=0, microsecond=0)
+
+
+def _snap_hourly_utc(dt: datetime.datetime, tolerance_s: float = 300.0) -> Optional[datetime.datetime]:
+    u = _to_utc(dt)
+    if u.minute == 0 and u.second == 0 and u.microsecond == 0:
+        return u
+    nearest = (u + datetime.timedelta(minutes=30)).replace(minute=0, second=0, microsecond=0)
+    if abs((u - nearest).total_seconds()) <= float(tolerance_s):
+        return nearest
+    return None
+
+
+def _normalize_knmi_station_id(raw_id: str) -> str:
+    """Normalize WIGOS/WMO station IDs (e.g. `0-20000-0-06260` -> `06260`)."""
+    s = str(raw_id).strip()
+    if s.startswith("0-") and "-" in s:
+        tail = s.rsplit("-", 1)[-1].strip()
+        if len(tail) == 5 and tail.isdigit():
+            return tail
+    return s
+
+
+def _knmi_vv_code_to_meters(code: float) -> float:
+    """Convert KNMI WMO VV visibility code (0..89) to representative visibility [m]."""
+    if not math.isfinite(code) or code < 0.0 or code > 89.0:
+        return float("nan")
+    c = int(round(code))
+    if 0 <= c <= 49:
+        return (c + 0.5) * 100.0
+    if c == 50:
+        return 5500.0
+    if 56 <= c <= 79:
+        return (c - 49.5) * 1000.0
+    if 80 <= c <= 88:
+        return (30.0 + (c - 80) * 5.0 + 2.5) * 1000.0
+    if c == 89:
+        return 75_000.0
+    return float("nan")
 
 
 def _decode_str_array(ds: nc.Dataset, var_name: str, n_stn: int) -> List[str]:
@@ -127,15 +169,15 @@ def _is_offshore_station(stn_id: str, stn_name: str) -> bool:
     return any(kw in low for kw in _OFFSHORE_KEYWORDS)
 
 
-def fetch_knmi_10min_netcdf(
-    valid_time_utc: datetime.datetime,
+def _download_knmi_dataset_file(
+    dataset_name: str,
+    dataset_version: str,
+    fname: str,
     cache_dir: Path | str,
     *,
     api_key: Optional[str] = None,
 ) -> Optional[Path]:
-    """Download (or reuse cached) official KNMI 10-minute NetCDF for `valid_time_utc`."""
-    snap = _snap_10min_utc(valid_time_utc)
-    fname = f"KMDS__OPER_P___10M_OBS_L2_{snap:%Y%m%d%H%M}.nc"
+    """Download (or reuse cached) a NetCDF file from KNMI Open Data API."""
     cdir = Path(cache_dir)
     cdir.mkdir(parents=True, exist_ok=True)
     out_p = cdir / fname
@@ -148,7 +190,7 @@ def fetch_knmi_10min_netcdf(
         return None
 
     headers = {"Authorization": key, "User-Agent": "Tempest-NWP/1.0"}
-    meta_url = f"{KNMI_API_BASE}/datasets/{DATASET_NAME}/versions/{DATASET_VERSION}/files/{fname}/url"
+    meta_url = f"{KNMI_API_BASE}/datasets/{dataset_name}/versions/{dataset_version}/files/{fname}/url"
     req = urllib.request.Request(meta_url, headers=headers)
     try:
         with urllib.request.urlopen(req, timeout=15) as resp:
@@ -161,7 +203,7 @@ def fetch_knmi_10min_netcdf(
         return out_p
     except urllib.error.HTTPError as exc:
         if exc.code == 404:
-            logger.debug("KNMI 10-min file not available (404): %s", fname)
+            logger.debug("KNMI %s file not available (404): %s", dataset_name, fname)
             return None
         if exc.code in (401, 403):
             raise PermissionError(f"KNMI API authentication failed (HTTP {exc.code}) for {fname}") from exc
@@ -172,24 +214,171 @@ def fetch_knmi_10min_netcdf(
         return None
 
 
+def fetch_knmi_10min_netcdf(
+    valid_time_utc: datetime.datetime,
+    cache_dir: Path | str,
+    *,
+    api_key: Optional[str] = None,
+) -> Optional[Path]:
+    """Download (or reuse cached) official KNMI 10-minute NetCDF for `valid_time_utc`."""
+    snap = _snap_10min_utc(valid_time_utc)
+    fname = f"KMDS__OPER_P___10M_OBS_L2_{snap:%Y%m%d%H%M}.nc"
+    return _download_knmi_dataset_file(DATASET_NAME, DATASET_VERSION, fname, cache_dir, api_key=api_key)
+
+
+def fetch_knmi_hourly_validated_netcdf(
+    valid_time_utc: datetime.datetime,
+    cache_dir: Path | str,
+    *,
+    api_key: Optional[str] = None,
+) -> Optional[Path]:
+    """Download (or reuse cached) official KNMI hourly-validated NetCDF (1951-present)."""
+    snap = _snap_hourly_utc(valid_time_utc)
+    if snap is None:
+        return None
+    fname = f"hourly-observations-validated-{snap:%Y%m%d-%H}.nc"
+    return _download_knmi_dataset_file(
+        HOURLY_VALIDATED_DATASET, HOURLY_VALIDATED_VERSION, fname, cache_dir, api_key=api_key
+    )
+
+
+def _extract_knmi_station_meta(ds: nc.Dataset, n_stn: int) -> Tuple[List[str], List[str], np.ndarray, np.ndarray, np.ndarray, Optional[datetime.datetime]]:
+    raw_ids = _decode_str_array(ds, "station", n_stn)
+    wsi_ids = _decode_str_array(ds, "wsi", n_stn) if "wsi" in ds.variables else [""] * n_stn
+    ids = [_normalize_knmi_station_id(raw_ids[i] or wsi_ids[i]) for i in range(n_stn)]
+    names = _decode_str_array(ds, "stationname", n_stn)
+    lats = _extract_1d_float(ds, "lat", n_stn)
+    lons = _extract_1d_float(ds, "lon", n_stn)
+    hgts = _extract_1d_float(ds, "height", n_stn)
+    if np.all(np.isnan(hgts)):
+        hgts = _extract_1d_float(ds, "elevation", n_stn)
+
+    obs_dt: Optional[datetime.datetime] = None
+    tvar = ds.variables.get("time")
+    if tvar is not None and len(tvar) > 0:
+        try:
+            t_raw = float(np.ma.filled(np.ma.asarray(tvar[0], dtype=np.float64), np.nan))
+            if np.isfinite(t_raw):
+                obs_dt = datetime.datetime(1950, 1, 1, tzinfo=datetime.timezone.utc) + datetime.timedelta(
+                    seconds=t_raw
+                )
+        except Exception:
+            pass
+    return ids, names, lats, lons, hgts, obs_dt
+
+
+def _build_knmi_station_row(
+    *,
+    sid: str,
+    raw_name: str,
+    lat: float,
+    lon: float,
+    elev: float,
+    obs_dt: Optional[datetime.datetime],
+    t_raw: float,
+    td_raw: float,
+    rh_raw: float,
+    p_raw: float,
+    ws_raw: float,
+    wd_raw: float,
+    gust_raw: float,
+    vis_v: float,
+    precip_mmh: float,
+    precip_1h_mm: float,
+    sw_down_wm2: float,
+    tcc: float,
+    obs_source: str,
+    obs_fog_w1: Optional[int] = None,
+    reject_calm_dir: bool = False,
+) -> Optional[Dict[str, Any]]:
+    sname = raw_name or (KNMI_STATIONS[sid][3] if sid in KNMI_STATIONS else sid)
+    if not (math.isfinite(lat) and math.isfinite(lon) and -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
+        if sid in KNMI_STATIONS:
+            lat, lon, fb_elev, fb_name = KNMI_STATIONS[sid]
+            sname = sname or fb_name
+            if not math.isfinite(elev):
+                elev = fb_elev
+        else:
+            return None
+    if not math.isfinite(elev):
+        elev = float(KNMI_STATIONS[sid][2]) if sid in KNMI_STATIONS else 0.0
+
+    t2m_c = float(t_raw)
+    if math.isfinite(t2m_c) and t2m_c > 150.0:
+        t2m_c -= 273.15
+    if not (-55.0 <= t2m_c <= 55.0):
+        t2m_c = float("nan")
+
+    td2m_c = float(td_raw)
+    if math.isfinite(td2m_c) and td2m_c > 150.0:
+        td2m_c -= 273.15
+    if not (-65.0 <= td2m_c <= 45.0):
+        td2m_c = float("nan")
+
+    rh_pct = float(rh_raw) if (math.isfinite(rh_raw) and 0.0 <= rh_raw <= 105.0) else float("nan")
+
+    mslp_hpa = float(p_raw)
+    if math.isfinite(mslp_hpa) and mslp_hpa > 2000.0:
+        mslp_hpa *= 0.01
+    if not (870.0 <= mslp_hpa <= 1075.0):
+        mslp_hpa = float("nan")
+
+    ws = float(ws_raw)
+    wd = float(wd_raw)
+    wd_valid = math.isfinite(wd) and ((0.0 < wd <= 360.0) if reject_calm_dir else (0.0 <= wd <= 360.0))
+    if not wd_valid:
+        wd = float("nan")
+
+    u10, v10 = float("nan"), float("nan")
+    if math.isfinite(ws) and 0.0 <= ws <= 75.0:
+        if math.isfinite(wd):
+            rad = math.radians(wd)
+            u10 = -ws * math.sin(rad)
+            v10 = -ws * math.cos(rad)
+    else:
+        ws = float("nan")
+
+    gust = float(gust_raw) if (math.isfinite(gust_raw) and 0.0 <= gust_raw <= 100.0) else float("nan")
+    if all(math.isnan(x) for x in (t2m_c, mslp_hpa, ws, rh_pct, vis_v, precip_mmh, sw_down_wm2, tcc)):
+        return None
+
+    return {
+        "station_id": sid,
+        "station_name": sname,
+        "lat": lat,
+        "lon": lon,
+        "elev_m": elev,
+        "is_offshore": _is_offshore_station(sid, sname),
+        "obs_time_utc": obs_dt.isoformat() if obs_dt is not None else "",
+        "obs_source": obs_source,
+        "t2m_c": t2m_c,
+        "td2m_c": td2m_c,
+        "rh_pct": rh_pct,
+        "mslp_hpa": mslp_hpa,
+        "ws10_ms": ws,
+        "wd10_deg": wd,
+        "u10_ms": u10,
+        "v10_ms": v10,
+        "gust10_ms": gust,
+        "vis_m": vis_v,
+        "obs_fog_w1": obs_fog_w1,
+        "precip_mmh": precip_mmh,
+        "precip_1h_mm": precip_1h_mm,
+        "sw_down_wm2": sw_down_wm2,
+        "tcc": tcc,
+    }
+
+
 def load_knmi_10min_stations(nc_path: Path | str) -> List[Dict[str, Any]]:
     """Parse KNMI 10-minute station NetCDF into clean SI/meteorological station dicts."""
-    p = Path(nc_path)
     rows: List[Dict[str, Any]] = []
-    with nc.Dataset(p) as ds:
+    with nc.Dataset(Path(nc_path)) as ds:
         stn_var = ds.variables.get("station")
         n_stn = len(stn_var) if stn_var is not None else 0
         if n_stn == 0:
             return rows
 
-        ids = _decode_str_array(ds, "station", n_stn)
-        names = _decode_str_array(ds, "stationname", n_stn)
-        lats = _extract_1d_float(ds, "lat", n_stn)
-        lons = _extract_1d_float(ds, "lon", n_stn)
-        hgts = _extract_1d_float(ds, "height", n_stn)
-        if np.all(np.isnan(hgts)):
-            hgts = _extract_1d_float(ds, "elevation", n_stn)
-
+        ids, names, lats, lons, hgts, obs_dt = _extract_knmi_station_meta(ds, n_stn)
         ta = _extract_1d_float(ds, "ta", n_stn)
         td = _extract_1d_float(ds, "td", n_stn)
         rh = _extract_1d_float(ds, "rh", n_stn)
@@ -202,104 +391,127 @@ def load_knmi_10min_stations(nc_path: Path | str) -> List[Dict[str, Any]]:
         rg = _extract_1d_float(ds, "rg", n_stn)
         qg = _extract_1d_float(ds, "qg", n_stn)
 
-        obs_dt: Optional[datetime.datetime] = None
-        tvar = ds.variables.get("time")
-        if tvar is not None and len(tvar) > 0:
-            try:
-                t_raw = float(np.ma.filled(np.ma.asarray(tvar[0], dtype=np.float64), np.nan))
-                if np.isfinite(t_raw):
-                    obs_dt = datetime.datetime(1950, 1, 1, tzinfo=datetime.timezone.utc) + datetime.timedelta(
-                        seconds=t_raw
-                    )
-            except Exception:
-                pass
+        for i in range(n_stn):
+            zm_i, vv_i = float(zm[i]), float(vv[i])
+            vis_v = zm_i if (math.isfinite(zm_i) and 0.0 <= zm_i <= 100_000.0) else float("nan")
+            if not math.isfinite(vis_v) and math.isfinite(vv_i) and 0.0 <= vv_i <= 100_000.0:
+                vis_v = vv_i
+            rg_i = float(rg[i])
+            rg_mmh = rg_i if (math.isfinite(rg_i) and 0.0 <= rg_i <= 300.0) else float("nan")
+            qg_i = float(qg[i])
+            qg_wm2 = qg_i if (math.isfinite(qg_i) and 0.0 <= qg_i <= 1400.0) else float("nan")
+
+            row = _build_knmi_station_row(
+                sid=ids[i],
+                raw_name=names[i],
+                lat=float(lats[i]),
+                lon=float(lons[i]),
+                elev=float(hgts[i]),
+                obs_dt=obs_dt,
+                t_raw=float(ta[i]),
+                td_raw=float(td[i]),
+                rh_raw=float(rh[i]),
+                p_raw=float(pp[i]),
+                ws_raw=float(ff[i]),
+                wd_raw=float(dd[i]),
+                gust_raw=float(fx[i]),
+                vis_v=vis_v,
+                precip_mmh=rg_mmh,
+                precip_1h_mm=float("nan"),
+                sw_down_wm2=qg_wm2,
+                tcc=float("nan"),
+                obs_source="10min",
+                obs_fog_w1=None,
+                reject_calm_dir=False,
+            )
+            if row is not None:
+                rows.append(row)
+    return rows
+
+
+def load_knmi_hourly_validated_stations(nc_path: Path | str) -> List[Dict[str, Any]]:
+    """Parse KNMI hourly validated NetCDF (`hourly-in-situ-meteorological-observations-validated` v1.0)."""
+    rows: List[Dict[str, Any]] = []
+    with nc.Dataset(Path(nc_path)) as ds:
+        stn_var = ds.variables.get("station")
+        n_stn = len(stn_var) if stn_var is not None else 0
+        if n_stn == 0:
+            return rows
+
+        ids, names, lats, lons, hgts, obs_dt = _extract_knmi_station_meta(ds, n_stn)
+        t_arr = _extract_1d_float(ds, "T", n_stn)
+        td_arr = _extract_1d_float(ds, "TD", n_stn)
+        u_arr = _extract_1d_float(ds, "U", n_stn)
+        p_arr = _extract_1d_float(ds, "P", n_stn)
+        ff_arr = _extract_1d_float(ds, "FF", n_stn)
+        fh_arr = _extract_1d_float(ds, "FH", n_stn)
+        fx_arr = _extract_1d_float(ds, "FX", n_stn)
+        dd_arr = _extract_1d_float(ds, "DD", n_stn)
+        rh_mm_arr = _extract_1d_float(ds, "RH", n_stn)  # hourly precip amount [mm]
+        q_jcm2_arr = _extract_1d_float(ds, "Q", n_stn)  # hourly global solar radiation [J/cm^2]
+        n_okta_arr = _extract_1d_float(ds, "N", n_stn)  # cloud cover [0..8 okta, 9=obscured]
+        vv_code_arr = _extract_1d_float(ds, "VV", n_stn)
+        w1_arr = _extract_1d_float(ds, "W1", n_stn)
 
         for i in range(n_stn):
-            sid = ids[i]
-            sname = names[i] or (KNMI_STATIONS[sid][3] if sid in KNMI_STATIONS else sid)
-            lat = float(lats[i])
-            lon = float(lons[i])
-            elev = float(hgts[i])
-            if not (math.isfinite(lat) and math.isfinite(lon) and -90.0 <= lat <= 90.0 and -180.0 <= lon <= 180.0):
-                if sid in KNMI_STATIONS:
-                    lat, lon, fb_elev, fb_name = KNMI_STATIONS[sid]
-                    sname = sname or fb_name
-                    if not math.isfinite(elev):
-                        elev = fb_elev
-                else:
-                    continue
-            if not math.isfinite(elev):
-                elev = float(KNMI_STATIONS[sid][2]) if sid in KNMI_STATIONS else 0.0
+            ws_i = float(ff_arr[i]) if math.isfinite(float(ff_arr[i])) else float(fh_arr[i])
 
-            t2m_c = float(ta[i])
-            if math.isfinite(t2m_c) and t2m_c > 150.0:
-                t2m_c -= 273.15
-            if not (-55.0 <= t2m_c <= 55.0):
-                t2m_c = float("nan")
-
-            td2m_c = float(td[i])
-            if math.isfinite(td2m_c) and td2m_c > 150.0:
-                td2m_c -= 273.15
-            if not (-65.0 <= td2m_c <= 45.0):
-                td2m_c = float("nan")
-
-            rh_pct = float(rh[i])
-            if not (0.0 <= rh_pct <= 105.0):
-                rh_pct = float("nan")
-
-            mslp_hpa = float(pp[i])
-            if math.isfinite(mslp_hpa) and mslp_hpa > 2000.0:
-                mslp_hpa *= 0.01
-            if not (870.0 <= mslp_hpa <= 1075.0):
-                mslp_hpa = float("nan")
-
-            ws = float(ff[i])
-            wd = float(dd[i])
-            u10, v10 = float("nan"), float("nan")
-            if math.isfinite(ws) and 0.0 <= ws <= 75.0:
-                if math.isfinite(wd) and 0.0 <= wd <= 360.0:
-                    rad = math.radians(wd)
-                    u10 = -ws * math.sin(rad)
-                    v10 = -ws * math.cos(rad)
+            rh_raw = float(rh_mm_arr[i])
+            if math.isfinite(rh_raw) and -0.1 <= rh_raw < 0.0:
+                rh_1h_mm = 0.025
+            elif math.isfinite(rh_raw) and 0.0 <= rh_raw <= 300.0:
+                rh_1h_mm = rh_raw
             else:
-                ws = float("nan")
-            if not (math.isfinite(wd) and 0.0 <= wd <= 360.0):
-                wd = float("nan")
+                rh_1h_mm = float("nan")
 
-            gust = float(fx[i]) if (math.isfinite(float(fx[i])) and 0.0 <= float(fx[i]) <= 100.0) else float("nan")
-            vis_v = float(zm[i]) if (math.isfinite(float(zm[i])) and 0.0 <= float(zm[i]) <= 100_000.0) else float("nan")
-            if not math.isfinite(vis_v):
-                vis_v = float(vv[i]) if (math.isfinite(float(vv[i])) and 0.0 <= float(vv[i]) <= 100_000.0) else float("nan")
-            rg_mmh = float(rg[i]) if (math.isfinite(float(rg[i])) and 0.0 <= float(rg[i]) <= 300.0) else float("nan")
-            qg_wm2 = float(qg[i]) if (math.isfinite(float(qg[i])) and 0.0 <= float(qg[i]) <= 1400.0) else float("nan")
+            q_raw = float(q_jcm2_arr[i])
+            sw_wm2 = (q_raw * (10_000.0 / 3600.0)) if (math.isfinite(q_raw) and 0.0 <= q_raw * (10_000.0 / 3600.0) <= 1400.0) else float("nan")
 
-            if all(math.isnan(x) for x in (t2m_c, mslp_hpa, ws, rh_pct, vis_v, rg_mmh)):
-                continue
+            n_raw = float(n_okta_arr[i])
+            tcc_val = (n_raw / 8.0) if (math.isfinite(n_raw) and 0.0 <= n_raw <= 8.0) else float("nan")
 
-            rows.append(
-                {
-                    "station_id": sid,
-                    "station_name": sname,
-                    "lat": lat,
-                    "lon": lon,
-                    "elev_m": elev,
-                    "is_offshore": _is_offshore_station(sid, sname),
-                    "obs_time_utc": obs_dt.isoformat() if obs_dt is not None else "",
-                    "t2m_c": t2m_c,
-                    "td2m_c": td2m_c,
-                    "rh_pct": rh_pct,
-                    "mslp_hpa": mslp_hpa,
-                    "ws10_ms": ws,
-                    "wd10_deg": wd,
-                    "u10_ms": u10,
-                    "v10_ms": v10,
-                    "gust10_ms": gust,
-                    "vis_m": vis_v,
-                    "precip_mmh": rg_mmh,
-                    "sw_down_wm2": qg_wm2,
-                }
+            w1_raw = float(w1_arr[i])
+            obs_fog_w1 = int(round(w1_raw)) if (math.isfinite(w1_raw) and w1_raw in (0.0, 1.0)) else None
+            vis_v = _knmi_vv_code_to_meters(float(vv_code_arr[i]))
+            if not math.isfinite(vis_v) and obs_fog_w1 is not None:
+                vis_v = 500.0 if obs_fog_w1 == 1 else 10_000.0
+
+            row = _build_knmi_station_row(
+                sid=ids[i],
+                raw_name=names[i],
+                lat=float(lats[i]),
+                lon=float(lons[i]),
+                elev=float(hgts[i]),
+                obs_dt=obs_dt,
+                t_raw=float(t_arr[i]),
+                td_raw=float(td_arr[i]),
+                rh_raw=float(u_arr[i]),
+                p_raw=float(p_arr[i]),
+                ws_raw=ws_i,
+                wd_raw=float(dd_arr[i]),
+                gust_raw=float(fx_arr[i]),
+                vis_v=vis_v,
+                precip_mmh=rh_1h_mm,
+                precip_1h_mm=rh_1h_mm,
+                sw_down_wm2=sw_wm2,
+                tcc=tcc_val,
+                obs_source="hourly-validated",
+                obs_fog_w1=obs_fog_w1,
+                reject_calm_dir=True,
             )
+            if row is not None:
+                rows.append(row)
     return rows
+
+
+def load_knmi_stations(nc_path: Path | str) -> List[Dict[str, Any]]:
+    """Auto-detect NetCDF schema (`hourly-validated` vs `10min`) and parse station dicts."""
+    p = Path(nc_path)
+    with nc.Dataset(p) as ds:
+        is_hv = ("T" in ds.variables and "ta" not in ds.variables) or (
+            "hourly-observations-validated" in p.name and "ta" not in ds.variables
+        )
+    return load_knmi_hourly_validated_stations(p) if is_hv else load_knmi_10min_stations(p)
 
 
 def load_knmi_hourly_precip_mm(
@@ -415,6 +627,7 @@ def sample_wx1_at_stations(
         gust10 = np.asarray(ds["gust10m"].values, dtype=np.float64) if "gust10m" in ds else np.full_like(t2m_c, np.nan)
         vis_m = np.asarray(ds["vis_m"].values, dtype=np.float64) if "vis_m" in ds else np.full_like(t2m_c, np.nan)
         sw_down = np.asarray(ds["sw_down"].values, dtype=np.float64) if "sw_down" in ds else np.full_like(t2m_c, np.nan)
+        tcc = np.asarray(ds["tcc"].values, dtype=np.float64) if "tcc" in ds else np.full_like(t2m_c, np.nan)
         wx1_attrs = {
             str(k): str(ds.attrs[k])
             for k in (
@@ -501,6 +714,7 @@ def sample_wx1_at_stations(
         m_gust = _sample_2d_bilinear(gust10, j0, j1, i0, i1, wy, wx)
         m_vis = _sample_2d_bilinear(vis_m, j0, j1, i0, i1, wy, wx)
         m_sw = _sample_2d_bilinear(sw_down, j0, j1, i0, i1, wy, wx)
+        m_tcc = _sample_2d_bilinear(tcc, j0, j1, i0, i1, wy, wx)
         m_pr = _sample_2d_bilinear(precip_mmh, j0, j1, i0, i1, wy, wx)
         m_p1h = _sample_2d_bilinear(precip_step_mm, j0, j1, i0, i1, wy, wx)
     else:
@@ -518,6 +732,7 @@ def sample_wx1_at_stations(
         m_gust = gust10[jj, ii]
         m_vis = vis_m[jj, ii]
         m_sw = sw_down[jj, ii]
+        m_tcc = tcc[jj, ii]
         m_pr = precip_mmh[jj, ii]
         m_p1h = precip_step_mm[jj, ii]
 
@@ -542,6 +757,7 @@ def sample_wx1_at_stations(
                 "mod_gust10_ms": float(m_gust[k]),
                 "mod_vis_m": float(m_vis[k]),
                 "mod_sw_down_wm2": float(m_sw[k]),
+                "mod_tcc": float(m_tcc[k]),
                 "mod_precip_mmh": float(m_pr[k]),
                 "mod_precip_step_mm": float(m_p1h[k]),
             }
@@ -805,6 +1021,10 @@ def _summarize_matched_rows(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         [r.get("mod_sw_down_wm2", float("nan")) for r in rows],
         [r.get("sw_down_wm2", float("nan")) for r in rows],
     )
+    tcc = compute_continuous_stats(
+        [r.get("mod_tcc", float("nan")) for r in rows],
+        [r.get("tcc", float("nan")) for r in rows],
+    )
     wdir = compute_wind_dir_stats_deg(
         [r["mod_wd10_deg"] for r in rows],
         [r["wd10_deg"] for r in rows],
@@ -828,6 +1048,7 @@ def _summarize_matched_rows(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         "fog": fog,
         "precip": precip,
         "sw_down": sw_down,
+        "tcc": tcc,
     }
 
 
@@ -999,6 +1220,7 @@ def sample_ifs_grib_at_stations(
                 "mod_gust10_ms": float("nan"),
                 "mod_vis_m": float("nan"),
                 "mod_sw_down_wm2": float("nan"),
+                "mod_tcc": float("nan"),
                 "mod_precip_mmh": float("nan"),
                 "mod_precip_step_mm": float("nan"),
                 "obs_precip_cmp": float("nan"),
@@ -1075,8 +1297,9 @@ def plot_hourly_verification_map(
     hour_stats: Dict[str, Any],
     *,
     land_only: bool = False,
+    obs_label: str = "KNMI 10-min",
 ) -> Path:
-    """Render a 2x2 Netherlands verification PNG comparing model fields against KNMI 10-min obs."""
+    """Render a 2x2 Netherlands verification PNG comparing model fields against KNMI in-situ obs."""
     import matplotlib
 
     matplotlib.use("Agg")
@@ -1245,7 +1468,7 @@ def plot_hourly_verification_map(
 
     s = hour_stats
     fig.suptitle(
-        f"Tempest-NWP ({grid['domain_name']}) vs KNMI 10-min | T+{lead_h:02.0f}h | Valid: {valid_dt:%Y-%m-%d %H:%MZ}\n"
+        f"Tempest-NWP ({grid['domain_name']}) vs {obs_label} | T+{lead_h:02.0f}h | Valid: {valid_dt:%Y-%m-%d %H:%MZ}\n"
         f"T2m: bias {s['t2m']['bias']:+.2f} K, RMSE {s['t2m']['rmse']:.2f} K | "
         f"MSLP: bias {s['mslp']['bias']:+.2f} hPa, RMSE {s['mslp']['rmse']:.2f} hPa | "
         f"RH: bias {s['rh']['bias']:+.1f}% | "
@@ -1268,6 +1491,7 @@ def plot_verification_timeseries(
     independent_after_hour: float = 4.0,
     domain_name: str = "Tempest LAM",
     use_land_stats: bool = True,
+    obs_label: str = "KNMI 10-min",
 ) -> Path:
     """Render a 2x3 lead-time dashboard PNG showing Bias & RMSE across all verified forecast hours."""
     import matplotlib
@@ -1381,7 +1605,7 @@ def plot_verification_timeseries(
 
     scope_lbl = "Landstations" if use_land_stats else "Alle KNMI stations"
     fig.suptitle(
-        f"Tempest-NWP ({domain_name}) — Uurlijkse KNMI 10-min Verificatie ({scope_lbl})\n"
+        f"Tempest-NWP ({domain_name}) — Uurlijkse {obs_label} Verificatie ({scope_lbl})\n"
         f"(Oranje band: T < +{independent_after_hour:.0f}u = DA-overlap / spin-up)",
         fontsize=12,
         fontweight="bold",
@@ -1408,6 +1632,7 @@ def verify_run_against_knmi(
     outdir: Optional[Path | str] = None,
     knmi_cache_dir: Optional[Path | str] = None,
     api_key: Optional[str] = None,
+    obs_source: str = "auto",
     max_lead_hours: Optional[float] = None,
     independent_after_hour: Optional[float] = None,
     hourly_precip_6x: bool = False,
@@ -1421,7 +1646,10 @@ def verify_run_against_knmi(
     radar_cache_dir: Optional[Path | str] = None,
     radar_hourly_fetcher: Optional[Callable[[datetime.datetime, Any], Optional[np.ndarray]]] = None,
 ) -> Dict[str, Any]:
-    """Verify every available forecast `.wx1` step of a run against KNMI 10-minute observations."""
+    """Verify every available forecast `.wx1` step against KNMI in-situ observations (`10min` or `hourly-validated`)."""
+    if obs_source not in ("auto", "10min", "hourly-validated"):
+        raise ValueError(f"Unsupported obs_source {obs_source!r}; expected 'auto', '10min', or 'hourly-validated'")
+
     items, manifest = discover_forecast_wx1(input_path)
     if max_lead_hours is not None:
         items = [it for it in items if it[0] <= float(max_lead_hours) + 1e-6]
@@ -1439,7 +1667,37 @@ def verify_run_against_knmi(
     else:
         indep_h = float(independent_after_hour)
 
-    fetch_fn = fetcher if fetcher is not None else (lambda dt, cdir: fetch_knmi_10min_netcdf(dt, cdir, api_key=api_key))
+    def _fetch_obs_for_valid_time(valid_dt: datetime.datetime, cdir: Path) -> Optional[Path]:
+        if fetcher is not None:
+            return fetcher(valid_dt, cdir)
+        if obs_source == "hourly-validated":
+            return fetch_knmi_hourly_validated_netcdf(valid_dt, cdir, api_key=api_key)
+        if obs_source == "10min":
+            return fetch_knmi_10min_netcdf(valid_dt, cdir, api_key=api_key)
+
+        u_dt = _to_utc(valid_dt)
+        hr_snap = _snap_hourly_utc(u_dt)
+        if hr_snap is not None:
+            hv_p = cdir / f"hourly-observations-validated-{hr_snap:%Y%m%d-%H}.nc"
+            if hv_p.is_file() and hv_p.stat().st_size > 1024:
+                return hv_p
+        m10_p = cdir / f"KMDS__OPER_P___10M_OBS_L2_{_snap_10min_utc(u_dt):%Y%m%d%H%M}.nc"
+        if m10_p.is_file() and m10_p.stat().st_size > 1024:
+            return m10_p
+
+        age_h = (datetime.datetime.now(datetime.timezone.utc) - u_dt).total_seconds() / 3600.0
+        if age_h >= 24.0 and hr_snap is not None:
+            p = fetch_knmi_hourly_validated_netcdf(u_dt, cdir, api_key=api_key)
+            if p is not None:
+                return p
+            return fetch_knmi_10min_netcdf(u_dt, cdir, api_key=api_key)
+        p = fetch_knmi_10min_netcdf(u_dt, cdir, api_key=api_key)
+        if p is not None:
+            return p
+        if hr_snap is not None:
+            return fetch_knmi_hourly_validated_netcdf(u_dt, cdir, api_key=api_key)
+        return None
+
     eff_ifs_dir = Path(ifs_grib_dir) if ifs_grib_dir is not None else (_auto_discover_ifs_dir(run_base, manifest) if compare_ifs else None)
     ifs_by_time = discover_ifs_grib_by_valid_time(eff_ifs_dir) if eff_ifs_dir is not None else {}
     ifs_sample_fn = ifs_sampler if ifs_sampler is not None else sample_ifs_grib_at_stations
@@ -1470,11 +1728,12 @@ def verify_run_against_knmi(
     prev_lead_h: Optional[float] = None
     domain_name = "tempest_lam"
     first_wx1_attrs: Dict[str, str] = {}
+    used_sources: set[str] = set()
     map_paths: List[Path] = []
     skipped_hours: List[Dict[str, Any]] = []
 
     for lead_h, valid_dt, wx1_path in items:
-        nc_path = fetch_fn(valid_dt, eff_cache)
+        nc_path = _fetch_obs_for_valid_time(valid_dt, eff_cache)
         if nc_path is None:
             skipped_hours.append({"lead_hours": lead_h, "valid_time_utc": valid_dt.isoformat(), "reason": "no_knmi_obs"})
             # Advance previous precipitation tracker so later hourly deltas stay exact
@@ -1487,9 +1746,17 @@ def verify_run_against_knmi(
                     prev_lead_h = lead_h
             continue
 
-        stations = load_knmi_10min_stations(nc_path)
+        stations = load_knmi_stations(nc_path)
+        src_kind = (
+            stations[0].get("obs_source", "10min")
+            if stations
+            else ("hourly-validated" if "hourly-observations-validated" in nc_path.name else "10min")
+        )
+        used_sources.add(src_kind)
+
+        had_prev_precip = prev_tot_precip is not None
         obs_1h_map: Dict[str, float] = {}
-        if hourly_precip_6x and prev_tot_precip is not None:
+        if src_kind == "10min" and hourly_precip_6x and had_prev_precip:
             obs_1h_map = load_knmi_hourly_precip_mm(valid_dt, eff_cache, api_key=api_key, fetcher=fetcher)
 
         dt_h = (lead_h - prev_lead_h) if (prev_lead_h is not None and lead_h > prev_lead_h) else 1.0
@@ -1508,7 +1775,17 @@ def verify_run_against_knmi(
         for row in matched:
             row["lead_hours"] = lead_h
             row["valid_time_utc"] = valid_dt.isoformat()
-            if obs_1h_map and row["station_id"] in obs_1h_map and lead_h > 0.0:
+            if (
+                src_kind == "hourly-validated"
+                and lead_h > 0.0
+                and had_prev_precip
+                and abs(dt_h - 1.0) < 0.25
+                and math.isfinite(row.get("precip_1h_mm", float("nan")))
+            ):
+                row["obs_precip_cmp"] = row["precip_1h_mm"]
+                row["mod_precip_cmp"] = row["mod_precip_step_mm"]
+                row["precip_unit"] = "mm/1h"
+            elif obs_1h_map and row["station_id"] in obs_1h_map and lead_h > 0.0:
                 row["obs_precip_cmp"] = obs_1h_map[row["station_id"]]
                 row["mod_precip_cmp"] = row["mod_precip_step_mm"]
                 row["precip_unit"] = "mm/1h"
@@ -1604,6 +1881,7 @@ def verify_run_against_knmi(
 
         if make_maps:
             tag = f"{int(round(lead_h)):03d}" if abs(lead_h - round(lead_h)) < 1e-4 else f"{lead_h:06.2f}"
+            obs_label_hr = "KNMI hourly-validated" if src_kind == "hourly-validated" else "KNMI 10-min"
             mp = plot_hourly_verification_map(
                 maps_dir / f"knmi_map_T+{tag}h.png",
                 lead_h,
@@ -1612,6 +1890,7 @@ def verify_run_against_knmi(
                 matched,
                 land_stats if land_only_plots else all_stats,
                 land_only=land_only_plots,
+                obs_label=obs_label_hr,
             )
             map_paths.append(mp)
 
@@ -1640,6 +1919,8 @@ def verify_run_against_knmi(
             "land_wdir_mae_deg": round(st_b["wdir"]["mae_deg"], 1),
             "land_sw_down_bias_wm2": round(st_b["sw_down"]["bias"], 1),
             "land_sw_down_rmse_wm2": round(st_b["sw_down"]["rmse"], 1),
+            "land_tcc_bias": round(st_b["tcc"]["bias"], 3),
+            "land_tcc_rmse": round(st_b["tcc"]["rmse"], 3),
             "land_fog_hits": st_b["fog"]["hits"],
             "land_fog_misses": st_b["fog"]["misses"],
             "land_fog_fa": st_b["fog"]["false_alarms"],
@@ -1692,6 +1973,13 @@ def verify_run_against_knmi(
     if stn_rows_out:
         _write_csv(stn_csv_p, stn_rows_out, list(stn_rows_out[0].keys()))
 
+    if used_sources == {"hourly-validated"}:
+        obs_label = "KNMI hourly-validated"
+    elif used_sources == {"10min"} or not used_sources:
+        obs_label = "KNMI 10-min"
+    else:
+        obs_label = "KNMI in-situ"
+
     ts_png: Optional[Path] = None
     if hourly_records:
         ts_png = plot_verification_timeseries(
@@ -1700,6 +1988,7 @@ def verify_run_against_knmi(
             independent_after_hour=indep_h,
             domain_name=domain_name,
             use_land_stats=True,
+            obs_label=obs_label,
         )
 
     # Strip large per-station lists before JSON serialization
@@ -1755,6 +2044,8 @@ def verify_run_against_knmi(
 
     summary: Dict[str, Any] = {
         "domain_name": domain_name,
+        "obs_source_requested": obs_source,
+        "obs_sources_used": sorted(used_sources),
         "run_metadata": run_metadata,
         "input_path": str(root),
         "outdir": str(eff_outdir),

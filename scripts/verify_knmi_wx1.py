@@ -24,14 +24,20 @@ def _fmt(val: float, spec: str = "+.2f") -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Verify Tempest-NWP .wx1 forecast outputs hourly against official KNMI 10-minute station observations."
+        description="Verify Tempest-NWP .wx1 forecast outputs hourly against official KNMI station observations."
     )
     src = parser.add_mutually_exclusive_group(required=True)
     src.add_argument("--run-dir", type=Path, help="Tempest run directory (e.g. runs/bnl_2p5km/20261122_18Z)")
     src.add_argument("--wx1-dir", type=Path, help="Direct directory containing forecast_*_T+*h.wx1 files")
     parser.add_argument("--outdir", type=Path, default=None, help="Output directory for CSV/JSON/PNG verification artifacts")
-    parser.add_argument("--knmi-cache-dir", type=Path, default=None, help="Cache dir for downloaded KNMI 10-min NetCDFs")
+    parser.add_argument("--knmi-cache-dir", type=Path, default=None, help="Cache dir for downloaded KNMI NetCDFs")
     parser.add_argument("--api-key", type=str, default=None, help="Optional KNMI Open Data API key override")
+    parser.add_argument(
+        "--obs-source",
+        choices=["auto", "10min", "hourly-validated"],
+        default="auto",
+        help="KNMI obs dataset: auto (hourly-validated when >=24h old/missing 10min), 10min, or hourly-validated",
+    )
     parser.add_argument("--max-lead-hours", type=float, default=None, help="Optional max forecast lead hour to verify")
     parser.add_argument(
         "--independent-after-hour",
@@ -73,6 +79,7 @@ def main() -> None:
         outdir=args.outdir,
         knmi_cache_dir=args.knmi_cache_dir,
         api_key=args.api_key,
+        obs_source=args.obs_source,
         max_lead_hours=args.max_lead_hours,
         independent_after_hour=args.independent_after_hour,
         hourly_precip_6x=args.hourly_precip_6x,
@@ -85,8 +92,15 @@ def main() -> None:
 
     rmeta = summary.get("run_metadata") or {}
     commit_str = f" | Commit: {rmeta['git_commit']}" if rmeta.get("git_commit") else ""
+    sources_used = summary.get("obs_sources_used") or []
+    if sources_used == ["hourly-validated"]:
+        obs_hdr = "KNMI hourly-validated"
+    elif sources_used == ["10min"] or not sources_used:
+        obs_hdr = "KNMI 10-min"
+    else:
+        obs_hdr = "KNMI " + "+".join(sources_used)
     print(
-        f"\n=== KNMI 10-min Verificatie | Domein: {summary['domain_name']}{commit_str} "
+        f"\n=== {obs_hdr} Verificatie | Domein: {summary['domain_name']}{commit_str} "
         f"| Uren geverifieerd: {summary['verified_hours']} (overgeslagen: {len(summary['skipped_hours'])}) ==="
     )
     print(
@@ -133,6 +147,13 @@ def main() -> None:
                 f"  Straling SW↓ (vs KNMI qg, n={sw_blk['n']}): "
                 f"bias={_fmt(sw_blk['bias'], '+.1f')} W/m², RMSE={_fmt(sw_blk['rmse'], '.1f')} W/m², "
                 f"obs_mean={_fmt(sw_blk['obs_mean'], '.1f')} vs mod_mean={_fmt(sw_blk['mod_mean'], '.1f')} W/m²"
+            )
+        tcc_blk = blk.get("tcc") or {}
+        if int(tcc_blk.get("n", 0)) > 0:
+            print(
+                f"  Bewolking TCC (vs KNMI N/8, n={tcc_blk['n']}): "
+                f"bias={_fmt(tcc_blk['bias'], '+.2f')}, RMSE={_fmt(tcc_blk['rmse'], '.2f')}, "
+                f"obs_mean={_fmt(tcc_blk['obs_mean'], '.2f')} vs mod_mean={_fmt(tcc_blk['mod_mean'], '.2f')}"
             )
         fg = blk["fog"]
         print(

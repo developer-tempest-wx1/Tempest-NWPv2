@@ -2062,6 +2062,7 @@ def run_era5_hindcast_lam_pipeline(
     lbc_dir: Optional[Path | str] = None,
     era5_cache_dir: Optional[Path | str] = None,
     lbc_interval_hours: float = 1.0,
+    stream_lbc: bool = False,
     enable_ocean_si3: bool = True,
     include_3d_diagnostics: bool = True,
     ocean_nz: int = 16,
@@ -2121,11 +2122,13 @@ def run_era5_hindcast_lam_pipeline(
         eff_lbc_dir,
         lbc_interval_hours=lbc_interval_hours,
         era5_cache_dir=eff_cache_dir,
+        stream_lbc=stream_lbc,
     )
     lbc_meta = {
         "source": "arco_era5",
         "resol": "0p25",
         "lbc_interval_hours": float(lbc_interval_hours),
+        "stream_lbc": bool(stream_lbc),
         "valid_times_utc": prep["valid_times_utc"],
         "lbc_dir": str(eff_lbc_dir),
         "era5_cache_dir": str(eff_cache_dir),
