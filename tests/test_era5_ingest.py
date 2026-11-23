@@ -325,3 +325,94 @@ def test_select_era5_cases_ranking(tmp_path: Path) -> None:
     assert ranked["clear_diurnal"][0]["date"] == "2025-06-20"
     assert ranked["rain"][0]["date"] == "2025-02-15"
 
+
+def test_expanded_regimes_season_filter_and_benchmark_scorecard(tmp_path: Path) -> None:
+    import gzip
+    import sys
+
+    scripts_dir = str(Path(__file__).resolve().parents[1] / "scripts")
+    if scripts_dir not in sys.path:
+        sys.path.insert(0, scripts_dir)
+    from select_era5_cases import rank_knmi_cases
+    from run_benchmark_suite import BENCHMARK_CATALOG, aggregate_benchmark_scorecard
+
+    # 1. Verify expanded convection & seasonal regimes in select_era5_cases
+    csv_gz = tmp_path / "knmi_uur_2024.csv.gz"
+    rows = ["STN,YYYYMMDD,HH,FH,FX,T,RH,S,O,M"]
+    for hh in range(1, 25):
+        # 20240618 (summer): warm localized heavy shower WITHOUT thunder (rain_max=25mm, rain_mean=2.5mm)
+        for stn, r_val in (("260", 20.0 if hh in (14, 15) else 0.0), ("240", 0.0), ("280", 0.0), ("290", 0.0), ("370", 0.0), ("380", 0.0), ("310", 0.0), ("344", 0.0), ("270", 0.0), ("275", 0.0)):
+            r10 = r_val * 10.0 if stn != "260" else (125.0 if hh in (14, 15) else 0.0)
+            rows.append(f"{stn},20240618,{hh},40.0,80.0,{240 if 11 <= hh <= 17 else 140}, {r10:.1f},0.0,0.0,0.0")
+        # 20241122 (autumn/winter-half): cold low-topped convection WITH thunder + snow
+        rows.append(f"260,20241122,{hh},90.0,220.0,55.0,5.0,1.0,1.0,0.0")
+        # 20240720 (summer): deep convection WITH thunder & heat
+        rows.append(f"260,20240720,{hh},50.0,180.0,285.0,20.0,0.0,1.0,0.0")
+    with gzip.open(csv_gz, "wt", encoding="utf-8") as fh:
+        fh.write("\n".join(rows) + "\n")
+
+    res_no_th = rank_knmi_cases(tmp_path, regime="high_conv_no_thunder", season="summer", top=2)
+    assert res_no_th["high_conv_no_thunder"][0]["date"] == "2024-06-18"
+    res_low_th = rank_knmi_cases(tmp_path, regime="low_conv_thunder", top=2)
+    assert res_low_th["low_conv_thunder"][0]["date"] == "2024-11-22"
+    res_hi_th = rank_knmi_cases(tmp_path, regime="high_conv_thunder", season="summer", top=2)
+    assert res_hi_th["high_conv_thunder"][0]["date"] == "2024-07-20"
+
+    # 2. Verify curated BENCHMARK_CATALOG invariants across all 4 seasons & regimes
+    assert len(BENCHMARK_CATALOG) == 20
+    assert len({c["date"] for c in BENCHMARK_CATALOG}) == 20
+    assert all(c["date"] <= "2026-11-12" for c in BENCHMARK_CATALOG)
+    assert {"winter", "spring", "summer", "autumn"}.issubset({c["season"] for c in BENCHMARK_CATALOG})
+    assert {"storm", "high_conv_thunder", "high_conv_no_thunder", "low_conv_thunder", "snow", "radiation_fog", "freezing_mixed", "rain"}.issubset({c["regime"] for c in BENCHMARK_CATALOG})
+
+    # 3. Verify aggregate_benchmark_scorecard pooling & means
+    def _mock_summary(t2m_rmse: float, ss_t2m: float, snow_h: int, snow_m: int) -> dict:
+        ev = {k: {"hits": 0, "misses": 0, "false_alarms": 0, "n": 10} for k in ("rain_0p1mm", "rain_2mm", "gust_15ms", "gust_20ms", "snow", "hail_graupel", "thunder", "ice_freezing_rain")}
+        ev["snow"] = {"hits": snow_h, "misses": snow_m, "false_alarms": 1, "n": 10}
+        return {
+            "verified_hours": 24,
+            "independent_land": {
+                "t2m": {"n": 20, "rmse": t2m_rmse, "bias": 0.2},
+                "td2m": {"rmse": 0.9},
+                "rh": {"bias": 1.0},
+                "mslp": {"rmse": 0.6},
+                "ws10": {"rmse": 1.1, "bias": 0.1},
+                "gust10": {"rmse": 1.8},
+                "sw_down": {"rmse": 45.0},
+                "tcc": {"rmse": 0.2},
+                "precip": {"rmse": 0.7},
+                "fog": {"hits": 2, "misses": 1, "false_alarms": 0, "n": 20},
+                "events": ev,
+            },
+            "era5_comparison": {
+                "independent_land": {
+                    "skill": {
+                        "t2m": {"skill_score": ss_t2m},
+                        "mslp": {"skill_score": 0.1},
+                        "ws10": {"skill_score": 0.2},
+                        "precip": {"skill_score": 0.05},
+                    }
+                }
+            },
+            "era5_upper_air": {
+                "independent": {
+                    "t850_k": {"rmse": 0.6},
+                    "gh500_m": {"rmse": 10.0},
+                    "wspd850_ms": {"rmse": 1.4},
+                }
+            },
+        }
+
+    sc = aggregate_benchmark_scorecard(
+        [
+            {"case": BENCHMARK_CATALOG[0], "summary": _mock_summary(1.0, 0.2, snow_h=3, snow_m=1)},
+            {"case": BENCHMARK_CATALOG[3], "summary": _mock_summary(1.4, 0.4, snow_h=0, snow_m=0)},
+        ]
+    )
+    assert sc["n_cases"] == 2
+    assert sc["overall"]["metrics"]["t2m_rmse"] == pytest.approx(1.2)
+    assert sc["overall"]["metrics"]["ss_t2m_era5"] == pytest.approx(0.3)
+    assert sc["overall"]["events"]["snow"]["pod"] == pytest.approx(3.0 / 4.0)
+    assert set(sc["by_season"].keys()) == {"winter", "summer"}
+
+

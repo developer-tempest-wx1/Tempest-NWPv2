@@ -22,8 +22,35 @@ from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 DEFAULT_CASES_DIR = Path("/home/j_ord/AI/Tempest/era5_cases")
-REGIMES: Tuple[str, ...] = ("radiation_fog", "fog", "storm", "rain", "clear_diurnal", "snow")
+SEASON_MONTHS: Dict[str, Tuple[int, ...]] = {
+    "winter": (12, 1, 2),
+    "spring": (3, 4, 5),
+    "summer": (6, 7, 8),
+    "autumn": (9, 10, 11),
+}
+REGIMES: Tuple[str, ...] = (
+    "radiation_fog",
+    "fog",
+    "storm",
+    "summer_storm",
+    "rain",
+    "clear_diurnal",
+    "snow",
+    "severe_frost",
+    "heatwave",
+    "freezing_mixed",
+    "high_conv_thunder",
+    "high_conv_no_thunder",
+    "low_conv_thunder",
+)
 _FILE_YEAR_RE = re.compile(r"knmi_uur_(\d{4})\.csv\.gz$")
+
+
+def _month_to_season(month: int) -> str:
+    for s_name, months in SEASON_MONTHS.items():
+        if month in months:
+            return s_name
+    return "unknown"
 
 
 def _parse_optional_float(raw: str) -> Optional[float]:
@@ -132,9 +159,12 @@ def _summarize_year_csv(
         t_min_c = d["t_min"] if d["t_min"] < 90.0 else float("nan")
         t_max_c = d["t_max"] if d["t_max"] > -90.0 else float("nan")
         iso_date = f"{ymd[:4]}-{ymd[4:6]}-{ymd[6:8]}"
+        mo = int(ymd[4:6])
         summaries.append(
             {
                 "ymd": ymd,
+                "month": mo,
+                "season": _month_to_season(mo),
                 "date": iso_date,
                 "init_utc": f"{iso_date}T00:00Z",
                 "fog_hrs": int(d["fog_hrs"]),
@@ -157,6 +187,7 @@ def rank_knmi_cases(
     cases_dir: Path | str = DEFAULT_CASES_DIR,
     *,
     regime: str = "all",
+    season: str = "all",
     top: int = 5,
     min_year: Optional[int] = None,
     max_year: Optional[int] = None,
@@ -165,6 +196,8 @@ def rank_knmi_cases(
     """Scan KNMI hourly CSV archives and return top historical test cases per regime."""
     if regime != "all" and regime not in REGIMES:
         raise ValueError(f"Unsupported regime {regime!r}; expected 'all' or one of {REGIMES}")
+    if season != "all" and season not in SEASON_MONTHS:
+        raise ValueError(f"Unsupported season {season!r}; expected 'all' or one of {tuple(SEASON_MONTHS)}")
     root = Path(cases_dir)
     if not root.is_dir():
         raise FileNotFoundError(f"Cases directory not found: {root}")
@@ -186,6 +219,12 @@ def rank_knmi_cases(
     all_days: List[Dict[str, Any]] = []
     for fp in selected_files:
         all_days.extend(_summarize_year_csv(fp, max_ymd=max_ymd))
+    if season != "all":
+        all_days = [d for d in all_days if d.get("season") == season]
+
+    def _storm_score(d: Dict[str, Any]) -> Tuple[float, float]:
+        fh_m = d["fh_mean_ms"] if d["fh_mean_ms"] == d["fh_mean_ms"] else 0.0
+        return (d["fx_p95_ms"] + 0.6 * d["fx_max_ms"] + fh_m, d["fx_max_ms"])
 
     target_regimes: Iterable[str] = REGIMES if regime == "all" else (regime,)
     ranked: Dict[str, List[Dict[str, Any]]] = {}
@@ -201,13 +240,10 @@ def rank_knmi_cases(
             cands.sort(key=lambda d: (d["fog_hrs"], -(d["fh_mean_ms"] if d["fh_mean_ms"] == d["fh_mean_ms"] else 99.0)), reverse=True)
         elif reg == "storm":
             cands = [d for d in all_days if d["fx_max_ms"] > 0.0]
-            cands.sort(
-                key=lambda d: (
-                    d["fx_p95_ms"] + 0.6 * d["fx_max_ms"] + (d["fh_mean_ms"] if d["fh_mean_ms"] == d["fh_mean_ms"] else 0.0),
-                    d["fx_max_ms"],
-                ),
-                reverse=True,
-            )
+            cands.sort(key=_storm_score, reverse=True)
+        elif reg == "summer_storm":
+            cands = [d for d in all_days if d.get("month") in (5, 6, 7, 8, 9) and d["fx_max_ms"] > 0.0]
+            cands.sort(key=_storm_score, reverse=True)
         elif reg == "rain":
             cands = [d for d in all_days if d["rain_mean_mm"] > 0.0]
             cands.sort(key=lambda d: (d["rain_mean_mm"], d["thunder_hrs"], d["rain_max_stn_mm"]), reverse=True)
@@ -217,12 +253,49 @@ def rank_knmi_cases(
                 if d["diurnal_c"] > 0.0 and d["rain_mean_mm"] < 0.1 and d["snow_hrs"] == 0 and d["thunder_hrs"] == 0
             ]
             cands.sort(key=lambda d: (d["diurnal_c"], -d["rain_mean_mm"], -d["fog_hrs"]), reverse=True)
-        else:  # snow
+        elif reg == "snow":
             cands = [
                 d for d in all_days
                 if d["snow_hrs"] >= 1 and d["t_min_c"] == d["t_min_c"] and d["t_min_c"] <= 0.5
             ]
             cands.sort(key=lambda d: (d["snow_hrs"], -d["t_min_c"]), reverse=True)
+        elif reg == "severe_frost":
+            cands = [d for d in all_days if d["t_min_c"] == d["t_min_c"] and d["t_min_c"] <= -5.0]
+            cands.sort(key=lambda d: (d["t_min_c"], d["t_max_c"]))
+        elif reg == "heatwave":
+            cands = [d for d in all_days if d["t_max_c"] == d["t_max_c"] and d["t_max_c"] >= 30.0 and d["rain_mean_mm"] <= 1.0]
+            cands.sort(key=lambda d: (d["t_max_c"], d["diurnal_c"]), reverse=True)
+        elif reg == "freezing_mixed":
+            cands = [
+                d for d in all_days
+                if d["t_min_c"] == d["t_min_c"] and d["t_max_c"] == d["t_max_c"]
+                and d["t_min_c"] <= -1.0 and d["t_max_c"] >= 1.0
+                and d["rain_mean_mm"] >= 1.5 and d["snow_hrs"] >= 5
+            ]
+            cands.sort(key=lambda d: (d["rain_mean_mm"], d["snow_hrs"]), reverse=True)
+        elif reg == "high_conv_thunder":
+            cands = [
+                d for d in all_days
+                if d.get("month") in (5, 6, 7, 8, 9) and d["t_max_c"] == d["t_max_c"]
+                and d["t_max_c"] >= 24.0 and d["thunder_hrs"] >= 15
+            ]
+            cands.sort(key=lambda d: (d["thunder_hrs"], d["rain_max_stn_mm"], d["fx_max_ms"]), reverse=True)
+        elif reg == "high_conv_no_thunder":
+            cands = [
+                d for d in all_days
+                if d.get("month") in (5, 6, 7, 8, 9) and d["t_max_c"] == d["t_max_c"]
+                and d["t_max_c"] >= 20.0 and d["thunder_hrs"] == 0
+                and d["rain_max_stn_mm"] >= 15.0 and d["rain_mean_mm"] >= 1.0
+                and (d["rain_max_stn_mm"] / max(d["rain_mean_mm"], 0.1)) >= 2.5
+            ]
+            cands.sort(key=lambda d: (d["rain_max_stn_mm"], d["t_max_c"]), reverse=True)
+        else:  # low_conv_thunder
+            cands = [
+                d for d in all_days
+                if d.get("month") in (11, 12, 1, 2, 3) and d["t_max_c"] == d["t_max_c"]
+                and d["t_max_c"] <= 12.0 and d["thunder_hrs"] >= 3
+            ]
+            cands.sort(key=lambda d: (d["thunder_hrs"], d["snow_hrs"], d["fx_max_ms"]), reverse=True)
         ranked[reg] = cands[: max(1, int(top))]
     return ranked
 
@@ -242,6 +315,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Select standout historical KNMI weather days for ARCO-ERA5 hindcasts.")
     parser.add_argument("--cases-dir", type=Path, default=DEFAULT_CASES_DIR, help="Directory with knmi_uur_*.csv.gz files")
     parser.add_argument("--regime", choices=("all",) + REGIMES, default="all", help="Meteorological regime to rank")
+    parser.add_argument("--season", choices=("all",) + tuple(SEASON_MONTHS), default="all", help="Season filter")
     parser.add_argument("--top", type=int, default=5, help="Number of cases per regime (default: 5)")
     parser.add_argument("--years", type=str, default=None, help="Year or inclusive range, e.g. '2025' or '2024-2026'")
     parser.add_argument(
@@ -256,6 +330,7 @@ def main() -> None:
     results = rank_knmi_cases(
         args.cases_dir,
         regime=args.regime,
+        season=args.season,
         top=args.top,
         min_year=min_y,
         max_year=max_y,
@@ -263,15 +338,15 @@ def main() -> None:
     )
 
     for reg, rows in results.items():
-        print(f"\n=== Regime: {reg} (top {len(rows)}) ===")
+        print(f"\n=== Regime: {reg} | season={args.season} (top {len(rows)}) ===")
         print(
-            "Datum       | Mist(u) | Sneeuw(u) | Onw(u) | Windgem | Stoot p95/max | Regen gem/max(mm) | Tmin/Tmax/Dag(C)"
+            "Datum       (Seiz)   | Mist(u) | Sneeuw(u) | Onw(u) | Windgem | Stoot p95/max | Regen gem/max(mm) | Tmin/Tmax/Dag(C)"
         )
-        print("-" * 112)
+        print("-" * 124)
         for r in rows:
             fh_s = f"{r['fh_mean_ms']:4.1f}" if r["fh_mean_ms"] == r["fh_mean_ms"] else " n/a"
             print(
-                f"{r['date']}  |  {r['fog_hrs']:5d}  |   {r['snow_hrs']:6d}  |  {r['thunder_hrs']:4d}  | "
+                f"{r['date']}  ({r['season']:<6s}) |  {r['fog_hrs']:5d}  |   {r['snow_hrs']:6d}  |  {r['thunder_hrs']:4d}  | "
                 f"{fh_s} m/s | {r['fx_p95_ms']:4.1f} / {r['fx_max_ms']:4.1f}  | "
                 f"{r['rain_mean_mm']:5.1f} / {r['rain_max_stn_mm']:5.1f}     | "
                 f"{r['t_min_c']:+5.1f} / {r['t_max_c']:+5.1f} / {r['diurnal_c']:4.1f}"
@@ -286,7 +361,7 @@ def main() -> None:
             )
             print(
                 "  -> Verify   : "
-                f"python scripts/verify_knmi_wx1.py --run-dir {run_dir} --obs-source auto"
+                f"python scripts/verify_knmi_wx1.py --run-dir {run_dir} --obs-source auto --compare-era5"
             )
 
 

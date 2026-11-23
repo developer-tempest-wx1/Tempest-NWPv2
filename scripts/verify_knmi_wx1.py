@@ -64,6 +64,23 @@ def main() -> None:
         help="Explicit directory containing ECMWF IFS *_sfc_*.grib2 files for side-by-side comparison",
     )
     parser.add_argument(
+        "--compare-era5",
+        action="store_true",
+        help="Score Tempest side-by-side vs ARCO-ERA5 0.25-deg surface & 850/500 hPa fields",
+    )
+    parser.add_argument(
+        "--era5-cache-dir",
+        type=Path,
+        default=None,
+        help="Optional ERA5 cache directory for --compare-era5 (auto-discovered from manifest if omitted)",
+    )
+    parser.add_argument(
+        "--era5-step-hours",
+        type=float,
+        default=3.0,
+        help="Lead-time interval [h] for --compare-era5 sampling (default: 3.0; use 1.0 for every hour)",
+    )
+    parser.add_argument(
         "--verify-radar-fss",
         action="store_true",
         help="Fetch 12x5-min live gauge-adjusted KNMI radar QPE per hour and score Roberts & Lean (2008) FSS",
@@ -87,6 +104,9 @@ def main() -> None:
         make_maps=not args.no_maps,
         ifs_grib_dir=args.compare_ifs_dir,
         compare_ifs=args.compare_ifs,
+        compare_era5=args.compare_era5,
+        era5_cache_dir=args.era5_cache_dir,
+        era5_step_hours=args.era5_step_hours,
         verify_radar_fss=args.verify_radar_fss,
     )
 
@@ -163,6 +183,40 @@ def main() -> None:
             f"CSI={_fmt(100.0 * fg['csi'] if math.isfinite(fg['csi']) else float('nan'), '.0f')}%"
         )
 
+    indep_ev = (summary.get("independent_land") or {}).get("events") or {}
+    indep_cd = (summary.get("independent_land") or {}).get("convection_diag") or {}
+    ev_labels = (
+        ("rain_0p1mm", "Regen >=0.1mm/u"),
+        ("rain_2mm", "Zware bui >=2mm/u"),
+        ("gust_15ms", "Stoot >=15 m/s"),
+        ("gust_20ms", "Zware stoot >=20 m/s"),
+        ("snow", "Sneeuw (W3 / acc)"),
+        ("hail_graupel", "Hagel/Korrelhagel (WW/graupel)"),
+        ("thunder", "Onweer (W5 / micro+CAPE)"),
+        ("ice_freezing_rain", "IJzel (W6 / T<=0.5C+rain)"),
+    )
+    active_ev = [
+        (lbl, indep_ev[k])
+        for k, lbl in ev_labels
+        if k in indep_ev and (indep_ev[k].get("obs_yes", 0) > 0 or indep_ev[k].get("mod_yes", 0) > 0)
+    ]
+    if active_ev or any(math.isfinite(float(indep_cd.get(ck, float("nan")))) for ck in ("mod_cape_mu_max", "mod_graupel_max_mm")):
+        print(f"\n[Weertypes & Convectie T>={summary['independent_after_hour']:.0f}u (landstations)]")
+        for lbl, ev in active_ev:
+            pod_s = _fmt(100.0 * ev["pod"] if math.isfinite(ev["pod"]) else float("nan"), ".0f")
+            far_s = _fmt(100.0 * ev["far"] if math.isfinite(ev["far"]) else float("nan"), ".0f")
+            csi_s = _fmt(100.0 * ev["csi"] if math.isfinite(ev["csi"]) else float("nan"), ".0f")
+            print(
+                f"  {lbl:<32s}: obs={ev['obs_yes']:3d} mod={ev['mod_yes']:3d} | "
+                f"H={ev['hits']:3d} M={ev['misses']:3d} FA={ev['false_alarms']:3d} | "
+                f"POD={pod_s}% FAR={far_s}% CSI={csi_s}%"
+            )
+        print(
+            f"  Convectie-diag: max MU-CAPE={_fmt(indep_cd.get('mod_cape_mu_max', float('nan')), '.0f')} J/kg | "
+            f"max graupel={_fmt(indep_cd.get('mod_graupel_max_mm', float('nan')), '.2f')} mm/u | "
+            f"max sneeuw={_fmt(indep_cd.get('mod_snow_max_mm', float('nan')), '.2f')} mm/u"
+        )
+
     if summary["worst_t2m_land_stations"]:
         print("\n[Top 5 landstations met grootste T2m RMSE (onafhankelijk)]")
         for st in summary["worst_t2m_land_stations"][:5]:
@@ -172,59 +226,83 @@ def main() -> None:
                 f"RH bias={st['rh_bias_pct']:+.1f}% | Wind bias={st['ws10_bias_ms']:+.2f}m/s"
             )
 
-    if summary.get("ifs_comparison"):
-        icmp = summary["ifs_comparison"]
-        print(
-            f"\n=== Tempest vs ECMWF IFS 0.1° ({icmp['matched_hours']} synchrone uren: {icmp['matched_leads']}) ==="
-        )
-        print(f"IFS GRIB2 bron: {icmp['ifs_dir']}")
-        print(
-            "Lead  | T2m RMSE: Tempest vs IFS  (SS)   | MSLP RMSE: Tempest vs IFS (SS)   | "
-            "Wind10 RMSE: Tempest vs IFS (SS) | Td2m RMSE: T vs IFS"
-        )
-        print("-" * 132)
-        for rec in summary["hourly"]:
-            ib = rec.get("ifs_land")
-            sk = rec.get("skill_vs_ifs_land")
-            tb = rec["land"]
-            if not ib or not sk:
-                continue
-            print(
-                f"T+{rec['lead_hours']:02.0f}h | "
-                f"{_fmt(tb['t2m']['rmse'], '.2f')} vs {_fmt(ib['t2m']['rmse'], '.2f')} K ({_fmt(sk['t2m']['skill_score'], '+.2f')}) | "
-                f"{_fmt(tb['mslp']['rmse'], '.2f')} vs {_fmt(ib['mslp']['rmse'], '.2f')} hPa ({_fmt(sk['mslp']['skill_score'], '+.2f')}) | "
-                f"{_fmt(tb['ws10']['rmse'], '.2f')} vs {_fmt(ib['ws10']['rmse'], '.2f')} m/s ({_fmt(sk['ws10']['skill_score'], '+.2f')}) | "
-                f"{_fmt(tb['td2m']['rmse'], '.2f')} vs {_fmt(ib['td2m']['rmse'], '.2f')} K"
-            )
+    def _print_ref_section(cmp_blk: dict, *, ref_key: str, title: str, src_key: str, var_rows: tuple) -> None:
+        print(f"\n=== {title} ({cmp_blk['matched_hours']} synchrone uren: {cmp_blk['matched_leads']}) ===")
+        print(f"Bron: {cmp_blk.get(src_key, '')}")
         for label, bkey in (
             ("Synchroon Totaal (landstations)", "overall_land"),
             (f"Synchroon Onafhankelijk T>={summary['independent_after_hour']:.0f}u (landstations)", "independent_land"),
         ):
-            blk = icmp[bkey]
-            ts, ifs_s, sk = blk["tempest"], blk["ifs"], blk["skill"]
-            print(f"\n[{label}] (SS > 0 betekent Tempest lagere RMSE dan IFS)")
-            for var_key, var_lbl, unit in (
+            blk = cmp_blk[bkey]
+            ts, rs, sk = blk["tempest"], blk[ref_key], blk["skill"]
+            print(f"\n[{label}] (SS > 0 betekent Tempest lagere RMSE dan {ref_key.upper()})")
+            for var_key, var_lbl, unit in var_rows:
+                if rs[var_key]["n"] == 0:
+                    continue
+                print(
+                    f"  {var_lbl:<11s} (n={rs[var_key]['n']:3d}): "
+                    f"Tempest bias={_fmt(ts[var_key]['bias'])} RMSE={_fmt(ts[var_key]['rmse'], '.2f')} {unit} | "
+                    f"{ref_key.upper()} bias={_fmt(rs[var_key]['bias'])} RMSE={_fmt(rs[var_key]['rmse'], '.2f')} {unit} | "
+                    f"SS={_fmt(sk[var_key]['skill_score'], '+.3f')}"
+                )
+            if rs["wdir"]["n"] > 0:
+                print(
+                    f"  Dir10m      (n={rs['wdir']['n']:3d}): "
+                    f"Tempest MAE={_fmt(ts['wdir']['mae_deg'], '.1f')}° | "
+                    f"{ref_key.upper()} MAE={_fmt(rs['wdir']['mae_deg'], '.1f')}° | "
+                    f"SS={_fmt(sk['wdir']['skill_score'], '+.3f')}"
+                )
+
+    if summary.get("ifs_comparison"):
+        icmp = summary["ifs_comparison"]
+        _print_ref_section(
+            icmp,
+            ref_key="ifs",
+            title="Tempest vs ECMWF IFS 0.1°",
+            src_key="ifs_dir",
+            var_rows=(
                 ("t2m", "T2m", "K"),
                 ("td2m", "Td2m", "K"),
                 ("rh", "RH", "%"),
                 ("mslp", "MSLP", "hPa"),
                 ("ws10", "Wind10m", "m/s"),
+            ),
+        )
+
+    if summary.get("era5_comparison"):
+        ecmp = summary["era5_comparison"]
+        _print_ref_section(
+            ecmp,
+            ref_key="era5",
+            title="Tempest vs ARCO-ERA5 0.25°",
+            src_key="era5_cache_dir",
+            var_rows=(
+                ("t2m", "T2m", "K"),
+                ("td2m", "Td2m", "K"),
+                ("rh", "RH", "%"),
+                ("mslp", "MSLP", "hPa"),
+                ("ws10", "Wind10m", "m/s"),
+                ("gust10", "Gust10m", "m/s"),
+                ("sw_down", "SW_down", "W/m2"),
+                ("tcc", "TCC", "0..1"),
+                ("precip", "Neerslag1h", "mm"),
+            ),
+        )
+        eua = (summary.get("era5_upper_air") or {}).get("independent") or (summary.get("era5_upper_air") or {}).get("overall")
+        if eua:
+            print(f"\n[Tempest Binnengebied vs ARCO-ERA5 3D Bovenlucht ({eua['n_hours']} uren)]")
+            for k_ua, lbl_ua, u_ua in (
+                ("mslp_hpa", "MSLP 2D", "hPa"),
+                ("t2m_c", "T2m 2D", "K"),
+                ("t850_k", "T 850hPa", "K"),
+                ("gh500_m", "GH 500hPa", "m"),
+                ("wspd850_ms", "WSPD 850hPa", "m/s"),
+                ("wspd500_ms", "WSPD 500hPa", "m/s"),
+                ("q850_gkg", "Q 850hPa", "g/kg"),
             ):
-                if ifs_s[var_key]["n"] == 0:
-                    continue
-                print(
-                    f"  {var_lbl:<7s} (n={ifs_s[var_key]['n']:3d}): "
-                    f"Tempest bias={_fmt(ts[var_key]['bias'])} RMSE={_fmt(ts[var_key]['rmse'], '.2f')} {unit} | "
-                    f"IFS bias={_fmt(ifs_s[var_key]['bias'])} RMSE={_fmt(ifs_s[var_key]['rmse'], '.2f')} {unit} | "
-                    f"SS={_fmt(sk[var_key]['skill_score'], '+.3f')}"
-                )
-            if ifs_s["wdir"]["n"] > 0:
-                print(
-                    f"  Dir10m  (n={ifs_s['wdir']['n']:3d}): "
-                    f"Tempest MAE={_fmt(ts['wdir']['mae_deg'], '.1f')}° | "
-                    f"IFS MAE={_fmt(ifs_s['wdir']['mae_deg'], '.1f')}° | "
-                    f"SS={_fmt(sk['wdir']['skill_score'], '+.3f')}"
-                )
+                b = eua.get(k_ua) or {}
+                if int(b.get("n_points", 0)) > 0:
+                    print(f"  {lbl_ua:<12s}: bias={_fmt(b['bias'])} {u_ua}, RMSE={_fmt(b['rmse'], '.2f')} {u_ua}")
 
     if summary.get("radar_fss") and summary["radar_fss"].get("overall"):
         rf = summary["radar_fss"]["overall"]

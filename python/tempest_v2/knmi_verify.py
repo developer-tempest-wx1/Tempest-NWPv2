@@ -29,6 +29,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 import netCDF4 as nc
 import numpy as np
 from scipy.spatial import cKDTree
+import xarray as xr
 import wx1
 
 from tempest_v2.ingest_knmi_observations import (
@@ -48,6 +49,9 @@ _IFS_SFC_RE = re.compile(r"(\d{8})_(\d{2})Z_sfc_step(\d+)")
 
 HOURLY_VALIDATED_DATASET = "hourly-in-situ-meteorological-observations-validated"
 HOURLY_VALIDATED_VERSION = "1.0"
+
+_WMO_4680_HAIL_CODES = frozenset({74, 75, 76, 89, 93, 96, 99})
+_WMO_4680_SHOWER_CODES = frozenset({80, 81, 82, 83, 84, 85, 86, 87, 89, 91, 92, 93, 94, 95, 96, 99})
 
 # WMO IDs of Dutch North Sea platforms / buoys that do not represent inland land stations
 _OFFSHORE_STATION_IDS = frozenset(
@@ -289,6 +293,13 @@ def _build_knmi_station_row(
     tcc: float,
     obs_source: str,
     obs_fog_w1: Optional[int] = None,
+    obs_rain_w2: Optional[int] = None,
+    obs_snow_w3: Optional[int] = None,
+    obs_thunder_w5: Optional[int] = None,
+    obs_ice_w6: Optional[int] = None,
+    obs_ww_code: Optional[int] = None,
+    obs_hail: Optional[int] = None,
+    obs_convective_shower: Optional[int] = None,
     reject_calm_dir: bool = False,
 ) -> Optional[Dict[str, Any]]:
     sname = raw_name or (KNMI_STATIONS[sid][3] if sid in KNMI_STATIONS else sid)
@@ -362,6 +373,13 @@ def _build_knmi_station_row(
         "gust10_ms": gust,
         "vis_m": vis_v,
         "obs_fog_w1": obs_fog_w1,
+        "obs_rain_w2": obs_rain_w2,
+        "obs_snow_w3": obs_snow_w3,
+        "obs_thunder_w5": obs_thunder_w5,
+        "obs_ice_w6": obs_ice_w6,
+        "obs_ww_code": obs_ww_code,
+        "obs_hail": obs_hail,
+        "obs_convective_shower": obs_convective_shower,
         "precip_mmh": precip_mmh,
         "precip_1h_mm": precip_1h_mm,
         "sw_down_wm2": sw_down_wm2,
@@ -452,6 +470,14 @@ def load_knmi_hourly_validated_stations(nc_path: Path | str) -> List[Dict[str, A
         n_okta_arr = _extract_1d_float(ds, "N", n_stn)  # cloud cover [0..8 okta, 9=obscured]
         vv_code_arr = _extract_1d_float(ds, "VV", n_stn)
         w1_arr = _extract_1d_float(ds, "W1", n_stn)
+        w2_arr = _extract_1d_float(ds, "W2", n_stn)
+        w3_arr = _extract_1d_float(ds, "W3", n_stn)
+        w5_arr = _extract_1d_float(ds, "W5", n_stn)
+        w6_arr = _extract_1d_float(ds, "W6", n_stn)
+        ww_arr = _extract_1d_float(ds, "WW", n_stn)
+
+        def _flag01(val: float) -> Optional[int]:
+            return int(round(val)) if (math.isfinite(val) and val in (0.0, 1.0)) else None
 
         for i in range(n_stn):
             ws_i = float(ff_arr[i]) if math.isfinite(float(ff_arr[i])) else float(fh_arr[i])
@@ -470,8 +496,20 @@ def load_knmi_hourly_validated_stations(nc_path: Path | str) -> List[Dict[str, A
             n_raw = float(n_okta_arr[i])
             tcc_val = (n_raw / 8.0) if (math.isfinite(n_raw) and 0.0 <= n_raw <= 8.0) else float("nan")
 
-            w1_raw = float(w1_arr[i])
-            obs_fog_w1 = int(round(w1_raw)) if (math.isfinite(w1_raw) and w1_raw in (0.0, 1.0)) else None
+            obs_fog_w1 = _flag01(float(w1_arr[i]))
+            obs_rain_w2 = _flag01(float(w2_arr[i]))
+            obs_snow_w3 = _flag01(float(w3_arr[i]))
+            obs_thunder_w5 = _flag01(float(w5_arr[i]))
+            obs_ice_w6 = _flag01(float(w6_arr[i]))
+            ww_raw = float(ww_arr[i])
+            obs_ww = int(round(ww_raw)) if (math.isfinite(ww_raw) and 0.0 <= ww_raw <= 99.0) else None
+            if obs_ww is not None:
+                obs_hail: Optional[int] = 1 if obs_ww in _WMO_4680_HAIL_CODES else 0
+                obs_shower: Optional[int] = 1 if obs_ww in _WMO_4680_SHOWER_CODES else 0
+            else:
+                obs_hail = None
+                obs_shower = 1 if obs_thunder_w5 == 1 else None
+
             vis_v = _knmi_vv_code_to_meters(float(vv_code_arr[i]))
             if not math.isfinite(vis_v) and obs_fog_w1 is not None:
                 vis_v = 500.0 if obs_fog_w1 == 1 else 10_000.0
@@ -497,6 +535,13 @@ def load_knmi_hourly_validated_stations(nc_path: Path | str) -> List[Dict[str, A
                 tcc=tcc_val,
                 obs_source="hourly-validated",
                 obs_fog_w1=obs_fog_w1,
+                obs_rain_w2=obs_rain_w2,
+                obs_snow_w3=obs_snow_w3,
+                obs_thunder_w5=obs_thunder_w5,
+                obs_ice_w6=obs_ice_w6,
+                obs_ww_code=obs_ww,
+                obs_hail=obs_hail,
+                obs_convective_shower=obs_shower,
                 reject_calm_dir=True,
             )
             if row is not None:
@@ -607,6 +652,7 @@ def sample_wx1_at_stations(
     stations: Sequence[Dict[str, Any]],
     *,
     prev_total_precip: Optional[np.ndarray] = None,
+    prev_precip_parts: Optional[Dict[str, np.ndarray]] = None,
     interval_h: float = 1.0,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Sample a forecast `.wx1` at KNMI station coordinates via exact projected bilinear interpolation."""
@@ -628,6 +674,14 @@ def sample_wx1_at_stations(
         vis_m = np.asarray(ds["vis_m"].values, dtype=np.float64) if "vis_m" in ds else np.full_like(t2m_c, np.nan)
         sw_down = np.asarray(ds["sw_down"].values, dtype=np.float64) if "sw_down" in ds else np.full_like(t2m_c, np.nan)
         tcc = np.asarray(ds["tcc"].values, dtype=np.float64) if "tcc" in ds else np.full_like(t2m_c, np.nan)
+        cape_mu = np.asarray(ds["cape_mu"].values, dtype=np.float64) if "cape_mu" in ds else np.full_like(t2m_c, np.nan)
+        cin_sb = np.asarray(ds["cin_sb"].values, dtype=np.float64) if "cin_sb" in ds else np.full_like(t2m_c, np.nan)
+        iwp = np.asarray(ds["iwp"].values, dtype=np.float64) if "iwp" in ds else np.full_like(t2m_c, np.nan)
+        frzlvl_m = (
+            np.asarray(ds["freezing_level_m"].values, dtype=np.float64)
+            if "freezing_level_m" in ds
+            else np.full_like(t2m_c, np.nan)
+        )
         wx1_attrs = {
             str(k): str(ds.attrs[k])
             for k in (
@@ -664,6 +718,17 @@ def sample_wx1_at_stations(
         else:
             precip_step_mm = np.zeros_like(tot_precip_mm)
 
+        def _part_delta(cur: np.ndarray, key: str) -> np.ndarray:
+            if prev_precip_parts is not None and key in prev_precip_parts:
+                prev = prev_precip_parts[key]
+                if isinstance(prev, np.ndarray) and prev.shape == cur.shape:
+                    return np.maximum(0.0, cur - prev)
+            return np.zeros_like(cur)
+
+        rain_step_mm = _part_delta(rain_acc, "rain_acc")
+        snow_step_mm = _part_delta(snow_acc, "snow_acc")
+        graup_step_mm = _part_delta(graup_acc, "graupel_acc")
+
         x_coords = np.asarray(ds.coords["x"].values, dtype=np.float64) if "x" in ds.coords else None
         y_coords = np.asarray(ds.coords["y"].values, dtype=np.float64) if "y" in ds.coords else None
 
@@ -681,6 +746,28 @@ def sample_wx1_at_stations(
         except Exception:
             use_proj = False
 
+    fields_2d = {
+        "mod_t2m_c": t2m_c,
+        "mod_td2m_c": td2m_c,
+        "mod_rh_pct": rh_pct,
+        "mod_mslp_hpa": mslp_hpa,
+        "mod_u10_ms": u10,
+        "mod_v10_ms": v10,
+        "mod_gust10_ms": gust10,
+        "mod_vis_m": vis_m,
+        "mod_sw_down_wm2": sw_down,
+        "mod_tcc": tcc,
+        "mod_precip_mmh": precip_mmh,
+        "mod_precip_step_mm": precip_step_mm,
+        "mod_rain_step_mm": rain_step_mm,
+        "mod_snow_step_mm": snow_step_mm,
+        "mod_graupel_step_mm": graup_step_mm,
+        "mod_cape_mu": cape_mu,
+        "mod_cin_sb": cin_sb,
+        "mod_iwp": iwp,
+        "mod_freezing_level_m": frzlvl_m,
+    }
+
     if use_proj:
         assert x_coords is not None and y_coords is not None
         x_asc = bool(x_coords[-1] > x_coords[0])
@@ -692,76 +779,34 @@ def sample_wx1_at_stations(
         i0_a = np.clip(np.searchsorted(xc, sx, side="right") - 1, 0, nx - 2)
         i1_a = i0_a + 1
         wx = np.clip((sx - xc[i0_a]) / np.maximum(xc[i1_a] - xc[i0_a], 1e-12), 0.0, 1.0)
-        if not x_asc:
-            i0, i1 = (nx - 1) - i0_a, (nx - 1) - i1_a
-        else:
-            i0, i1 = i0_a, i1_a
+        i0, i1 = (i0_a, i1_a) if x_asc else ((nx - 1) - i0_a, (nx - 1) - i1_a)
 
         j0_a = np.clip(np.searchsorted(yc, sy, side="right") - 1, 0, ny - 2)
         j1_a = j0_a + 1
         wy = np.clip((sy - yc[j0_a]) / np.maximum(yc[j1_a] - yc[j0_a], 1e-12), 0.0, 1.0)
-        if not y_asc:
-            j0, j1 = (ny - 1) - j0_a, (ny - 1) - j1_a
-        else:
-            j0, j1 = j0_a, j1_a
+        j0, j1 = (j0_a, j1_a) if y_asc else ((ny - 1) - j0_a, (ny - 1) - j1_a)
 
-        m_t2m = _sample_2d_bilinear(t2m_c, j0, j1, i0, i1, wy, wx)
-        m_td2m = _sample_2d_bilinear(td2m_c, j0, j1, i0, i1, wy, wx)
-        m_rh = _sample_2d_bilinear(rh_pct, j0, j1, i0, i1, wy, wx)
-        m_mslp = _sample_2d_bilinear(mslp_hpa, j0, j1, i0, i1, wy, wx)
-        m_u10 = _sample_2d_bilinear(u10, j0, j1, i0, i1, wy, wx)
-        m_v10 = _sample_2d_bilinear(v10, j0, j1, i0, i1, wy, wx)
-        m_gust = _sample_2d_bilinear(gust10, j0, j1, i0, i1, wy, wx)
-        m_vis = _sample_2d_bilinear(vis_m, j0, j1, i0, i1, wy, wx)
-        m_sw = _sample_2d_bilinear(sw_down, j0, j1, i0, i1, wy, wx)
-        m_tcc = _sample_2d_bilinear(tcc, j0, j1, i0, i1, wy, wx)
-        m_pr = _sample_2d_bilinear(precip_mmh, j0, j1, i0, i1, wy, wx)
-        m_p1h = _sample_2d_bilinear(precip_step_mm, j0, j1, i0, i1, wy, wx)
+        sampled = {fk: _sample_2d_bilinear(arr, j0, j1, i0, i1, wy, wx) for fk, arr in fields_2d.items()}
     else:
         tree = cKDTree(np.column_stack([lat2d.ravel(), lon2d.ravel()]))
         dist, idx = tree.query(np.column_stack([st_lats, st_lons]))
         inside = dist <= 0.15
         jj = idx // nx
         ii = idx % nx
-        m_t2m = t2m_c[jj, ii]
-        m_td2m = td2m_c[jj, ii]
-        m_rh = rh_pct[jj, ii]
-        m_mslp = mslp_hpa[jj, ii]
-        m_u10 = u10[jj, ii]
-        m_v10 = v10[jj, ii]
-        m_gust = gust10[jj, ii]
-        m_vis = vis_m[jj, ii]
-        m_sw = sw_down[jj, ii]
-        m_tcc = tcc[jj, ii]
-        m_pr = precip_mmh[jj, ii]
-        m_p1h = precip_step_mm[jj, ii]
+        sampled = {fk: arr[jj, ii] for fk, arr in fields_2d.items()}
 
     matched: List[Dict[str, Any]] = []
     for k, stn in enumerate(stations):
         if not bool(inside[k]):
             continue
-        mu, mv = float(m_u10[k]), float(m_v10[k])
+        mu, mv = float(sampled["mod_u10_ms"][k]), float(sampled["mod_v10_ms"][k])
         mws = math.hypot(mu, mv) if (math.isfinite(mu) and math.isfinite(mv)) else float("nan")
         mwd = (math.degrees(math.atan2(-mu, -mv)) % 360.0) if (math.isfinite(mu) and math.isfinite(mv) and mws > 1e-4) else float("nan")
         row = dict(stn)
-        row.update(
-            {
-                "mod_t2m_c": float(m_t2m[k]),
-                "mod_td2m_c": float(m_td2m[k]),
-                "mod_rh_pct": float(m_rh[k]),
-                "mod_mslp_hpa": float(m_mslp[k]),
-                "mod_u10_ms": mu,
-                "mod_v10_ms": mv,
-                "mod_ws10_ms": mws,
-                "mod_wd10_deg": mwd,
-                "mod_gust10_ms": float(m_gust[k]),
-                "mod_vis_m": float(m_vis[k]),
-                "mod_sw_down_wm2": float(m_sw[k]),
-                "mod_tcc": float(m_tcc[k]),
-                "mod_precip_mmh": float(m_pr[k]),
-                "mod_precip_step_mm": float(m_p1h[k]),
-            }
-        )
+        for fk, arr in sampled.items():
+            row[fk] = float(arr[k])
+        row["mod_ws10_ms"] = mws
+        row["mod_wd10_deg"] = mwd
         matched.append(row)
 
     rw = min(16, max(1, ny // 6), max(1, nx // 6))
@@ -782,6 +827,9 @@ def sample_wx1_at_stations(
         "precip_mmh": precip_mmh,
         "tot_precip_mm": tot_precip_mm,
         "precip_step_mm": precip_step_mm,
+        "rain_acc": rain_acc,
+        "snow_acc": snow_acc,
+        "graupel_acc": graup_acc,
         "rim_max_mmh": float(np.max(precip_mmh[rim_mask])),
         "int_max_mmh": float(np.max(precip_mmh[~rim_mask])),
         "nl_max_mmh": float(np.max(precip_mmh[nl_mask])) if np.any(nl_mask) else float("nan"),
@@ -901,6 +949,60 @@ def compute_fog_contingency(
     }
 
 
+def compute_binary_contingency(
+    mod_yes: Sequence[Optional[bool]],
+    obs_yes: Sequence[Optional[bool]],
+) -> Dict[str, Any]:
+    """Compute 2x2 dichotomous weather-event contingency counts, POD, FAR, CSI, and frequency bias."""
+    hits = misses = fa = cn = n = 0
+    for m, o in zip(mod_yes, obs_yes):
+        if m is None or o is None:
+            continue
+        mb = bool(m)
+        ob = bool(o)
+        n += 1
+        if mb and ob:
+            hits += 1
+        elif (not mb) and ob:
+            misses += 1
+        elif mb and (not ob):
+            fa += 1
+        else:
+            cn += 1
+    pod = float(hits / (hits + misses)) if (hits + misses) > 0 else float("nan")
+    far = float(fa / (hits + fa)) if (hits + fa) > 0 else float("nan")
+    csi = float(hits / (hits + misses + fa)) if (hits + misses + fa) > 0 else float("nan")
+    fb = float((hits + fa) / (hits + misses)) if (hits + misses) > 0 else float("nan")
+    return {
+        "n": n,
+        "obs_yes": hits + misses,
+        "mod_yes": hits + fa,
+        "hits": hits,
+        "misses": misses,
+        "false_alarms": fa,
+        "correct_negatives": cn,
+        "pod": pod,
+        "far": far,
+        "csi": csi,
+        "freq_bias": fb,
+    }
+
+
+def _mod_thunder_indicator(row: Dict[str, Any]) -> Optional[bool]:
+    """Classical microphysics+instability thunder diagnostic (graupel+CAPE/precip or deep IWP+CAPE)."""
+    gr = float(row.get("mod_graupel_step_mm", float("nan")))
+    cape = float(row.get("mod_cape_mu", float("nan")))
+    iwp = float(row.get("mod_iwp", float("nan")))
+    pr = float(row.get("mod_precip_cmp", row.get("mod_precip_step_mm", float("nan"))))
+    if not math.isfinite(gr) and not math.isfinite(cape):
+        return None
+    if math.isfinite(gr) and gr >= 0.05 and ((math.isfinite(cape) and cape >= 50.0) or (math.isfinite(pr) and pr >= 0.5)):
+        return True
+    if math.isfinite(cape) and cape >= 300.0 and math.isfinite(iwp) and iwp >= 0.25 and math.isfinite(pr) and pr >= 1.5:
+        return True
+    return False
+
+
 def compute_fractions_skill_score(
     mod_mm: np.ndarray,
     obs_mm: np.ndarray,
@@ -1016,7 +1118,10 @@ def _summarize_matched_rows(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     mslp = compute_continuous_stats([r["mod_mslp_hpa"] for r in rows], [r["mslp_hpa"] for r in rows])
     ws10 = compute_continuous_stats([r["mod_ws10_ms"] for r in rows], [r["ws10_ms"] for r in rows])
     gust = compute_continuous_stats([r["mod_gust10_ms"] for r in rows], [r["gust10_ms"] for r in rows])
-    precip = compute_continuous_stats([r["mod_precip_cmp"] for r in rows], [r["obs_precip_cmp"] for r in rows])
+    precip = compute_continuous_stats(
+        [r.get("mod_precip_cmp", float("nan")) for r in rows],
+        [r.get("obs_precip_cmp", float("nan")) for r in rows],
+    )
     sw_down = compute_continuous_stats(
         [r.get("mod_sw_down_wm2", float("nan")) for r in rows],
         [r.get("sw_down_wm2", float("nan")) for r in rows],
@@ -1031,6 +1136,81 @@ def _summarize_matched_rows(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         [r["ws10_ms"] for r in rows],
     )
     fog = compute_fog_contingency([r["mod_vis_m"] for r in rows], [r["vis_m"] for r in rows])
+
+    def _ge(val: Any, thr: float) -> Optional[bool]:
+        fv = float(val) if val is not None else float("nan")
+        return (fv >= thr) if math.isfinite(fv) else None
+
+    def _obs_flag(r: Dict[str, Any], key: str, *, need_positive_lead: bool = False) -> Optional[bool]:
+        if need_positive_lead and float(r.get("lead_hours", 0.0)) <= 0.0:
+            return None
+        v = r.get(key)
+        return (int(v) == 1) if v is not None else None
+
+    def _mod_species(r: Dict[str, Any], key: str, thr: float) -> Optional[bool]:
+        if float(r.get("lead_hours", 0.0)) <= 0.0:
+            return None
+        return _ge(r.get(key), thr)
+
+    def _mod_freezing_rain(r: Dict[str, Any]) -> Optional[bool]:
+        if float(r.get("lead_hours", 0.0)) <= 0.0:
+            return None
+        mt = float(r.get("mod_t2m_c", float("nan")))
+        mr = float(r.get("mod_rain_step_mm", float("nan")))
+        if not (math.isfinite(mt) and math.isfinite(mr)):
+            return None
+        return (mt <= 0.5) and (mr >= 0.05)
+
+    events = {
+        "rain_0p1mm": compute_binary_contingency(
+            [_ge(r.get("mod_precip_cmp"), 0.1) for r in rows],
+            [_ge(r.get("obs_precip_cmp"), 0.1) for r in rows],
+        ),
+        "rain_2mm": compute_binary_contingency(
+            [_ge(r.get("mod_precip_cmp"), 2.0) for r in rows],
+            [_ge(r.get("obs_precip_cmp"), 2.0) for r in rows],
+        ),
+        "gust_15ms": compute_binary_contingency(
+            [_ge(r.get("mod_gust10_ms"), 15.0) for r in rows],
+            [_ge(r.get("gust10_ms"), 15.0) for r in rows],
+        ),
+        "gust_20ms": compute_binary_contingency(
+            [_ge(r.get("mod_gust10_ms"), 20.0) for r in rows],
+            [_ge(r.get("gust10_ms"), 20.0) for r in rows],
+        ),
+        "snow": compute_binary_contingency(
+            [_mod_species(r, "mod_snow_step_mm", 0.05) for r in rows],
+            [_obs_flag(r, "obs_snow_w3", need_positive_lead=True) for r in rows],
+        ),
+        "hail_graupel": compute_binary_contingency(
+            [_mod_species(r, "mod_graupel_step_mm", 0.05) for r in rows],
+            [_obs_flag(r, "obs_hail", need_positive_lead=True) for r in rows],
+        ),
+        "thunder": compute_binary_contingency(
+            [(_mod_thunder_indicator(r) if float(r.get("lead_hours", 0.0)) > 0.0 else None) for r in rows],
+            [_obs_flag(r, "obs_thunder_w5", need_positive_lead=True) for r in rows],
+        ),
+        "ice_freezing_rain": compute_binary_contingency(
+            [_mod_freezing_rain(r) for r in rows],
+            [_obs_flag(r, "obs_ice_w6", need_positive_lead=True) for r in rows],
+        ),
+    }
+
+    def _nanmax_vals(key: str) -> float:
+        vals = [float(r[key]) for r in rows if r.get(key) is not None and math.isfinite(float(r[key]))]
+        return max(vals) if vals else float("nan")
+
+    convection_diag = {
+        "mod_cape_mu_max": _nanmax_vals("mod_cape_mu"),
+        "mod_graupel_max_mm": _nanmax_vals("mod_graupel_step_mm"),
+        "mod_snow_max_mm": _nanmax_vals("mod_snow_step_mm"),
+        "obs_thunder_hrs": sum(1 for r in rows if r.get("obs_thunder_w5") == 1),
+        "obs_snow_hrs": sum(1 for r in rows if r.get("obs_snow_w3") == 1),
+        "obs_hail_hrs": sum(1 for r in rows if r.get("obs_hail") == 1),
+        "obs_ice_hrs": sum(1 for r in rows if r.get("obs_ice_w6") == 1),
+        "obs_shower_hrs": sum(1 for r in rows if r.get("obs_convective_shower") == 1),
+    }
+
     n_station_hours = len(rows)
     unique_ids = {str(r["station_id"]) for r in rows if r.get("station_id")}
     n_unique_stations = len(unique_ids) if unique_ids else n_station_hours
@@ -1049,6 +1229,8 @@ def _summarize_matched_rows(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         "precip": precip,
         "sw_down": sw_down,
         "tcc": tcc,
+        "events": events,
+        "convection_diag": convection_diag,
     }
 
 
@@ -1232,9 +1414,9 @@ def sample_ifs_grib_at_stations(
 
 
 def compute_skill_score_vs_ifs(tempest_stats: Dict[str, Any], ifs_stats: Dict[str, Any]) -> Dict[str, Any]:
-    """Compute RMSE Skill Score (SS = 1 - RMSE_Tempest / RMSE_IFS; >0 means Tempest beats IFS)."""
+    """Compute RMSE Skill Score (SS = 1 - RMSE_Tempest / RMSE_Ref; >0 means Tempest beats IFS/ERA5)."""
     out: Dict[str, Any] = {}
-    for key in ("t2m", "td2m", "rh", "mslp", "ws10"):
+    for key in ("t2m", "td2m", "rh", "mslp", "ws10", "gust10", "sw_down", "tcc", "precip"):
         tb = tempest_stats.get(key, {})
         ib = ifs_stats.get(key, {})
         rt = float(tb.get("rmse", float("nan")))
@@ -1266,26 +1448,386 @@ def _align_rows_with_ifs(
     tempest_rows: Sequence[Dict[str, Any]],
     ifs_rows: Sequence[Dict[str, Any]],
 ) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
-    """Align Tempest & IFS station rows per (valid_time_utc, station_id) and mask missing IFS vars."""
+    """Align Tempest & IFS/ERA5 station rows per `(valid_time_utc, station_id)` and mask missing ref vars."""
     ifs_idx = {
         (str(r.get("valid_time_utc", "")), str(r.get("station_id", ""))): r
         for r in ifs_rows
     }
     t_aligned: List[Dict[str, Any]] = []
     i_aligned: List[Dict[str, Any]] = []
+    mask_keys = (
+        "mod_t2m_c",
+        "mod_td2m_c",
+        "mod_rh_pct",
+        "mod_mslp_hpa",
+        "mod_ws10_ms",
+        "mod_wd10_deg",
+        "mod_gust10_ms",
+        "mod_sw_down_wm2",
+        "mod_tcc",
+        "mod_precip_cmp",
+    )
     for tr in tempest_rows:
         key = (str(tr.get("valid_time_utc", "")), str(tr.get("station_id", "")))
         ir = ifs_idx.get(key)
         if ir is None:
             continue
         tc = dict(tr)
-        for mod_k in ("mod_t2m_c", "mod_td2m_c", "mod_rh_pct", "mod_mslp_hpa", "mod_ws10_ms", "mod_wd10_deg"):
-            iv = float(ir.get(mod_k, float("nan")))
+        ic = dict(ir)
+        for copy_k in ("lead_hours", "obs_precip_cmp", "precip_unit"):
+            if copy_k in tr and (copy_k not in ic or (isinstance(ic[copy_k], float) and not math.isfinite(ic[copy_k]))):
+                ic[copy_k] = tr[copy_k]
+        for mod_k in mask_keys:
+            raw_iv = ic.get(mod_k, float("nan"))
+            iv = float(raw_iv) if raw_iv is not None else float("nan")
             if not math.isfinite(iv):
                 tc[mod_k] = float("nan")
         t_aligned.append(tc)
-        i_aligned.append(ir)
+        i_aligned.append(ic)
     return t_aligned, i_aligned
+
+
+def _select_era5_time_slice(era5_ds: xr.Dataset, valid_dt: Optional[datetime.datetime] = None) -> xr.Dataset:
+    if "time" not in era5_ds.dims:
+        return era5_ds
+    if era5_ds.sizes["time"] <= 1 or valid_dt is None:
+        return era5_ds.isel(time=0)
+    t_target = np.datetime64(_to_utc(valid_dt).replace(tzinfo=None), "s")
+    return era5_ds.sel(time=t_target, method="nearest")
+
+
+def sample_era5_at_stations(
+    era5_ds: xr.Dataset,
+    stations: Sequence[Dict[str, Any]],
+    *,
+    valid_dt: Optional[datetime.datetime] = None,
+) -> List[Dict[str, Any]]:
+    """Sample ARCO-ERA5 0.25-deg surface fields bilinearly at KNMI station coordinates."""
+    if not stations:
+        return []
+    ds_t = _select_era5_time_slice(era5_ds, valid_dt)
+    lat_k = next(c for c in ("latitude", "lat") if c in ds_t.coords or c in ds_t.variables)
+    lon_k = next(c for c in ("longitude", "lon") if c in ds_t.coords or c in ds_t.variables)
+    lats = np.asarray(ds_t[lat_k].values, dtype=np.float64)
+    lons = np.asarray(ds_t[lon_k].values, dtype=np.float64)
+    st_lats = np.array([float(s["lat"]) for s in stations], dtype=np.float64)
+    st_lons = np.array([float(s["lon"]) for s in stations], dtype=np.float64)
+    n = len(stations)
+
+    def _sample_key(aliases: Tuple[str, ...]) -> np.ndarray:
+        for k in aliases:
+            if k in ds_t.data_vars:
+                arr = np.asarray(ds_t[k].values, dtype=np.float64)
+                while arr.ndim > 2:
+                    arr = arr[0]
+                return _bilinear_sample_latlon_2d(arr, lats, lons, st_lats, st_lons)
+        return np.full(n, np.nan, dtype=np.float64)
+
+    t2m_c = _sample_key(("2m_temperature", "t2m")) - 273.15
+    td2m_c = _sample_key(("2m_dewpoint_temperature", "d2m")) - 273.15
+    mslp_hpa = _sample_key(("mean_sea_level_pressure", "msl")) * 0.01
+    u10 = _sample_key(("10m_u_component_of_wind", "u10"))
+    v10 = _sample_key(("10m_v_component_of_wind", "v10"))
+    gust10 = _sample_key(("10m_wind_gust_since_previous_post_processing", "fg10", "instantaneous_10m_wind_gust", "i10fg"))
+    tcc_raw = _sample_key(("total_cloud_cover", "tcc"))
+    tcc = np.where(np.isfinite(tcc_raw), np.clip(tcc_raw, 0.0, 1.0), np.nan)
+    ssrd_raw = _sample_key(("surface_solar_radiation_downwards", "ssrd"))
+    sw_down = np.where(np.isfinite(ssrd_raw), np.maximum(0.0, ssrd_raw / 3600.0), np.nan)
+    tp_raw = _sample_key(("total_precipitation", "tp"))
+    tp_mm = np.where(np.isfinite(tp_raw), np.maximum(0.0, tp_raw * 1000.0), np.nan)
+
+    rh_pct = np.full(n, np.nan, dtype=np.float64)
+    valid_td = np.isfinite(t2m_c) & np.isfinite(td2m_c)
+    if np.any(valid_td):
+        tc = t2m_c[valid_td]
+        td = np.minimum(td2m_c[valid_td], tc)
+        rh_pct[valid_td] = np.clip(
+            100.0 * np.exp((17.625 * td) / (243.04 + td) - (17.625 * tc) / (243.04 + tc)),
+            0.0,
+            100.0,
+        )
+
+    matched: List[Dict[str, Any]] = []
+    for k, stn in enumerate(stations):
+        mu, mv = float(u10[k]), float(v10[k])
+        has_wind = math.isfinite(mu) and math.isfinite(mv)
+        mws = math.hypot(mu, mv) if has_wind else float("nan")
+        mwd = (math.degrees(math.atan2(-mu, -mv)) % 360.0) if (has_wind and mws > 1e-4) else float("nan")
+        row = dict(stn)
+        row.update(
+            {
+                "mod_t2m_c": float(t2m_c[k]),
+                "mod_td2m_c": float(td2m_c[k]),
+                "mod_rh_pct": float(rh_pct[k]),
+                "mod_mslp_hpa": float(mslp_hpa[k]),
+                "mod_u10_ms": mu,
+                "mod_v10_ms": mv,
+                "mod_ws10_ms": mws,
+                "mod_wd10_deg": mwd,
+                "mod_gust10_ms": float(gust10[k]),
+                "mod_vis_m": float("nan"),
+                "mod_sw_down_wm2": float(sw_down[k]),
+                "mod_tcc": float(tcc[k]),
+                "mod_precip_mmh": float(tp_mm[k]),
+                "mod_precip_step_mm": float(tp_mm[k]),
+                "obs_precip_cmp": float("nan"),
+                "mod_precip_cmp": float(tp_mm[k]),
+            }
+        )
+        matched.append(row)
+    return matched
+
+
+def compute_upper_air_vs_era5(
+    wx1_path: Path | str,
+    era5_ds: xr.Dataset,
+    *,
+    rim_width: int = 16,
+    valid_dt: Optional[datetime.datetime] = None,
+) -> Dict[str, Any]:
+    """Compare interior Tempest `.wx1` synoptic & 850/500 hPa fields directly against ARCO-ERA5 0.25-deg."""
+    with wx1.open_dataset(Path(wx1_path)) as ds_m:
+        lat2d = np.asarray(ds_m["lat"].values, dtype=np.float64)
+        lon2d = np.asarray(ds_m["lon"].values, dtype=np.float64)
+        ny, nx = lat2d.shape
+        rw = min(int(rim_width), max(0, ny // 6), max(0, nx // 6))
+        if (ny - 2 * rw) < 2 or (nx - 2 * rw) < 2:
+            rw = 0
+        sy, sx = slice(rw, ny - rw), slice(rw, nx - rw)
+
+        lat_int = lat2d[sy, sx].ravel()
+        lon_int = lon2d[sy, sx].ravel()
+        mslp_int = np.asarray(ds_m["mslp"].values, dtype=np.float64)[sy, sx].ravel() * 0.01
+        t2m_int = np.asarray(ds_m["t2m"].values, dtype=np.float64)[sy, sx].ravel() - 273.15
+
+        plev_k = next((c for c in ("plev", "level") if c in ds_m.coords or c in ds_m.variables), None)
+        t850_m = gh500_m = w850_m = w500_m = q850_m = None
+        if plev_k is not None:
+            plev_raw = np.asarray(ds_m[plev_k].values, dtype=np.float64)
+            plev_pa = plev_raw * 100.0 if (plev_raw.size > 0 and float(np.max(plev_raw)) < 2000.0) else plev_raw
+            i850 = int(np.argmin(np.abs(plev_pa - 85_000.0)))
+            i500 = int(np.argmin(np.abs(plev_pa - 50_000.0)))
+            has850 = abs(float(plev_pa[i850]) - 85_000.0) <= 2500.0
+            has500 = abs(float(plev_pa[i500]) - 50_000.0) <= 2500.0
+
+            def _pl2(name: str, kidx: int) -> Optional[np.ndarray]:
+                if name not in ds_m:
+                    return None
+                arr = np.asarray(ds_m[name].values, dtype=np.float64)
+                while arr.ndim > 3:
+                    arr = arr[0]
+                return arr[kidx, sy, sx].ravel()
+
+            if has850:
+                t850_m = _pl2("t_pl", i850)
+                u850, v850 = _pl2("u_pl", i850), _pl2("v_pl", i850)
+                if u850 is not None and v850 is not None:
+                    w850_m = np.hypot(u850, v850)
+                q850_raw = _pl2("q_pl", i850)
+                if q850_raw is not None:
+                    q850_m = q850_raw * 1000.0
+            if has500:
+                gh500_m = _pl2("gh_pl", i500)
+                if gh500_m is None:
+                    z500_raw = _pl2("z_pl", i500)
+                    if z500_raw is not None:
+                        gh500_m = z500_raw / 9.80665
+                u500, v500 = _pl2("u_pl", i500), _pl2("v_pl", i500)
+                if u500 is not None and v500 is not None:
+                    w500_m = np.hypot(u500, v500)
+
+    ds_e = _select_era5_time_slice(era5_ds, valid_dt)
+    elat_k = next(c for c in ("latitude", "lat") if c in ds_e.coords or c in ds_e.variables)
+    elon_k = next(c for c in ("longitude", "lon") if c in ds_e.coords or c in ds_e.variables)
+    e_lats = np.asarray(ds_e[elat_k].values, dtype=np.float64)
+    e_lons = np.asarray(ds_e[elon_k].values, dtype=np.float64)
+
+    def _regrid_e2(aliases: Tuple[str, ...]) -> Optional[np.ndarray]:
+        for ak in aliases:
+            if ak in ds_e.data_vars:
+                arr = np.asarray(ds_e[ak].values, dtype=np.float64)
+                while arr.ndim > 2:
+                    arr = arr[0]
+                return _bilinear_sample_latlon_2d(arr, e_lats, e_lons, lat_int, lon_int)
+        return None
+
+    e_mslp_raw = _regrid_e2(("mean_sea_level_pressure", "msl"))
+    e_t2m_raw = _regrid_e2(("2m_temperature", "t2m"))
+    empty_stat = compute_continuous_stats([], [])
+    out: Dict[str, Any] = {
+        "n_points": int(lat_int.size),
+        "mslp_hpa": compute_continuous_stats(mslp_int, e_mslp_raw * 0.01) if e_mslp_raw is not None else dict(empty_stat),
+        "t2m_c": compute_continuous_stats(t2m_int, e_t2m_raw - 273.15) if e_t2m_raw is not None else dict(empty_stat),
+        "t850_k": dict(empty_stat),
+        "gh500_m": dict(empty_stat),
+        "wspd850_ms": dict(empty_stat),
+        "wspd500_ms": dict(empty_stat),
+        "q850_gkg": dict(empty_stat),
+    }
+
+    elvl_k = next((c for c in ("level", "plev") if c in ds_e.coords or c in ds_e.variables), None)
+    if elvl_k is not None:
+        elvl_raw = np.asarray(ds_e[elvl_k].values, dtype=np.float64)
+        elvl_hpa = elvl_raw * 0.01 if (elvl_raw.size > 0 and float(np.max(elvl_raw)) > 2000.0) else elvl_raw
+        ei850 = int(np.argmin(np.abs(elvl_hpa - 850.0)))
+        ei500 = int(np.argmin(np.abs(elvl_hpa - 500.0)))
+        ehas850 = abs(float(elvl_hpa[ei850]) - 850.0) <= 25.0
+        ehas500 = abs(float(elvl_hpa[ei500]) - 500.0) <= 25.0
+
+        def _regrid_e3(aliases: Tuple[str, ...], kidx: int) -> Optional[np.ndarray]:
+            for ak in aliases:
+                if ak in ds_e.data_vars:
+                    arr = np.asarray(ds_e[ak].values, dtype=np.float64)
+                    while arr.ndim > 3:
+                        arr = arr[0]
+                    return _bilinear_sample_latlon_2d(arr[kidx], e_lats, e_lons, lat_int, lon_int)
+            return None
+
+        if ehas850:
+            if t850_m is not None:
+                e_t850 = _regrid_e3(("temperature", "t"), ei850)
+                if e_t850 is not None:
+                    out["t850_k"] = compute_continuous_stats(t850_m, e_t850)
+            if w850_m is not None:
+                eu850 = _regrid_e3(("u_component_of_wind", "u"), ei850)
+                ev850 = _regrid_e3(("v_component_of_wind", "v"), ei850)
+                if eu850 is not None and ev850 is not None:
+                    out["wspd850_ms"] = compute_continuous_stats(w850_m, np.hypot(eu850, ev850))
+            if q850_m is not None:
+                e_q850 = _regrid_e3(("specific_humidity", "q"), ei850)
+                if e_q850 is not None:
+                    out["q850_gkg"] = compute_continuous_stats(q850_m, e_q850 * 1000.0)
+        if ehas500:
+            if gh500_m is not None:
+                e_z500 = _regrid_e3(("geopotential", "z"), ei500)
+                if e_z500 is not None:
+                    out["gh500_m"] = compute_continuous_stats(gh500_m, e_z500 / 9.80665)
+            if w500_m is not None:
+                eu500 = _regrid_e3(("u_component_of_wind", "u"), ei500)
+                ev500 = _regrid_e3(("v_component_of_wind", "v"), ei500)
+                if eu500 is not None and ev500 is not None:
+                    out["wspd500_ms"] = compute_continuous_stats(w500_m, np.hypot(eu500, ev500))
+    return out
+
+
+_ERA5_VERIFY_3D_PAIRS: Tuple[Tuple[str, str], ...] = (
+    ("geopotential", "z"),
+    ("temperature", "t"),
+    ("specific_humidity", "q"),
+    ("u_component_of_wind", "u"),
+    ("v_component_of_wind", "v"),
+)
+_ERA5_VERIFY_2D_PAIRS: Tuple[Tuple[str, str], ...] = (
+    ("mean_sea_level_pressure", "msl"),
+    ("2m_temperature", "t2m"),
+    ("2m_dewpoint_temperature", "d2m"),
+    ("10m_u_component_of_wind", "u10"),
+    ("10m_v_component_of_wind", "v10"),
+    ("10m_wind_gust_since_previous_post_processing", "fg10"),
+    ("total_cloud_cover", "tcc"),
+    ("surface_solar_radiation_downwards", "ssrd"),
+    ("total_precipitation", "tp"),
+)
+
+
+def _load_era5_verify_slice(
+    valid_dt: datetime.datetime,
+    lat2d: np.ndarray,
+    lon2d: np.ndarray,
+    era5_cache_dir: Optional[Path | str],
+    opened_era5_ds: Optional[xr.Dataset],
+    *,
+    allow_cache_write: bool = True,
+) -> Tuple[Optional[xr.Dataset], Optional[xr.Dataset]]:
+    """Load or lazily slice a lightweight ARCO-ERA5 verification subset (`sfc + 850/500 hPa`)."""
+    v_dt = _to_utc(valid_dt)
+    cdir = Path(era5_cache_dir) if era5_cache_dir is not None else None
+    verify_cache = (cdir / f"era5_verify_0p25_{v_dt:%Y%m%d_%H}Z.wx1") if cdir is not None else None
+    if verify_cache is not None and verify_cache.is_file() and verify_cache.stat().st_size > 1024:
+        try:
+            with wx1.open_dataset(verify_cache) as ds_c:
+                return ds_c.load(), opened_era5_ds
+        except Exception:
+            pass
+
+    ds_src = opened_era5_ds
+    if ds_src is None:
+        from tempest_v2.ingest_era5 import open_arco_era5_dataset
+
+        ds_src = open_arco_era5_dataset()
+
+    from tempest_v2.ingest_era5 import _extract_lon_wrapped_subset
+
+    pairs: List[Tuple[str, str]] = []
+    for long_k, short_k in _ERA5_VERIFY_3D_PAIRS + _ERA5_VERIFY_2D_PAIRS:
+        if long_k in ds_src.data_vars:
+            pairs.append((long_k, short_k))
+        elif short_k in ds_src.data_vars:
+            pairs.append((short_k, short_k))
+    if not pairs:
+        return None, ds_src
+
+    ds_sel = ds_src[[src for src, _ in pairs]]
+    if "time" in ds_sel.dims:
+        t_target = np.datetime64(v_dt.replace(tzinfo=None), "s")
+        ds_t = ds_sel.sel(time=t_target, method="nearest")
+        sel_sec = int(np.datetime64(ds_t["time"].values, "ns").astype("datetime64[s]").astype(np.int64))
+        if abs(sel_sec - int(v_dt.timestamp())) > 1800:
+            raise ValueError(f"ERA5 archive does not contain {v_dt.isoformat()}")
+    else:
+        ds_t = ds_sel
+
+    lat_min = max(-90.0, float(np.min(lat2d)) - 2.0)
+    lat_max = min(90.0, float(np.max(lat2d)) + 2.0)
+    lon_180 = ((np.asarray(lon2d, dtype=np.float64) + 180.0) % 360.0) - 180.0
+    lon_min = max(-180.0, float(np.min(lon_180)) - 2.0)
+    lon_max = min(180.0, float(np.max(lon_180)) + 2.0)
+    ds_sub = _extract_lon_wrapped_subset(ds_t, lat_min, lat_max, lon_min, lon_max)
+
+    elvl_k = next((c for c in ("level", "plev") if c in ds_sub.coords), None)
+    if elvl_k is not None:
+        lvls = np.asarray(ds_sub[elvl_k].values, dtype=np.float64)
+        pick = [lvls[int(np.argmin(np.abs(lvls - tgt)))] for tgt in (850.0, 500.0) if np.min(np.abs(lvls - tgt)) <= 25.0]
+        if pick:
+            ds_sub = ds_sub.sel({elvl_k: sorted(set(pick), reverse=True)})
+
+    ds_loaded = ds_sub.load()
+    rename_map = {src: short for src, short in pairs if src != short and src in ds_loaded.data_vars}
+    if rename_map:
+        ds_loaded = ds_loaded.rename(rename_map)
+
+    if allow_cache_write and verify_cache is not None:
+        try:
+            verify_cache.parent.mkdir(parents=True, exist_ok=True)
+            wx1.write_dataset(
+                verify_cache,
+                ds_loaded,
+                dataset_id=f"era5_verify_{v_dt:%Y%m%d_%H}Z",
+                codec="zstd_shuffle",
+                workers=2,
+            )
+        except Exception as exc:
+            logger.debug("Skipping ERA5 verify cache write (%s): %s", verify_cache, exc)
+    return ds_loaded, ds_src
+
+
+def _aggregate_upper_air_records(records: Sequence[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    valid = [r for r in records if isinstance(r, dict) and r]
+    if not valid:
+        return None
+    out: Dict[str, Any] = {"n_hours": len(valid)}
+    keys = ("mslp_hpa", "t2m_c", "t850_k", "gh500_m", "wspd850_ms", "wspd500_ms", "q850_gkg")
+    for k in keys:
+        biases = [float(r[k]["bias"]) for r in valid if k in r and math.isfinite(float(r[k].get("bias", float("nan"))))]
+        rmses = [float(r[k]["rmse"]) for r in valid if k in r and math.isfinite(float(r[k].get("rmse", float("nan"))))]
+        ns = sum(int(r[k].get("n", 0)) for r in valid if k in r)
+        out[k] = {
+            "n_points": ns,
+            "n_hours": len(rmses),
+            "bias": float(np.mean(biases)) if biases else float("nan"),
+            "rmse": math.sqrt(float(np.mean([x * x for x in rmses]))) if rmses else float("nan"),
+        }
+    return out
 
 
 def plot_hourly_verification_map(
@@ -1642,6 +2184,10 @@ def verify_run_against_knmi(
     ifs_grib_dir: Optional[Path | str] = None,
     compare_ifs: bool = False,
     ifs_sampler: Optional[Callable[[Path | str, Sequence[Dict[str, Any]]], List[Dict[str, Any]]]] = None,
+    compare_era5: bool = False,
+    era5_cache_dir: Optional[Path | str] = None,
+    era5_ds: Optional[xr.Dataset] = None,
+    era5_step_hours: float = 3.0,
     verify_radar_fss: bool = False,
     radar_cache_dir: Optional[Path | str] = None,
     radar_hourly_fetcher: Optional[Callable[[datetime.datetime, Any], Optional[np.ndarray]]] = None,
@@ -1701,6 +2247,16 @@ def verify_run_against_knmi(
     eff_ifs_dir = Path(ifs_grib_dir) if ifs_grib_dir is not None else (_auto_discover_ifs_dir(run_base, manifest) if compare_ifs else None)
     ifs_by_time = discover_ifs_grib_by_valid_time(eff_ifs_dir) if eff_ifs_dir is not None else {}
     ifs_sample_fn = ifs_sampler if ifs_sampler is not None else sample_ifs_grib_at_stations
+    lbc_manifest = manifest.get("lbc") if isinstance(manifest, dict) else None
+    if era5_cache_dir is not None:
+        eff_era5_cache: Optional[Path] = Path(era5_cache_dir)
+    elif isinstance(lbc_manifest, dict) and lbc_manifest.get("era5_cache_dir"):
+        eff_era5_cache = Path(str(lbc_manifest["era5_cache_dir"]))
+    else:
+        eff_era5_cache = eff_outdir / "era5_verify_cache"
+    opened_era5_ds = era5_ds
+    allow_era5_cache_write = era5_ds is None
+
     eff_radar_cache = Path(radar_cache_dir) if radar_cache_dir is not None else (eff_outdir / "radar_cache")
     fss_all_recs: List[Dict[str, Any]] = []
     fss_indep_recs: List[Dict[str, Any]] = []
@@ -1721,10 +2277,22 @@ def verify_run_against_knmi(
     ifs_indep_t_land: List[Dict[str, Any]] = []
     ifs_indep_i_land: List[Dict[str, Any]] = []
     ifs_matched_leads: List[float] = []
+    era5_t_all: List[Dict[str, Any]] = []
+    era5_e_all: List[Dict[str, Any]] = []
+    era5_t_land: List[Dict[str, Any]] = []
+    era5_e_land: List[Dict[str, Any]] = []
+    era5_indep_t_all: List[Dict[str, Any]] = []
+    era5_indep_e_all: List[Dict[str, Any]] = []
+    era5_indep_t_land: List[Dict[str, Any]] = []
+    era5_indep_e_land: List[Dict[str, Any]] = []
+    era5_matched_leads: List[float] = []
+    era5_upper_all: List[Dict[str, Any]] = []
+    era5_upper_indep: List[Dict[str, Any]] = []
     hourly_records: List[Dict[str, Any]] = []
     station_buckets: Dict[str, List[Dict[str, Any]]] = {}
 
     prev_tot_precip: Optional[np.ndarray] = None
+    prev_precip_parts: Optional[Dict[str, np.ndarray]] = None
     prev_lead_h: Optional[float] = None
     domain_name = "tempest_lam"
     first_wx1_attrs: Dict[str, str] = {}
@@ -1736,13 +2304,17 @@ def verify_run_against_knmi(
         nc_path = _fetch_obs_for_valid_time(valid_dt, eff_cache)
         if nc_path is None:
             skipped_hours.append({"lead_hours": lead_h, "valid_time_utc": valid_dt.isoformat(), "reason": "no_knmi_obs"})
-            # Advance previous precipitation tracker so later hourly deltas stay exact
             with wx1.open_dataset(wx1_path) as ds_p:
-                r = np.asarray(ds_p["rain_acc"].values, dtype=np.float64) if "rain_acc" in ds_p else 0.0
-                s = np.asarray(ds_p["snow_acc"].values, dtype=np.float64) if "snow_acc" in ds_p else 0.0
-                g = np.asarray(ds_p["graupel_acc"].values, dtype=np.float64) if "graupel_acc" in ds_p else 0.0
-                if isinstance(r, np.ndarray):
-                    prev_tot_precip = np.maximum(0.0, r + s + g)
+                r = np.asarray(ds_p["rain_acc"].values, dtype=np.float64) if "rain_acc" in ds_p else None
+                s = np.asarray(ds_p["snow_acc"].values, dtype=np.float64) if "snow_acc" in ds_p else None
+                g = np.asarray(ds_p["graupel_acc"].values, dtype=np.float64) if "graupel_acc" in ds_p else None
+                if r is not None:
+                    prev_tot_precip = np.maximum(0.0, r + (s if s is not None else 0.0) + (g if g is not None else 0.0))
+                    prev_precip_parts = {
+                        "rain_acc": r,
+                        "snow_acc": s if s is not None else np.zeros_like(r),
+                        "graupel_acc": g if g is not None else np.zeros_like(r),
+                    }
                     prev_lead_h = lead_h
             continue
 
@@ -1764,12 +2336,18 @@ def verify_run_against_knmi(
             wx1_path,
             stations,
             prev_total_precip=prev_tot_precip,
+            prev_precip_parts=prev_precip_parts,
             interval_h=dt_h,
         )
         domain_name = grid["domain_name"]
         if not first_wx1_attrs and isinstance(grid.get("wx1_attrs"), dict):
             first_wx1_attrs = dict(grid["wx1_attrs"])
         prev_tot_precip = grid["tot_precip_mm"]
+        prev_precip_parts = {
+            "rain_acc": grid["rain_acc"],
+            "snow_acc": grid["snow_acc"],
+            "graupel_acc": grid["graupel_acc"],
+        }
         prev_lead_h = lead_h
 
         for row in matched:
@@ -1850,6 +2428,56 @@ def verify_run_against_knmi(
                 ifs_indep_t_land.extend(t_land_a)
                 ifs_indep_i_land.extend(i_land_a)
             ifs_matched_leads.append(lead_h)
+
+        era5_cadence_ok = (float(era5_step_hours) <= 1.0) or (
+            abs(lead_h - round(lead_h / float(era5_step_hours)) * float(era5_step_hours)) < 1e-3
+        )
+        if compare_era5 and era5_cadence_ok:
+            try:
+                ds_e_slice, opened_era5_ds = _load_era5_verify_slice(
+                    valid_dt,
+                    grid["lat"],
+                    grid["lon"],
+                    eff_era5_cache,
+                    opened_era5_ds,
+                    allow_cache_write=allow_era5_cache_write,
+                )
+                if ds_e_slice is not None:
+                    try:
+                        era5_matched = sample_era5_at_stations(ds_e_slice, stations, valid_dt=valid_dt)
+                        for er in era5_matched:
+                            er["lead_hours"] = lead_h
+                            er["valid_time_utc"] = valid_dt.isoformat()
+                        era5_land_raw = [r for r in era5_matched if not r["is_offshore"]]
+                        t_all_e, e_all_a = _align_rows_with_ifs(matched, era5_matched)
+                        t_land_e, e_land_a = _align_rows_with_ifs(land_rows, era5_land_raw)
+                        era5_all_stats = _summarize_matched_rows(e_all_a)
+                        era5_land_stats = _summarize_matched_rows(e_land_a)
+                        t_land_e_skill = _summarize_matched_rows(t_land_e)
+                        rec["era5_all"] = era5_all_stats
+                        rec["era5_land"] = era5_land_stats
+                        rec["skill_vs_era5_land"] = compute_skill_score_vs_ifs(t_land_e_skill, era5_land_stats)
+                        era5_t_all.extend(t_all_e)
+                        era5_e_all.extend(e_all_a)
+                        era5_t_land.extend(t_land_e)
+                        era5_e_land.extend(e_land_a)
+                        if is_indep:
+                            era5_indep_t_all.extend(t_all_e)
+                            era5_indep_e_all.extend(e_all_a)
+                            era5_indep_t_land.extend(t_land_e)
+                            era5_indep_e_land.extend(e_land_a)
+                        era5_matched_leads.append(lead_h)
+
+                        ua_rec = compute_upper_air_vs_era5(wx1_path, ds_e_slice, valid_dt=valid_dt)
+                        rec["era5_upper_air"] = ua_rec
+                        era5_upper_all.append(ua_rec)
+                        if is_indep:
+                            era5_upper_indep.append(ua_rec)
+                    finally:
+                        if era5_ds is None:
+                            ds_e_slice.close()
+            except Exception as exc:
+                logger.warning("ERA5 validation failed at T+%.1fh (%s): %s", lead_h, valid_dt.isoformat(), exc)
 
         if verify_radar_fss and lead_h > 0.0 and abs(dt_h - 1.0) < 0.25:
             try:
@@ -1941,6 +2569,17 @@ def verify_run_against_knmi(
                     "ifs_ws10_rmse_ms": round(ib["ws10"]["rmse"], 3) if ib else float("nan"),
                 }
             )
+        if era5_matched_leads:
+            eb = rec.get("era5_land")
+            esk = rec.get("skill_vs_era5_land")
+            csv_row.update(
+                {
+                    "era5_t2m_rmse_k": round(eb["t2m"]["rmse"], 3) if eb else float("nan"),
+                    "t2m_skill_vs_era5": round(esk["t2m"]["skill_score"], 3) if esk else float("nan"),
+                    "era5_mslp_rmse_hpa": round(eb["mslp"]["rmse"], 3) if eb else float("nan"),
+                    "era5_ws10_rmse_ms": round(eb["ws10"]["rmse"], 3) if eb else float("nan"),
+                }
+            )
         hourly_csv_rows.append(csv_row)
     hourly_csv_p = eff_outdir / "knmi_hourly_metrics.csv"
     if hourly_csv_rows:
@@ -1997,26 +2636,74 @@ def verify_run_against_knmi(
         for rec in hourly_records
     ]
 
-    ifs_comparison: Optional[Dict[str, Any]] = None
-    if ifs_matched_leads:
-        def _cmp_block(t_rows: Sequence[Dict[str, Any]], i_rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
-            ts = _summarize_matched_rows(t_rows)
-            ist = _summarize_matched_rows(i_rows)
-            return {
-                "tempest": ts,
-                "ifs": ist,
-                "skill": compute_skill_score_vs_ifs(ts, ist),
-            }
+    def _build_ref_comparison(
+        src_key: str,
+        src_label_k: str,
+        src_label_val: str,
+        matched_leads: List[float],
+        t_all: Sequence[Dict[str, Any]],
+        r_all: Sequence[Dict[str, Any]],
+        t_land: Sequence[Dict[str, Any]],
+        r_land: Sequence[Dict[str, Any]],
+        indep_t_all: Sequence[Dict[str, Any]],
+        indep_r_all: Sequence[Dict[str, Any]],
+        indep_t_land: Sequence[Dict[str, Any]],
+        indep_r_land: Sequence[Dict[str, Any]],
+    ) -> Optional[Dict[str, Any]]:
+        if not matched_leads:
+            return None
 
-        ifs_comparison = {
-            "ifs_dir": str(eff_ifs_dir) if eff_ifs_dir is not None else "",
-            "matched_hours": len(ifs_matched_leads),
-            "matched_leads": ifs_matched_leads,
-            "overall_all": _cmp_block(ifs_t_all, ifs_i_all),
-            "overall_land": _cmp_block(ifs_t_land, ifs_i_land),
-            "independent_all": _cmp_block(ifs_indep_t_all, ifs_indep_i_all),
-            "independent_land": _cmp_block(ifs_indep_t_land, ifs_indep_i_land),
+        def _cmp_block(t_rows: Sequence[Dict[str, Any]], r_rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+            ts = _summarize_matched_rows(t_rows)
+            rs = _summarize_matched_rows(r_rows)
+            return {"tempest": ts, src_key: rs, "skill": compute_skill_score_vs_ifs(ts, rs)}
+
+        return {
+            src_label_k: src_label_val,
+            "matched_hours": len(matched_leads),
+            "matched_leads": matched_leads,
+            "overall_all": _cmp_block(t_all, r_all),
+            "overall_land": _cmp_block(t_land, r_land),
+            "independent_all": _cmp_block(indep_t_all, indep_r_all),
+            "independent_land": _cmp_block(indep_t_land, indep_r_land),
         }
+
+    ifs_comparison = _build_ref_comparison(
+        "ifs",
+        "ifs_dir",
+        str(eff_ifs_dir) if eff_ifs_dir is not None else "",
+        ifs_matched_leads,
+        ifs_t_all,
+        ifs_i_all,
+        ifs_t_land,
+        ifs_i_land,
+        ifs_indep_t_all,
+        ifs_indep_i_all,
+        ifs_indep_t_land,
+        ifs_indep_i_land,
+    )
+    era5_comparison = _build_ref_comparison(
+        "era5",
+        "era5_cache_dir",
+        str(eff_era5_cache) if eff_era5_cache is not None else "",
+        era5_matched_leads,
+        era5_t_all,
+        era5_e_all,
+        era5_t_land,
+        era5_e_land,
+        era5_indep_t_all,
+        era5_indep_e_all,
+        era5_indep_t_land,
+        era5_indep_e_land,
+    )
+    era5_upper_air = (
+        {
+            "overall": _aggregate_upper_air_records(era5_upper_all),
+            "independent": _aggregate_upper_air_records(era5_upper_indep),
+        }
+        if era5_upper_all
+        else None
+    )
 
     run_metadata: Dict[str, Any] = {}
     if isinstance(manifest, dict):
@@ -2057,6 +2744,8 @@ def verify_run_against_knmi(
         "independent_all": _summarize_matched_rows(indep_pairs_all),
         "independent_land": _summarize_matched_rows(indep_pairs_land),
         "ifs_comparison": ifs_comparison,
+        "era5_comparison": era5_comparison,
+        "era5_upper_air": era5_upper_air,
         "radar_fss": (
             {
                 "overall": _aggregate_fss_records(fss_all_recs),

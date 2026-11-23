@@ -523,3 +523,154 @@ def test_knmi_hourly_validated_loader_tcc_and_auto_source(tmp_path: Path) -> Non
     csv_txt = Path(res["artifacts"]["hourly_csv"]).read_text(encoding="utf-8")
     assert "land_tcc_bias" in csv_txt and "land_tcc_rmse" in csv_txt
 
+
+def test_weather_type_events_and_era5_dual_validation(tmp_path: Path) -> None:
+    spec = get_domain_spec("d3_nl_2p5km", nz=16)
+    t0 = datetime.datetime(2016, 6, 23, 18, 0, tzinfo=datetime.timezone.utc)
+    t1 = datetime.datetime(2016, 6, 23, 19, 0, tzinfo=datetime.timezone.utc)
+
+    cache_dir = tmp_path / "knmi_cache_ev"
+    epoch = datetime.datetime(1950, 1, 1, tzinfo=datetime.timezone.utc)
+    stns = [
+        ("0-20000-0-06260", "DE BILT", 52.100, 5.183, 1.9),
+        ("0-20000-0-06290", "TWENTHE", 52.274, 6.889, 34.8),
+        ("0-20000-0-06370", "EINDHOVEN", 51.450, 5.377, 22.6),
+    ]
+    for dt_x, is_event in ((t0, False), (t1, True)):
+        p_nc = cache_dir / f"hourly-observations-validated-{dt_x:%Y%m%d-%H}.nc"
+        p_nc.parent.mkdir(parents=True, exist_ok=True)
+        with nc.Dataset(p_nc, "w") as ds:
+            ds.createDimension("station", len(stns))
+            ds.createDimension("time", 1)
+            ds.createVariable("station", "S15", ("station",))[:] = np.array([s[0].encode() for s in stns], dtype="S15")
+            ds.createVariable("stationname", "S15", ("station",))[:] = np.array([s[1].ljust(15)[:15].encode() for s in stns], dtype="S15")
+            ds.createVariable("lat", "f8", ("station",))[:] = [s[2] for s in stns]
+            ds.createVariable("lon", "f8", ("station",))[:] = [s[3] for s in stns]
+            ds.createVariable("height", "f8", ("station",))[:] = [s[4] for s in stns]
+            ds.createVariable("time", "f8", ("time",))[:] = [(dt_x - epoch).total_seconds()]
+
+            def _v(name: str, vals: list[float]) -> None:
+                v = ds.createVariable(name, "f8", ("station", "time"))
+                v[:, 0] = vals
+
+            _v("T", [20.0, 20.0, 0.2] if is_event else [24.0, 24.0, 24.0])
+            _v("TD", [18.0, 18.0, 0.1])
+            _v("U", [90.0, 90.0, 99.0])
+            _v("P", [1012.0, 1012.0, 1012.0])
+            _v("FF", [14.0, 14.0, 8.0] if is_event else [5.0, 5.0, 5.0])
+            _v("DD", [240.0, 240.0, 240.0])
+            _v("FX", [22.0, 22.0, 12.0] if is_event else [8.0, 8.0, 8.0])
+            _v("RH", [5.0, 3.0, 1.0] if is_event else [0.0, 0.0, 0.0])
+            _v("Q", [36.0, 36.0, 36.0])  # 100 W/m^2
+            _v("N", [7.0, 7.0, 7.0])  # 0.875
+            _v("VV", [30.0, 30.0, 30.0])
+            _v("W1", [0.0, 0.0, 0.0])
+            _v("W2", [1.0, 1.0, 0.0] if is_event else [0.0, 0.0, 0.0])
+            _v("W3", [1.0, 0.0, 0.0] if is_event else [0.0, 0.0, 0.0])
+            _v("W5", [1.0, 0.0, 0.0] if is_event else [0.0, 0.0, 0.0])
+            _v("W6", [0.0, 0.0, 1.0] if is_event else [0.0, 0.0, 0.0])
+            _v("WW", [89.0, 81.0, 66.0] if is_event else [2.0, 2.0, 2.0])
+
+    # Build model .wx1 files matching event at De Bilt/Twenthe + freezing rain at Eindhoven
+    run_dir = tmp_path / "run_ev"
+    ny, nx = spec.ny, spec.nx
+    plevs = np.array([85_000.0, 50_000.0], dtype=np.float32)
+    for lead_h, dt_x in ((0.0, t0), (1.0, t1)):
+        t2m_k = np.full((ny, nx), 273.15 + (20.0 if lead_h > 0 else 24.0), dtype=np.float32)
+        if lead_h > 0:
+            t2m_k[spec.lat2d < 51.8] = 273.15 + 0.2  # sub-0.5C over south (Eindhoven) for ice/ijzel
+        ds_m = xr.Dataset(
+            data_vars={
+                "t2m": (("y", "x"), t2m_k),
+                "td2m": (("y", "x"), t2m_k - 1.5),
+                "rh2m": (("y", "x"), np.full((ny, nx), 90.0, dtype=np.float32)),
+                "mslp": (("y", "x"), np.full((ny, nx), 101_200.0, dtype=np.float32)),
+                "u10m_geo": (("y", "x"), np.full((ny, nx), 10.0, dtype=np.float32)),
+                "v10m_geo": (("y", "x"), np.full((ny, nx), 0.0, dtype=np.float32)),
+                "gust10m": (("y", "x"), np.full((ny, nx), 22.0 if lead_h > 0 else 8.0, dtype=np.float32)),
+                "vis_m": (("y", "x"), np.full((ny, nx), 3000.0, dtype=np.float32)),
+                "sw_down": (("y", "x"), np.full((ny, nx), 100.0, dtype=np.float32)),
+                "tcc": (("y", "x"), np.full((ny, nx), 0.875, dtype=np.float32)),
+                "precip_rate": (("y", "x"), np.full((ny, nx), 3.0 / 3600.0 if lead_h > 0 else 0.0, dtype=np.float32)),
+                "rain_acc": (("y", "x"), np.full((ny, nx), 2.5 if lead_h > 0 else 0.0, dtype=np.float32)),
+                "snow_acc": (("y", "x"), np.full((ny, nx), 0.2 if lead_h > 0 else 0.0, dtype=np.float32)),
+                "graupel_acc": (("y", "x"), np.full((ny, nx), 0.3 if lead_h > 0 else 0.0, dtype=np.float32)),
+                "cape_mu": (("y", "x"), np.full((ny, nx), 600.0 if lead_h > 0 else 50.0, dtype=np.float32)),
+                "cin_sb": (("y", "x"), np.full((ny, nx), 10.0, dtype=np.float32)),
+                "iwp": (("y", "x"), np.full((ny, nx), 0.6, dtype=np.float32)),
+                "freezing_level_m": (("y", "x"), np.full((ny, nx), 2800.0, dtype=np.float32)),
+                "t_pl": (("plev", "y", "x"), np.stack([np.full((ny, nx), 286.0, dtype=np.float32), np.full((ny, nx), 258.0, dtype=np.float32)])),
+                "gh_pl": (("plev", "y", "x"), np.stack([np.full((ny, nx), 1500.0, dtype=np.float32), np.full((ny, nx), 5640.0, dtype=np.float32)])),
+                "u_pl": (("plev", "y", "x"), np.stack([np.full((ny, nx), 14.0, dtype=np.float32), np.full((ny, nx), 24.0, dtype=np.float32)])),
+                "v_pl": (("plev", "y", "x"), np.zeros((2, ny, nx), dtype=np.float32)),
+                "q_pl": (("plev", "y", "x"), np.stack([np.full((ny, nx), 0.009, dtype=np.float32), np.full((ny, nx), 0.002, dtype=np.float32)])),
+                "lat": (("y", "x"), spec.lat2d.astype(np.float32)),
+                "lon": (("y", "x"), spec.lon2d.astype(np.float32)),
+            },
+            coords={"plev": plevs, "y": spec.y_m.astype(np.float64), "x": spec.x_m.astype(np.float64)},
+            attrs={"domain_name": spec.name, "lead_hours": f"{lead_h:.3f}", "valid_time_utc": dt_x.isoformat()},
+        )
+        p_wx = run_dir / "d3" / f"forecast_{spec.name}_T+{int(lead_h):03d}h.wx1"
+        p_wx.parent.mkdir(parents=True, exist_ok=True)
+        wx1.write_dataset(p_wx, ds_m, dataset_id=f"ev_{int(lead_h)}", codec="zstd_shuffle")
+
+    # Synthetic ARCO-ERA5 Dataset (hotter by +3.5 C, wind slower, higher T850/GH500) so Tempest clearly beats ERA5
+    e_lats = np.linspace(55.5, 49.0, 27, dtype=np.float64)
+    e_lons = np.linspace(1.5, 9.0, 31, dtype=np.float64)
+    e_lvls = np.array([850, 500], dtype=np.int32)
+    e_times = np.array([np.datetime64(t0.replace(tzinfo=None), "s"), np.datetime64(t1.replace(tzinfo=None), "s")], dtype="datetime64[ns]")
+    nt, nl, ny_e, nx_e = 2, 2, len(e_lats), len(e_lons)
+    ds_era5 = xr.Dataset(
+        data_vars={
+            "2m_temperature": (("time", "latitude", "longitude"), np.full((nt, ny_e, nx_e), 273.15 + 23.5, dtype=np.float32)),
+            "2m_dewpoint_temperature": (("time", "latitude", "longitude"), np.full((nt, ny_e, nx_e), 273.15 + 15.0, dtype=np.float32)),
+            "mean_sea_level_pressure": (("time", "latitude", "longitude"), np.full((nt, ny_e, nx_e), 101_400.0, dtype=np.float32)),
+            "10m_u_component_of_wind": (("time", "latitude", "longitude"), np.full((nt, ny_e, nx_e), 5.0, dtype=np.float32)),
+            "10m_v_component_of_wind": (("time", "latitude", "longitude"), np.zeros((nt, ny_e, nx_e), dtype=np.float32)),
+            "10m_wind_gust_since_previous_post_processing": (("time", "latitude", "longitude"), np.full((nt, ny_e, nx_e), 12.0, dtype=np.float32)),
+            "total_cloud_cover": (("time", "latitude", "longitude"), np.full((nt, ny_e, nx_e), 0.25, dtype=np.float32)),
+            "surface_solar_radiation_downwards": (("time", "latitude", "longitude"), np.full((nt, ny_e, nx_e), 500.0 * 3600.0, dtype=np.float32)),
+            "total_precipitation": (("time", "latitude", "longitude"), np.zeros((nt, ny_e, nx_e), dtype=np.float32)),
+            "temperature": (("time", "level", "latitude", "longitude"), np.stack([np.full((nt, ny_e, nx_e), 287.5, dtype=np.float32), np.full((nt, ny_e, nx_e), 258.0, dtype=np.float32)], axis=1)),
+            "geopotential": (("time", "level", "latitude", "longitude"), np.stack([np.full((nt, ny_e, nx_e), 9.80665 * 1500.0, dtype=np.float32), np.full((nt, ny_e, nx_e), 9.80665 * 5660.0, dtype=np.float32)], axis=1)),
+            "u_component_of_wind": (("time", "level", "latitude", "longitude"), np.stack([np.full((nt, ny_e, nx_e), 12.0, dtype=np.float32), np.full((nt, ny_e, nx_e), 24.0, dtype=np.float32)], axis=1)),
+            "v_component_of_wind": (("time", "level", "latitude", "longitude"), np.zeros((nt, nl, ny_e, nx_e), dtype=np.float32)),
+            "specific_humidity": (("time", "level", "latitude", "longitude"), np.stack([np.full((nt, ny_e, nx_e), 0.008, dtype=np.float32), np.full((nt, ny_e, nx_e), 0.002, dtype=np.float32)], axis=1)),
+        },
+        coords={"time": e_times, "level": e_lvls, "latitude": e_lats, "longitude": e_lons},
+    )
+
+    res = verify_run_against_knmi(
+        run_dir,
+        outdir=tmp_path / "out_ev",
+        knmi_cache_dir=cache_dir,
+        obs_source="auto",
+        independent_after_hour=1.0,
+        make_maps=False,
+        compare_era5=True,
+        era5_ds=ds_era5,
+        era5_step_hours=1.0,
+    )
+    ev = res["independent_land"]["events"]
+    assert ev["hail_graupel"]["hits"] == 1
+    assert ev["snow"]["hits"] == 1
+    assert ev["thunder"]["hits"] == 1
+    assert ev["ice_freezing_rain"]["hits"] == 1
+    assert ev["ice_freezing_rain"]["false_alarms"] == 0
+    assert ev["gust_20ms"]["hits"] == 2
+    assert ev["rain_0p1mm"]["hits"] == 3
+
+    ecmp = res["era5_comparison"]
+    assert ecmp is not None
+    assert ecmp["matched_hours"] == 2
+    assert ecmp["independent_land"]["skill"]["t2m"]["skill_score"] > 0.5
+    assert ecmp["independent_land"]["skill"]["gust10"]["skill_score"] == pytest.approx(1.0 - 1.0 / np.sqrt(2.0), abs=1e-4)
+    assert ecmp["independent_land"]["era5"]["precip"]["n"] == 3
+
+    eua = res["era5_upper_air"]["independent"]
+    assert eua["t850_k"]["bias"] == pytest.approx(-1.5, abs=0.05)
+    assert eua["gh500_m"]["bias"] == pytest.approx(-20.0, abs=0.5)
+    assert eua["wspd850_ms"]["bias"] == pytest.approx(2.0, abs=0.05)
+    assert eua["q850_gkg"]["bias"] == pytest.approx(1.0, abs=0.05)
+
+
