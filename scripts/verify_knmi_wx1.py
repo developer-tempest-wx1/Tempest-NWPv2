@@ -46,6 +46,17 @@ def main() -> None:
     )
     parser.add_argument("--land-only", action="store_true", help="Plot only land stations on hourly maps")
     parser.add_argument("--no-maps", action="store_true", help="Skip hourly PNG maps (write CSV/JSON/timeseries only)")
+    parser.add_argument(
+        "--compare-ifs",
+        action="store_true",
+        help="Auto-discover ECMWF IFS GRIB2 cache from manifest.json and score side-by-side vs Tempest",
+    )
+    parser.add_argument(
+        "--compare-ifs-dir",
+        type=Path,
+        default=None,
+        help="Explicit directory containing ECMWF IFS *_sfc_*.grib2 files for side-by-side comparison",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -62,6 +73,8 @@ def main() -> None:
         hourly_precip_6x=args.hourly_precip_6x,
         land_only_plots=args.land_only,
         make_maps=not args.no_maps,
+        ifs_grib_dir=args.compare_ifs_dir,
+        compare_ifs=args.compare_ifs,
     )
 
     print(
@@ -118,6 +131,60 @@ def main() -> None:
                 f"T2m bias={st['t2m_bias_k']:+.2f}K RMSE={st['t2m_rmse_k']:.2f}K | "
                 f"RH bias={st['rh_bias_pct']:+.1f}% | Wind bias={st['ws10_bias_ms']:+.2f}m/s"
             )
+
+    if summary.get("ifs_comparison"):
+        icmp = summary["ifs_comparison"]
+        print(
+            f"\n=== Tempest vs ECMWF IFS 0.1° ({icmp['matched_hours']} synchrone uren: {icmp['matched_leads']}) ==="
+        )
+        print(f"IFS GRIB2 bron: {icmp['ifs_dir']}")
+        print(
+            "Lead  | T2m RMSE: Tempest vs IFS  (SS)   | MSLP RMSE: Tempest vs IFS (SS)   | "
+            "Wind10 RMSE: Tempest vs IFS (SS) | Td2m RMSE: T vs IFS"
+        )
+        print("-" * 132)
+        for rec in summary["hourly"]:
+            ib = rec.get("ifs_land")
+            sk = rec.get("skill_vs_ifs_land")
+            tb = rec["land"]
+            if not ib or not sk:
+                continue
+            print(
+                f"T+{rec['lead_hours']:02.0f}h | "
+                f"{_fmt(tb['t2m']['rmse'], '.2f')} vs {_fmt(ib['t2m']['rmse'], '.2f')} K ({_fmt(sk['t2m']['skill_score'], '+.2f')}) | "
+                f"{_fmt(tb['mslp']['rmse'], '.2f')} vs {_fmt(ib['mslp']['rmse'], '.2f')} hPa ({_fmt(sk['mslp']['skill_score'], '+.2f')}) | "
+                f"{_fmt(tb['ws10']['rmse'], '.2f')} vs {_fmt(ib['ws10']['rmse'], '.2f')} m/s ({_fmt(sk['ws10']['skill_score'], '+.2f')}) | "
+                f"{_fmt(tb['td2m']['rmse'], '.2f')} vs {_fmt(ib['td2m']['rmse'], '.2f')} K"
+            )
+        for label, bkey in (
+            ("Synchroon Totaal (landstations)", "overall_land"),
+            (f"Synchroon Onafhankelijk T>={summary['independent_after_hour']:.0f}u (landstations)", "independent_land"),
+        ):
+            blk = icmp[bkey]
+            ts, ifs_s, sk = blk["tempest"], blk["ifs"], blk["skill"]
+            print(f"\n[{label}] (SS > 0 betekent Tempest lagere RMSE dan IFS)")
+            for var_key, var_lbl, unit in (
+                ("t2m", "T2m", "K"),
+                ("td2m", "Td2m", "K"),
+                ("rh", "RH", "%"),
+                ("mslp", "MSLP", "hPa"),
+                ("ws10", "Wind10m", "m/s"),
+            ):
+                if ifs_s[var_key]["n"] == 0:
+                    continue
+                print(
+                    f"  {var_lbl:<7s} (n={ifs_s[var_key]['n']:3d}): "
+                    f"Tempest bias={_fmt(ts[var_key]['bias'])} RMSE={_fmt(ts[var_key]['rmse'], '.2f')} {unit} | "
+                    f"IFS bias={_fmt(ifs_s[var_key]['bias'])} RMSE={_fmt(ifs_s[var_key]['rmse'], '.2f')} {unit} | "
+                    f"SS={_fmt(sk[var_key]['skill_score'], '+.3f')}"
+                )
+            if ifs_s["wdir"]["n"] > 0:
+                print(
+                    f"  Dir10m  (n={ifs_s['wdir']['n']:3d}): "
+                    f"Tempest MAE={_fmt(ts['wdir']['mae_deg'], '.1f')}° | "
+                    f"IFS MAE={_fmt(ifs_s['wdir']['mae_deg'], '.1f')}° | "
+                    f"SS={_fmt(sk['wdir']['skill_score'], '+.3f')}"
+                )
 
     art = summary["artifacts"]
     print(f"\n[Output] Overzicht PNG : {art['timeseries_png']}")

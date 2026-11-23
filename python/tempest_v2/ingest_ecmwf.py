@@ -25,7 +25,7 @@ STANDARD_SFC_VARS = [
     "sd", "rsn", "asn",
     "tclw", "tciw", "tcwv",
 ]
-LBC_SFC_VARS = ["msl", "2t"]
+LBC_SFC_VARS = ["msl", "2t", "2d", "10u", "10v"]
 
 # 4-layer soil temperature and volumetric moisture (levels 1, 2, 3, 4)
 STANDARD_SOIL_LEVELS = [1, 2, 3, 4]

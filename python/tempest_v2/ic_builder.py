@@ -641,6 +641,17 @@ def ecmwf_grib_to_domain_state(
     t2m_h = _get_sfc(("t2m", "2t"), 285.0)
     d2m_key = next((k for k in ("d2m", "2d") if k in sfc_vars), None)
     d2m_h = _get_sfc((d2m_key,), float(np.mean(t2m_h))) if d2m_key is not None else None
+    u10_key = next((k for k in ("u10", "10u") if k in sfc_vars), None)
+    v10_key = next((k for k in ("v10", "10v") if k in sfc_vars), None)
+    u10_grid_h: Optional[np.ndarray] = None
+    v10_grid_h: Optional[np.ndarray] = None
+    if u10_key is not None and v10_key is not None:
+        u10_geo_h = _get_sfc((u10_key,), 0.0)
+        v10_geo_h = _get_sfc((v10_key,), 0.0)
+        if spec.is_projected and spec.projection is not None:
+            u10_grid_h, v10_grid_h = spec.projection.geo_to_grid_wind(u10_geo_h, v10_geo_h, spec.lon2d)
+        else:
+            u10_grid_h, v10_grid_h = u10_geo_h, v10_geo_h
     skt_key = next((k for k in ("skt", "t") if k in sfc_vars), None)
     skt_h = _get_sfc((skt_key,), float(np.mean(t2m_h))) if skt_key is not None else np.full((spec.ny, spec.nx), float(np.mean(t2m_h)), dtype=np.float64)
     if skt_key is not None and "lsm" in sfc_vars:
@@ -691,6 +702,9 @@ def ecmwf_grib_to_domain_state(
         surf["q2m"] = _q_from_dewpoint_pa(d2m_h, ps_child, t_k=t2m_h).astype(np.float32)
     else:
         surf["q2m"] = np.clip(state_3d["qv"][0], 1e-7, 0.04).astype(np.float32)
+    if u10_grid_h is not None and v10_grid_h is not None:
+        surf["u10m"] = np.clip(u10_grid_h, -100.0, 100.0).astype(np.float32)
+        surf["v10m"] = np.clip(v10_grid_h, -100.0, 100.0).astype(np.float32)
     surf["snow_swe"] = sd_h.astype(np.float32)
     surf["sst_bulk"] = np.clip(sst_water_h, 271.15, 310.0).astype(np.float32)
     if surface_static is not None and "lsm" in surface_static:

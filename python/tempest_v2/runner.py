@@ -11,6 +11,7 @@ Features:
 from __future__ import annotations
 
 import datetime
+import functools
 import gc
 import json
 import logging
@@ -62,6 +63,24 @@ from tempest_v2.verification import (
 )
 
 logger = logging.getLogger("tempest_v2.runner")
+
+
+@functools.lru_cache(maxsize=1)
+def _get_git_commit() -> str:
+    """Return short git commit hash of this Tempest repository (or 'unknown')."""
+    try:
+        res = subprocess.run(
+            ["git", "rev-parse", "--short", "HEAD"],
+            cwd=Path(__file__).resolve().parents[2],
+            capture_output=True,
+            text=True,
+            timeout=3.0,
+        )
+        if res.returncode == 0 and res.stdout.strip():
+            return res.stdout.strip()
+    except Exception:
+        pass
+    return "unknown"
 
 RUN_LAYOUT_SUBDIRS = (
     "config",
@@ -255,6 +274,7 @@ def write_forecast_wx1(
     prev_precip_total: Optional[np.ndarray] = None,
     interval_s: float = 0.0,
     surface_static: Optional[Dict[str, np.ndarray]] = None,
+    provenance_attrs: Optional[Dict[str, Any]] = None,
 ) -> Path:
     """Write synoptic 2D, soil, optional 3D isobaric & NEMO+SI3 forecast product in WX-1 (`zstd_shuffle`)."""
     p = Path(out_path)
@@ -471,15 +491,23 @@ def write_forecast_wx1(
                     if src_k in ocean_diag:
                         data_vars[out_k] = (("ice_cat", "y", "x"), np.asarray(ocean_diag[src_k], dtype=np.float32), {"units": unit})
 
+    ds_attrs: Dict[str, str] = {
+        "model": "Tempest-NWP v2 (0% AI/ML)",
+        "domain_name": spec.name,
+        "lead_hours": f"{float(lead_hours):.3f}",
+        "valid_time_utc": v_dt.isoformat(),
+        "git_commit": _get_git_commit(),
+        "nz": str(int(spec.nz)),
+    }
+    if provenance_attrs:
+        for k_attr, v_attr in provenance_attrs.items():
+            if v_attr is not None:
+                ds_attrs[str(k_attr)] = str(v_attr)
+
     ds = xr.Dataset(
         data_vars=data_vars,
         coords=coords,
-        attrs={
-            "model": "Tempest-NWP v2 (0% AI/ML)",
-            "domain_name": spec.name,
-            "lead_hours": f"{float(lead_hours):.3f}",
-            "valid_time_utc": v_dt.isoformat(),
-        },
+        attrs=ds_attrs,
     )
     wx1.write_dataset(p, ds, dataset_id=f"fc_{spec.name}_{lead_hours:06.2f}h", codec="zstd_shuffle", workers=4)
     return p
@@ -557,6 +585,19 @@ def run_domain_forecast(
     bc_x_val = 1 if spec.is_periodic_lon else 2
     bc_y_val = 0 if (use_spherical or spec.is_periodic_lon) else 2
     has_parent_lbc = (lbc_interpolator is not None) or ((not use_spherical) and (not spec.is_periodic_lon))
+    eff_lbc_rim = max(2, min(14, spec.nx // 4)) if has_parent_lbc else 0
+    eff_lbc_tau = min(0.015, 0.25 / max(float(dt_s), 1.0)) if has_parent_lbc else 0.0
+    prov_attrs = {
+        "git_commit": _get_git_commit(),
+        "nz": str(int(spec.nz)),
+        "dt_s": f"{float(dt_s):.3f}",
+        "physics_every": str(int(physics_every)),
+        "cy46_physics": "true" if bool(cy46_physics) else "false",
+        "pbl_last": "true" if bool(pbl_last) else "false",
+        "enable_ocean_si3": "true" if bool(enable_ocean_si3) else "false",
+        "lbc_rim_width": str(int(eff_lbc_rim)),
+        "lbc_tau_max_s": f"{float(eff_lbc_tau):.5f}",
+    }
 
     solver = NonHydrostaticGPUSolver(
         spec.vertical,
@@ -578,8 +619,8 @@ def run_domain_forecast(
         hyperdiff_coeff=0.005,
         sponge_depth_m=min(6000.0, 0.22 * spec.vertical.z_top_m),
         sponge_tau_max_s=0.01,
-        lbc_rim_width=max(2, min(14, spec.nx // 4)) if has_parent_lbc else 0,
-        lbc_tau_max_s=min(0.015, 0.25 / max(float(dt_s), 1.0)) if has_parent_lbc else 0.0,
+        lbc_rim_width=eff_lbc_rim,
+        lbc_tau_max_s=eff_lbc_tau,
         theta_sfc_k=theta_sfc_ref,
         p_sfc_pa=p_sfc_ref,
         n_ref_s=n_ref_hz,
@@ -880,6 +921,7 @@ def run_domain_forecast(
                     prev_precip_total=prev_out_precip if step_idx > prev_out_step else None,
                     interval_s=max(0.0, (step_idx - prev_out_step) * float(dt_s)),
                     surface_static=eff_static,
+                    provenance_attrs=prov_attrs,
                 )
                 out_paths.append(fp)
                 logger.info("[%s] Wrote %s in %.2fs", spec.name, fp.name, time.perf_counter() - t_wx0)
@@ -1774,12 +1816,15 @@ def run_three_nest_pipeline(
     manifest_path = out_root / "manifest.json"
     wall_total = float(time.perf_counter() - t0_pipe)
     manifest = {
+        "git_commit": _get_git_commit(),
         "init_time_utc": init_dt.isoformat(),
         "ic_source": ic_source,
         "warm_start": bool(ic_source == "restart"),
         "forecast_hours": float(forecast_hours),
         "d1_forecast_hours": float(d1_hrs),
         "nz": int(nz),
+        "cy46_physics": bool(cy46_physics),
+        "pbl_last": bool(pbl_last),
         "include_3d_diagnostics": bool(include_3d_diagnostics),
         "ocean": {
             "enabled": bool(enable_ocean_si3),
@@ -2082,6 +2127,7 @@ def run_ecmwf_lbc_lam_pipeline(
     wall_total = float(time.perf_counter() - t0_pipe)
     manifest = {
         "mode": "lam_ecmwf_lbc",
+        "git_commit": _get_git_commit(),
         "domain": lam_spec.name,
         "init_time_utc": init_dt.isoformat(),
         "ic_source": ic_source,
@@ -2090,6 +2136,8 @@ def run_ecmwf_lbc_lam_pipeline(
         "nz": int(lam_spec.nz),
         "dt_s": float(dt_eff),
         "physics_every": int(phys_eff),
+        "cy46_physics": bool(cy46_physics),
+        "pbl_last": bool(pbl_last),
         "include_3d_diagnostics": bool(include_3d_diagnostics),
         "lbc": lbc_meta,
         "ocean": {

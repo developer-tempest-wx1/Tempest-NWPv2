@@ -343,4 +343,88 @@ def test_coastal_skt_water_masking_and_t0_10m_wind_reduction(tmp_path, monkeypat
         assert abs(float(ds["lake_tml"].values[sstatic["lake_mask"] >= 0.5].mean()) - 278.5) < 1e-3
 
 
+def test_ecmwf_t0_10m_wind_direct_and_wx1_provenance(tmp_path, monkeypatch) -> None:
+    """Verify ECMWF u10/v10 populate rotated T+0 grid 10m wind and write_forecast_wx1 records provenance attrs."""
+    import datetime
+    import xarray as xr
+    import wx1
+    from tempest_v2 import ic_builder
+    from tempest_v2.runner import write_forecast_wx1
+
+    ny, nx = 8, 12
+    vgrid = VerticalGrid(nz=16, z_top_m=15_000.0, stretch_power=1.2)
+    spec = _make_lcc_domain("test_t0_u10", ny=ny, nx=nx, dx_m=2500.0, projection=LCCProjection(), vertical=vgrid)
+    hs_m = np.zeros((ny, nx), dtype=np.float64)
+
+    lats = np.linspace(float(spec.lat2d.min()) - 0.5, float(spec.lat2d.max()) + 0.5, 14)
+    lons = np.linspace(float(spec.lon2d.min()) - 0.5, float(spec.lon2d.max()) + 0.5, 18)
+    lon2, lat2 = np.meshgrid(lons, lats)
+    p_hpa = np.array([1000, 850, 700, 500, 300, 100], dtype=np.float64)
+    z_pl = np.array([110.0, 1450.0, 3000.0, 5570.0, 9160.0, 16_200.0])
+    t_pl = 282.0 - 0.0065 * z_pl
+
+    def _da2(val):
+        return xr.DataArray(np.full_like(lat2, val, dtype=np.float64), dims=("latitude", "longitude"), coords={"latitude": lats, "longitude": lons})
+
+    def _da3(prof1d):
+        arr = np.broadcast_to(prof1d[:, None, None], (len(p_hpa), len(lats), len(lons))).copy()
+        return xr.DataArray(arr, dims=("isobaricInhPa", "latitude", "longitude"), coords={"isobaricInhPa": p_hpa, "latitude": lats, "longitude": lons})
+
+    pl_vars = {
+        "t": (_da3(t_pl), lats, lons),
+        "u": (_da3(np.full(len(p_hpa), 12.0)), lats, lons),
+        "v": (_da3(np.full(len(p_hpa), 4.0)), lats, lons),
+        "q": (_da3(np.full(len(p_hpa), 0.004)), lats, lons),
+        "gh": (_da3(z_pl), lats, lons),
+    }
+    u10_target_geo = -3.4
+    v10_target_geo = 2.1
+    sfc_vars = {
+        "msl": (_da2(101_500.0), lats, lons),
+        "t2m": (_da2(278.0), lats, lons),
+        "d2m": (_da2(276.0), lats, lons),
+        "u10": (_da2(u10_target_geo), lats, lons),
+        "v10": (_da2(v10_target_geo), lats, lons),
+        "skt": (_da2(278.0), lats, lons),
+        "lsm": (_da2(1.0), lats, lons),
+        "sd": (_da2(0.0), lats, lons),
+    }
+
+    sfc_p = tmp_path / "dummy_sfc.grib2"
+    pl_p = tmp_path / "dummy_pl.grib2"
+    sfc_p.write_bytes(b"grib")
+    pl_p.write_bytes(b"grib")
+    monkeypatch.setattr(ic_builder, "_read_cfgrib_var_map", lambda p: sfc_vars if "sfc" in str(p) else pl_vars)
+
+    state3d, surf, _ = ic_builder.ecmwf_grib_to_domain_state(sfc_p, pl_p, spec, hs_m)
+    assert float(np.max(np.abs(surf["u10m"]))) > 0.5
+
+    out_wx1 = tmp_path / "t0_direct_u10_prov.wx1"
+    write_forecast_wx1(
+        out_wx1,
+        datetime.datetime(2026, 11, 22, 18, 0, tzinfo=datetime.timezone.utc),
+        0.0,
+        spec,
+        hs_m,
+        state3d,
+        surf,
+        include_3d_diagnostics=False,
+        provenance_attrs={
+            "cy46_physics": "true",
+            "pbl_last": "true",
+            "dt_s": "6.000",
+            "lbc_rim_width": "14",
+        },
+    )
+    with wx1.open_dataset(out_wx1) as ds:
+        assert float(np.max(np.abs(ds["u10m_geo"].values - u10_target_geo))) < 0.05
+        assert float(np.max(np.abs(ds["v10m_geo"].values - v10_target_geo))) < 0.05
+        assert ds.attrs.get("git_commit") not in (None, "", "unknown")
+        assert ds.attrs.get("nz") == "16"
+        assert ds.attrs.get("cy46_physics") == "true"
+        assert ds.attrs.get("pbl_last") == "true"
+        assert ds.attrs.get("dt_s") == "6.000"
+        assert ds.attrs.get("lbc_rim_width") == "14"
+
+
 

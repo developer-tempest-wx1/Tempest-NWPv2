@@ -44,6 +44,7 @@ from tempest_v2.projection import get_domain_spec
 logger = logging.getLogger("tempest_v2.knmi_verify")
 
 _LEAD_RE = re.compile(r"_T\+([0-9]+(?:\.[0-9]+)?)h\.wx1$")
+_IFS_SFC_RE = re.compile(r"(\d{8})_(\d{2})Z_sfc_step(\d+)")
 
 # WMO IDs of Dutch North Sea platforms / buoys that do not represent inland land stations
 _OFFSHORE_STATION_IDS = frozenset(
@@ -684,6 +685,240 @@ def _summarize_matched_rows(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 
+def _auto_discover_ifs_dir(run_base: Path, manifest: Optional[Dict[str, Any]]) -> Optional[Path]:
+    """Locate cached ECMWF IFS GRIB2 directory matching a run's `manifest.json`."""
+    candidates: List[Path] = []
+    lbc = manifest.get("lbc") if isinstance(manifest, dict) else None
+    if isinstance(lbc, dict) and lbc.get("ecmwf_cycle_utc"):
+        try:
+            cyc_dt = _to_utc(datetime.datetime.fromisoformat(str(lbc["ecmwf_cycle_utc"]).replace("Z", "+00:00")))
+            cyc_tag = f"{cyc_dt:%Y%m%d_%H}Z"
+            resol = str(lbc.get("resol") or "").strip()
+            tags = [f"{cyc_tag}_{resol}"] if (resol and resol != "auto") else []
+            for base_cache in (
+                run_base.parent / "ecmwf_lbc_cache",
+                run_base.parent.parent / "ecmwf_lbc_cache",
+                Path("runs") / "ecmwf_lbc_cache",
+            ):
+                for tag in tags:
+                    candidates.append(base_cache / tag)
+                if base_cache.is_dir():
+                    for p in sorted(base_cache.glob(f"{cyc_tag}*")):
+                        if p.is_dir():
+                            candidates.append(p)
+            candidates.append(run_base / "raw_ecmwf")
+        except Exception:
+            pass
+    for cand in candidates:
+        if cand.is_dir() and any(cand.glob("*_sfc_*.grib2")):
+            return cand
+    return None
+
+
+def discover_ifs_grib_by_valid_time(ifs_dir: Path | str) -> Dict[str, Path]:
+    """Index `*_sfc_*.grib2` files by UTC valid-time key `YYYY-MM-DDTHH:MMZ`."""
+    root = Path(ifs_dir)
+    if not root.is_dir():
+        return {}
+    out: Dict[str, Path] = {}
+    for p in sorted(root.glob("*_sfc_*.grib2")):
+        v_dt: Optional[datetime.datetime] = None
+        m = _IFS_SFC_RE.search(p.name)
+        if m:
+            ymd, hh, step_s = m.groups()
+            cyc_dt = datetime.datetime.strptime(f"{ymd}{hh}", "%Y%m%d%H").replace(tzinfo=datetime.timezone.utc)
+            v_dt = cyc_dt + datetime.timedelta(hours=int(step_s))
+        else:
+            try:
+                from tempest_v2.ic_builder import _read_cfgrib_var_map
+
+                vmap = _read_cfgrib_var_map(p, use_cache=False)
+                for da, _la, _lo in vmap.values():
+                    if "valid_time" in da.coords:
+                        ts = int(np.datetime64(da.coords["valid_time"].values, "s").astype(np.int64))
+                        v_dt = datetime.datetime.fromtimestamp(ts, tz=datetime.timezone.utc)
+                        break
+            except Exception:
+                v_dt = None
+        if v_dt is not None:
+            out[v_dt.strftime("%Y-%m-%dT%H:%MZ")] = p
+    return out
+
+
+def _bilinear_sample_latlon_2d(
+    field: np.ndarray,
+    lats: np.ndarray,
+    lons: np.ndarray,
+    st_lats: np.ndarray,
+    st_lons: np.ndarray,
+) -> np.ndarray:
+    """Bilinearly interpolate a regular lat-lon 2D field at station coordinates."""
+    arr = np.asarray(field, dtype=np.float64)
+    while arr.ndim > 2:
+        arr = arr[0]
+    la = np.asarray(lats, dtype=np.float64)
+    lo = np.asarray(lons, dtype=np.float64)
+    if la.size < 2 or lo.size < 2:
+        return np.full(len(st_lats), np.nan, dtype=np.float64)
+    if la[-1] < la[0]:
+        la = la[::-1]
+        arr = arr[::-1, :]
+    if lo[-1] < lo[0]:
+        lo = lo[::-1]
+        arr = arr[:, ::-1]
+
+    slat = np.asarray(st_lats, dtype=np.float64)
+    slon_raw = np.asarray(st_lons, dtype=np.float64)
+    if float(np.nanmax(lo)) > 180.0:
+        slon = np.mod(slon_raw, 360.0)
+    else:
+        slon = ((slon_raw + 180.0) % 360.0) - 180.0
+
+    inside = (
+        np.isfinite(slat)
+        & np.isfinite(slon)
+        & (slat >= la[0])
+        & (slat <= la[-1])
+        & (slon >= lo[0])
+        & (slon <= lo[-1])
+    )
+    ny, nx = arr.shape
+    slat_c = np.clip(slat, la[0], la[-1])
+    slon_c = np.clip(slon, lo[0], lo[-1])
+    j0 = np.clip(np.searchsorted(la, slat_c, side="right") - 1, 0, ny - 2)
+    j1 = j0 + 1
+    wy = np.clip((slat_c - la[j0]) / np.maximum(la[j1] - la[j0], 1e-12), 0.0, 1.0)
+    i0 = np.clip(np.searchsorted(lo, slon_c, side="right") - 1, 0, nx - 2)
+    i1 = i0 + 1
+    wx = np.clip((slon_c - lo[i0]) / np.maximum(lo[i1] - lo[i0], 1e-12), 0.0, 1.0)
+    vals = _sample_2d_bilinear(arr, j0, j1, i0, i1, wy, wx)
+    return np.where(inside, vals, np.nan)
+
+
+def sample_ifs_grib_at_stations(
+    grib_path: Path | str,
+    stations: Sequence[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Sample ECMWF IFS surface GRIB2 variables at KNMI station coordinates."""
+    if not stations:
+        return []
+    from tempest_v2.ic_builder import _read_cfgrib_var_map
+
+    vmap = _read_cfgrib_var_map(Path(grib_path), use_cache=False)
+    st_lats = np.array([float(s["lat"]) for s in stations], dtype=np.float64)
+    st_lons = np.array([float(s["lon"]) for s in stations], dtype=np.float64)
+    n = len(stations)
+
+    def _sample_key(aliases: Tuple[str, ...]) -> np.ndarray:
+        for k in aliases:
+            if k in vmap:
+                da, la, lo = vmap[k]
+                return _bilinear_sample_latlon_2d(np.asarray(da.values, dtype=np.float64), la, lo, st_lats, st_lons)
+        return np.full(n, np.nan, dtype=np.float64)
+
+    t2m_c = _sample_key(("t2m", "2t")) - 273.15
+    td2m_c = _sample_key(("d2m", "2d")) - 273.15
+    mslp_hpa = _sample_key(("msl", "mslp")) * 0.01
+    u10 = _sample_key(("u10", "10u"))
+    v10 = _sample_key(("v10", "10v"))
+
+    rh_pct = np.full(n, np.nan, dtype=np.float64)
+    valid_td = np.isfinite(t2m_c) & np.isfinite(td2m_c)
+    if np.any(valid_td):
+        tc = t2m_c[valid_td]
+        td = np.minimum(td2m_c[valid_td], tc)
+        rh_pct[valid_td] = np.clip(
+            100.0 * np.exp((17.625 * td) / (243.04 + td) - (17.625 * tc) / (243.04 + tc)),
+            0.0,
+            100.0,
+        )
+
+    matched: List[Dict[str, Any]] = []
+    for k, stn in enumerate(stations):
+        mu, mv = float(u10[k]), float(v10[k])
+        has_wind = math.isfinite(mu) and math.isfinite(mv)
+        mws = math.hypot(mu, mv) if has_wind else float("nan")
+        mwd = (math.degrees(math.atan2(-mu, -mv)) % 360.0) if (has_wind and mws > 1e-4) else float("nan")
+        row = dict(stn)
+        row.update(
+            {
+                "mod_t2m_c": float(t2m_c[k]),
+                "mod_td2m_c": float(td2m_c[k]),
+                "mod_rh_pct": float(rh_pct[k]),
+                "mod_mslp_hpa": float(mslp_hpa[k]),
+                "mod_u10_ms": mu,
+                "mod_v10_ms": mv,
+                "mod_ws10_ms": mws,
+                "mod_wd10_deg": mwd,
+                "mod_gust10_ms": float("nan"),
+                "mod_vis_m": float("nan"),
+                "mod_precip_mmh": float("nan"),
+                "mod_precip_step_mm": float("nan"),
+                "obs_precip_cmp": float("nan"),
+                "mod_precip_cmp": float("nan"),
+            }
+        )
+        matched.append(row)
+    return matched
+
+
+def compute_skill_score_vs_ifs(tempest_stats: Dict[str, Any], ifs_stats: Dict[str, Any]) -> Dict[str, Any]:
+    """Compute RMSE Skill Score (SS = 1 - RMSE_Tempest / RMSE_IFS; >0 means Tempest beats IFS)."""
+    out: Dict[str, Any] = {}
+    for key in ("t2m", "td2m", "rh", "mslp", "ws10"):
+        tb = tempest_stats.get(key, {})
+        ib = ifs_stats.get(key, {})
+        rt = float(tb.get("rmse", float("nan")))
+        ri = float(ib.get("rmse", float("nan")))
+        bt = float(tb.get("bias", float("nan")))
+        bi = float(ib.get("bias", float("nan")))
+        ss = (1.0 - rt / ri) if (math.isfinite(rt) and math.isfinite(ri) and ri > 1e-12) else float("nan")
+        out[key] = {
+            "n_tempest": int(tb.get("n", 0)),
+            "n_ifs": int(ib.get("n", 0)),
+            "skill_score": ss,
+            "delta_rmse": (rt - ri) if (math.isfinite(rt) and math.isfinite(ri)) else float("nan"),
+            "delta_abs_bias": (abs(bt) - abs(bi)) if (math.isfinite(bt) and math.isfinite(bi)) else float("nan"),
+        }
+    wt = tempest_stats.get("wdir", {})
+    wi = ifs_stats.get("wdir", {})
+    mt = float(wt.get("mae_deg", float("nan")))
+    mi = float(wi.get("mae_deg", float("nan")))
+    out["wdir"] = {
+        "n_tempest": int(wt.get("n", 0)),
+        "n_ifs": int(wi.get("n", 0)),
+        "skill_score": (1.0 - mt / mi) if (math.isfinite(mt) and math.isfinite(mi) and mi > 1e-12) else float("nan"),
+        "delta_mae_deg": (mt - mi) if (math.isfinite(mt) and math.isfinite(mi)) else float("nan"),
+    }
+    return out
+
+
+def _align_rows_with_ifs(
+    tempest_rows: Sequence[Dict[str, Any]],
+    ifs_rows: Sequence[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], List[Dict[str, Any]]]:
+    """Align Tempest & IFS station rows per (valid_time_utc, station_id) and mask missing IFS vars."""
+    ifs_idx = {
+        (str(r.get("valid_time_utc", "")), str(r.get("station_id", ""))): r
+        for r in ifs_rows
+    }
+    t_aligned: List[Dict[str, Any]] = []
+    i_aligned: List[Dict[str, Any]] = []
+    for tr in tempest_rows:
+        key = (str(tr.get("valid_time_utc", "")), str(tr.get("station_id", "")))
+        ir = ifs_idx.get(key)
+        if ir is None:
+            continue
+        tc = dict(tr)
+        for mod_k in ("mod_t2m_c", "mod_td2m_c", "mod_rh_pct", "mod_mslp_hpa", "mod_ws10_ms", "mod_wd10_deg"):
+            iv = float(ir.get(mod_k, float("nan")))
+            if not math.isfinite(iv):
+                tc[mod_k] = float("nan")
+        t_aligned.append(tc)
+        i_aligned.append(ir)
+    return t_aligned, i_aligned
+
+
 def plot_hourly_verification_map(
     out_png: Path | str,
     lead_h: float,
@@ -902,6 +1137,15 @@ def plot_verification_timeseries(
     def _series(metric: str, field: str) -> np.ndarray:
         return np.array([r[bucket][metric][field] for r in hourly_records], dtype=np.float64)
 
+    ifs_key = "ifs_land" if use_land_stats else "ifs_all"
+
+    def _ifs_series(metric: str, field: str) -> np.ndarray:
+        vals = []
+        for r in hourly_records:
+            blk = r.get(ifs_key)
+            vals.append(float(blk[metric][field]) if isinstance(blk, dict) and metric in blk else float("nan"))
+        return np.array(vals, dtype=np.float64)
+
     fig, axes = plt.subplots(2, 3, figsize=(15.5, 8.8), dpi=140, sharex=True)
     ax_list = axes.ravel()
 
@@ -916,6 +1160,10 @@ def plot_verification_timeseries(
     ax.plot(leads, _series("t2m", "bias"), "o-", label="T2m Bias (K)")
     ax.plot(leads, _series("t2m", "rmse"), "s--", label="T2m RMSE (K)")
     ax.plot(leads, _series("td2m", "bias"), "^:", label="Td2m Bias (K)")
+    ifs_t2m = _ifs_series("t2m", "rmse")
+    if np.any(np.isfinite(ifs_t2m)):
+        m_i = np.isfinite(ifs_t2m)
+        ax.plot(leads[m_i], ifs_t2m[m_i], "kD--", linewidth=1.2, markersize=5, label="IFS 0.1° T2m RMSE")
     ax.set_title("2m Temperatuur & Dauwpunt (K)")
     ax.legend(fontsize=8)
 
@@ -924,6 +1172,10 @@ def plot_verification_timeseries(
     ax.axhline(0.0, color="black", linewidth=0.7)
     ax.plot(leads, _series("mslp", "bias"), "o-", color="#1f77b4", label="MSLP Bias (hPa)")
     ax.plot(leads, _series("mslp", "rmse"), "s--", color="#ff7f0e", label="MSLP RMSE (hPa)")
+    ifs_mslp = _ifs_series("mslp", "rmse")
+    if np.any(np.isfinite(ifs_mslp)):
+        m_i = np.isfinite(ifs_mslp)
+        ax.plot(leads[m_i], ifs_mslp[m_i], "kD--", linewidth=1.2, markersize=5, label="IFS 0.1° MSLP RMSE")
     ax.set_title("Luchtdruk op zeeniveau (hPa)")
     ax.legend(fontsize=8)
 
@@ -932,6 +1184,10 @@ def plot_verification_timeseries(
     ax.axhline(0.0, color="black", linewidth=0.7)
     ax.plot(leads, _series("rh", "bias"), "o-", color="#2ca02c", label="RH Bias (%)")
     ax.plot(leads, _series("rh", "rmse"), "s--", color="#9467bd", label="RH RMSE (%)")
+    ifs_rh = _ifs_series("rh", "rmse")
+    if np.any(np.isfinite(ifs_rh)):
+        m_i = np.isfinite(ifs_rh)
+        ax.plot(leads[m_i], ifs_rh[m_i], "kD--", linewidth=1.2, markersize=5, label="IFS 0.1° RH RMSE")
     ax.set_title("Relatieve Vochtigheid 2m (%)")
     ax.legend(fontsize=8)
 
@@ -940,6 +1196,10 @@ def plot_verification_timeseries(
     ax.axhline(0.0, color="black", linewidth=0.7)
     ax.plot(leads, _series("ws10", "bias"), "o-", label="10m Wind Bias (m/s)")
     ax.plot(leads, _series("ws10", "rmse"), "s--", label="10m Wind RMSE (m/s)")
+    ifs_ws = _ifs_series("ws10", "rmse")
+    if np.any(np.isfinite(ifs_ws)):
+        m_i = np.isfinite(ifs_ws)
+        ax.plot(leads[m_i], ifs_ws[m_i], "kD--", linewidth=1.2, markersize=5, label="IFS 0.1° Wind RMSE")
     ax_dir = ax.twinx()
     ax_dir.plot(leads, _series("wdir", "mae_deg"), "d:", color="#8c564b", label="Richting MAE (°)")
     ax_dir.set_ylabel("Richting MAE (°)", fontsize=8.5, color="#8c564b")
@@ -1007,6 +1267,9 @@ def verify_run_against_knmi(
     land_only_plots: bool = False,
     make_maps: bool = True,
     fetcher: Optional[Callable[[datetime.datetime, Path | str], Optional[Path]]] = None,
+    ifs_grib_dir: Optional[Path | str] = None,
+    compare_ifs: bool = False,
+    ifs_sampler: Optional[Callable[[Path | str, Sequence[Dict[str, Any]]], List[Dict[str, Any]]]] = None,
 ) -> Dict[str, Any]:
     """Verify every available forecast `.wx1` step of a run against KNMI 10-minute observations."""
     items, manifest = discover_forecast_wx1(input_path)
@@ -1027,11 +1290,25 @@ def verify_run_against_knmi(
         indep_h = float(independent_after_hour)
 
     fetch_fn = fetcher if fetcher is not None else (lambda dt, cdir: fetch_knmi_10min_netcdf(dt, cdir, api_key=api_key))
+    eff_ifs_dir = Path(ifs_grib_dir) if ifs_grib_dir is not None else (_auto_discover_ifs_dir(run_base, manifest) if compare_ifs else None)
+    ifs_by_time = discover_ifs_grib_by_valid_time(eff_ifs_dir) if eff_ifs_dir is not None else {}
+    ifs_sample_fn = ifs_sampler if ifs_sampler is not None else sample_ifs_grib_at_stations
+    if (compare_ifs or ifs_grib_dir is not None) and not ifs_by_time:
+        logger.warning("IFS comparison requested, but no *_sfc_*.grib2 files found (dir=%s).", eff_ifs_dir)
 
     all_pairs_all: List[Dict[str, Any]] = []
     all_pairs_land: List[Dict[str, Any]] = []
     indep_pairs_all: List[Dict[str, Any]] = []
     indep_pairs_land: List[Dict[str, Any]] = []
+    ifs_t_all: List[Dict[str, Any]] = []
+    ifs_i_all: List[Dict[str, Any]] = []
+    ifs_t_land: List[Dict[str, Any]] = []
+    ifs_i_land: List[Dict[str, Any]] = []
+    ifs_indep_t_all: List[Dict[str, Any]] = []
+    ifs_indep_i_all: List[Dict[str, Any]] = []
+    ifs_indep_t_land: List[Dict[str, Any]] = []
+    ifs_indep_i_land: List[Dict[str, Any]] = []
+    ifs_matched_leads: List[float] = []
     hourly_records: List[Dict[str, Any]] = []
     station_buckets: Dict[str, List[Dict[str, Any]]] = {}
 
@@ -1095,7 +1372,7 @@ def verify_run_against_knmi(
             indep_pairs_all.extend(matched)
             indep_pairs_land.extend(land_rows)
 
-        rec = {
+        rec: Dict[str, Any] = {
             "lead_hours": lead_h,
             "valid_time_utc": valid_dt.isoformat(),
             "independent": is_indep,
@@ -1112,6 +1389,34 @@ def verify_run_against_knmi(
             },
             "obs_rows_land": land_rows,
         }
+
+        v_key = _to_utc(valid_dt).strftime("%Y-%m-%dT%H:%MZ")
+        ifs_path = ifs_by_time.get(v_key)
+        if ifs_path is not None:
+            ifs_matched = ifs_sample_fn(ifs_path, stations)
+            for ir in ifs_matched:
+                ir["lead_hours"] = lead_h
+                ir["valid_time_utc"] = valid_dt.isoformat()
+            ifs_land_raw = [r for r in ifs_matched if not r["is_offshore"]]
+            t_all_a, i_all_a = _align_rows_with_ifs(matched, ifs_matched)
+            t_land_a, i_land_a = _align_rows_with_ifs(land_rows, ifs_land_raw)
+            ifs_all_stats = _summarize_matched_rows(i_all_a)
+            ifs_land_stats = _summarize_matched_rows(i_land_a)
+            t_land_for_skill = _summarize_matched_rows(t_land_a)
+            rec["ifs_all"] = ifs_all_stats
+            rec["ifs_land"] = ifs_land_stats
+            rec["skill_vs_ifs_land"] = compute_skill_score_vs_ifs(t_land_for_skill, ifs_land_stats)
+            ifs_t_all.extend(t_all_a)
+            ifs_i_all.extend(i_all_a)
+            ifs_t_land.extend(t_land_a)
+            ifs_i_land.extend(i_land_a)
+            if is_indep:
+                ifs_indep_t_all.extend(t_all_a)
+                ifs_indep_i_all.extend(i_all_a)
+                ifs_indep_t_land.extend(t_land_a)
+                ifs_indep_i_land.extend(i_land_a)
+            ifs_matched_leads.append(lead_h)
+
         hourly_records.append(rec)
 
         if make_maps:
@@ -1128,35 +1433,48 @@ def verify_run_against_knmi(
             map_paths.append(mp)
 
     # Hourly CSV export
+    has_ifs_rows = bool(ifs_matched_leads)
     hourly_csv_rows: List[Dict[str, Any]] = []
     for rec in hourly_records:
         st_b = rec["land"]
         gp = rec["grid_precip"]
-        hourly_csv_rows.append(
-            {
-                "lead_hours": rec["lead_hours"],
-                "valid_time_utc": rec["valid_time_utc"],
-                "independent": rec["independent"],
-                "n_land": st_b["n_stations"],
-                "n_all": rec["all"]["n_stations"],
-                "land_t2m_bias_k": round(st_b["t2m"]["bias"], 3),
-                "land_t2m_rmse_k": round(st_b["t2m"]["rmse"], 3),
-                "land_t2m_corr": round(st_b["t2m"]["corr"], 3),
-                "land_td2m_bias_k": round(st_b["td2m"]["bias"], 3),
-                "land_rh_bias_pct": round(st_b["rh"]["bias"], 2),
-                "land_mslp_bias_hpa": round(st_b["mslp"]["bias"], 3),
-                "land_mslp_rmse_hpa": round(st_b["mslp"]["rmse"], 3),
-                "land_ws10_bias_ms": round(st_b["ws10"]["bias"], 3),
-                "land_ws10_rmse_ms": round(st_b["ws10"]["rmse"], 3),
-                "land_wdir_mae_deg": round(st_b["wdir"]["mae_deg"], 1),
-                "land_fog_hits": st_b["fog"]["hits"],
-                "land_fog_misses": st_b["fog"]["misses"],
-                "land_fog_fa": st_b["fog"]["false_alarms"],
-                "grid_nl_precip_max_mmh": round(gp["nl_max_mmh"], 2),
-                "grid_int_precip_max_mmh": round(gp["int_max_mmh"], 2),
-                "grid_rim_precip_max_mmh": round(gp["rim_max_mmh"], 2),
-            }
-        )
+        csv_row: Dict[str, Any] = {
+            "lead_hours": rec["lead_hours"],
+            "valid_time_utc": rec["valid_time_utc"],
+            "independent": rec["independent"],
+            "n_land": st_b["n_stations"],
+            "n_all": rec["all"]["n_stations"],
+            "land_t2m_bias_k": round(st_b["t2m"]["bias"], 3),
+            "land_t2m_rmse_k": round(st_b["t2m"]["rmse"], 3),
+            "land_t2m_corr": round(st_b["t2m"]["corr"], 3),
+            "land_td2m_bias_k": round(st_b["td2m"]["bias"], 3),
+            "land_rh_bias_pct": round(st_b["rh"]["bias"], 2),
+            "land_mslp_bias_hpa": round(st_b["mslp"]["bias"], 3),
+            "land_mslp_rmse_hpa": round(st_b["mslp"]["rmse"], 3),
+            "land_ws10_bias_ms": round(st_b["ws10"]["bias"], 3),
+            "land_ws10_rmse_ms": round(st_b["ws10"]["rmse"], 3),
+            "land_wdir_mae_deg": round(st_b["wdir"]["mae_deg"], 1),
+            "land_fog_hits": st_b["fog"]["hits"],
+            "land_fog_misses": st_b["fog"]["misses"],
+            "land_fog_fa": st_b["fog"]["false_alarms"],
+            "grid_nl_precip_max_mmh": round(gp["nl_max_mmh"], 2),
+            "grid_int_precip_max_mmh": round(gp["int_max_mmh"], 2),
+            "grid_rim_precip_max_mmh": round(gp["rim_max_mmh"], 2),
+        }
+        if has_ifs_rows:
+            ib = rec.get("ifs_land")
+            sk = rec.get("skill_vs_ifs_land")
+            csv_row.update(
+                {
+                    "ifs_t2m_bias_k": round(ib["t2m"]["bias"], 3) if ib else float("nan"),
+                    "ifs_t2m_rmse_k": round(ib["t2m"]["rmse"], 3) if ib else float("nan"),
+                    "t2m_skill_vs_ifs": round(sk["t2m"]["skill_score"], 3) if sk else float("nan"),
+                    "ifs_mslp_bias_hpa": round(ib["mslp"]["bias"], 3) if ib else float("nan"),
+                    "ifs_mslp_rmse_hpa": round(ib["mslp"]["rmse"], 3) if ib else float("nan"),
+                    "ifs_ws10_rmse_ms": round(ib["ws10"]["rmse"], 3) if ib else float("nan"),
+                }
+            )
+        hourly_csv_rows.append(csv_row)
     hourly_csv_p = eff_outdir / "knmi_hourly_metrics.csv"
     if hourly_csv_rows:
         _write_csv(hourly_csv_p, hourly_csv_rows, list(hourly_csv_rows[0].keys()))
@@ -1203,6 +1521,28 @@ def verify_run_against_knmi(
         {k: v for k, v in rec.items() if k != "obs_rows_land"}
         for rec in hourly_records
     ]
+
+    ifs_comparison: Optional[Dict[str, Any]] = None
+    if ifs_matched_leads:
+        def _cmp_block(t_rows: Sequence[Dict[str, Any]], i_rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+            ts = _summarize_matched_rows(t_rows)
+            ist = _summarize_matched_rows(i_rows)
+            return {
+                "tempest": ts,
+                "ifs": ist,
+                "skill": compute_skill_score_vs_ifs(ts, ist),
+            }
+
+        ifs_comparison = {
+            "ifs_dir": str(eff_ifs_dir) if eff_ifs_dir is not None else "",
+            "matched_hours": len(ifs_matched_leads),
+            "matched_leads": ifs_matched_leads,
+            "overall_all": _cmp_block(ifs_t_all, ifs_i_all),
+            "overall_land": _cmp_block(ifs_t_land, ifs_i_land),
+            "independent_all": _cmp_block(ifs_indep_t_all, ifs_indep_i_all),
+            "independent_land": _cmp_block(ifs_indep_t_land, ifs_indep_i_land),
+        }
+
     summary: Dict[str, Any] = {
         "domain_name": domain_name,
         "input_path": str(root),
@@ -1214,6 +1554,7 @@ def verify_run_against_knmi(
         "overall_land": _summarize_matched_rows(all_pairs_land),
         "independent_all": _summarize_matched_rows(indep_pairs_all),
         "independent_land": _summarize_matched_rows(indep_pairs_land),
+        "ifs_comparison": ifs_comparison,
         "hourly": hourly_json,
         "worst_t2m_land_stations": [r for r in stn_rows_out if not r["is_offshore"]][:10],
         "artifacts": {

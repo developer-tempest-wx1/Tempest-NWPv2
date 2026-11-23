@@ -12,9 +12,12 @@ import xarray as xr
 import wx1
 
 from tempest_v2.knmi_verify import (
+    _bilinear_sample_latlon_2d,
     compute_continuous_stats,
     compute_fog_contingency,
+    compute_skill_score_vs_ifs,
     compute_wind_dir_stats_deg,
+    sample_ifs_grib_at_stations,
     verify_run_against_knmi,
 )
 from tempest_v2.projection import get_domain_spec
@@ -195,3 +198,107 @@ def test_verify_run_offline_synthetic_wx1_and_knmi_nc(tmp_path: Path) -> None:
     assert Path(res["artifacts"]["timeseries_png"]).stat().st_size > 10_000
     assert len(res["artifacts"]["map_pngs"]) == 2
     assert all(Path(p).stat().st_size > 10_000 for p in res["artifacts"]["map_pngs"])
+
+
+def test_ifs_latlon_bilinear_sampling_and_comparison(tmp_path: Path, monkeypatch) -> None:
+    """Verify IFS lat/lon bilinear sampling, Skill Score vs IFS, partial GRIB2 handling, and timeseries overlay."""
+    from tempest_v2 import ic_builder
+
+    # Test descending lat & 0..360 lon wrapping
+    lats_desc = np.array([54.0, 53.0, 52.0, 51.0], dtype=np.float64)
+    lons_360 = np.array([3.0, 5.0, 7.0], dtype=np.float64)
+    grid = lats_desc[:, None] * 10.0 + lons_360[None, :]
+    vals = _bilinear_sample_latlon_2d(grid, lats_desc, lons_360, np.array([52.5, 50.0]), np.array([5.5, 5.5]))
+    assert vals[0] == pytest.approx(52.5 * 10.0 + 5.5, abs=1e-6)
+    assert np.isnan(vals[1])
+
+    spec = get_domain_spec("lam_bnl_ns_de_2p5km", nz=16)
+    t0 = datetime.datetime(2026, 11, 22, 18, 0, tzinfo=datetime.timezone.utc)
+    t3 = datetime.datetime(2026, 11, 22, 21, 0, tzinfo=datetime.timezone.utc)
+
+    run_dir = tmp_path / "run"
+    _write_synthetic_wx1(run_dir / "d3" / f"forecast_{spec.name}_T+000h.wx1", spec, t0, 0.0, t2m_c=4.0, mslp_hpa=1012.0)
+    _write_synthetic_wx1(run_dir / "d3" / f"forecast_{spec.name}_T+003h.wx1", spec, t3, 3.0, t2m_c=3.2, mslp_hpa=1014.0)
+
+    cache_dir = tmp_path / "knmi_cache"
+    _write_synthetic_knmi_nc(
+        cache_dir / f"KMDS__OPER_P___10M_OBS_L2_{t0:%Y%m%d%H%M}.nc",
+        t0,
+        ta_c=np.array([4.0, 4.0, 4.0]),
+        pp_hpa=np.array([1012.0, 1012.0, 1012.0]),
+        ff_ms=np.array([5.0, 5.0, 5.0]),
+        dd_deg=np.array([270.0, 270.0, 270.0]),
+        rh_pct=np.array([92.0, 92.0, 92.0]),
+        vis_m=np.array([5000.0, 5000.0, 5000.0]),
+    )
+    _write_synthetic_knmi_nc(
+        cache_dir / f"KMDS__OPER_P___10M_OBS_L2_{t3:%Y%m%d%H%M}.nc",
+        t3,
+        ta_c=np.array([3.0, 3.0, 3.0]),  # Tempest bias=+0.2 K, IFS will be 1.5 K warmer -> Tempest wins!
+        pp_hpa=np.array([1014.0, 1014.0, 1014.0]),
+        ff_ms=np.array([5.0, 5.0, 5.0]),
+        dd_deg=np.array([270.0, 270.0, 270.0]),
+        rh_pct=np.array([92.0, 92.0, 92.0]),
+        vis_m=np.array([600.0, 2000.0, 600.0]),
+    )
+
+    ifs_dir = tmp_path / "ifs_cache"
+    ifs_dir.mkdir()
+    ifs_step12 = ifs_dir / "ecmwf_ifs_0p1_20261122_06Z_sfc_step012.grib2"
+    ifs_step15 = ifs_dir / "ecmwf_ifs_0p1_20261122_06Z_sfc_step015.grib2"
+    ifs_step12.write_bytes(b"grib")
+    ifs_step15.write_bytes(b"grib")
+
+    ifs_lats = np.linspace(54.5, 49.5, 11)
+    ifs_lons = np.linspace(2.0, 8.0, 13)
+
+    def _da(val: float):
+        arr = np.full((len(ifs_lats), len(ifs_lons)), val, dtype=np.float64)
+        return xr.DataArray(arr, dims=("latitude", "longitude"), coords={"latitude": ifs_lats, "longitude": ifs_lons})
+
+    fake_maps = {
+        str(ifs_step12): {
+            "t2m": (_da(273.15 + 5.0), ifs_lats, ifs_lons),
+            "d2m": (_da(273.15 + 3.0), ifs_lats, ifs_lons),
+            "msl": (_da(101_300.0), ifs_lats, ifs_lons),
+            "u10": (_da(7.0), ifs_lats, ifs_lons),
+            "v10": (_da(0.0), ifs_lats, ifs_lons),
+        },
+        # Step 15 simulates partial LBC GRIB2 with only t2m + msl
+        str(ifs_step15): {
+            "t2m": (_da(273.15 + 4.5), ifs_lats, ifs_lons),
+            "msl": (_da(101_500.0), ifs_lats, ifs_lons),
+        },
+    }
+    monkeypatch.setattr(ic_builder, "_read_cfgrib_var_map", lambda p, use_cache=False: fake_maps[str(p)])
+
+    # Direct unit check of sample_ifs_grib_at_stations
+    rows_ifs = sample_ifs_grib_at_stations(ifs_step12, [{"lat": 52.1, "lon": 5.18, "station_id": "06260", "is_offshore": False}])
+    assert rows_ifs[0]["mod_t2m_c"] == pytest.approx(5.0, abs=1e-4)
+    assert rows_ifs[0]["mod_ws10_ms"] == pytest.approx(7.0, abs=1e-4)
+
+    ss = compute_skill_score_vs_ifs({"t2m": {"rmse": 0.2, "bias": 0.2, "n": 3}}, {"t2m": {"rmse": 1.5, "bias": 1.5, "n": 3}})
+    assert ss["t2m"]["skill_score"] == pytest.approx(1.0 - 0.2 / 1.5, abs=1e-4)
+
+    out_dir = tmp_path / "verify_ifs"
+    res = verify_run_against_knmi(
+        run_dir,
+        outdir=out_dir,
+        knmi_cache_dir=cache_dir,
+        independent_after_hour=2.0,
+        make_maps=False,
+        ifs_grib_dir=ifs_dir,
+    )
+    icmp = res["ifs_comparison"]
+    assert icmp is not None
+    assert icmp["matched_hours"] == 2
+    assert icmp["matched_leads"] == [0.0, 3.0]
+    assert icmp["independent_land"]["tempest"]["t2m"]["rmse"] == pytest.approx(0.2, abs=1e-4)
+    assert icmp["independent_land"]["ifs"]["t2m"]["rmse"] == pytest.approx(1.5, abs=1e-4)
+    assert icmp["independent_land"]["skill"]["t2m"]["skill_score"] > 0.85
+    # Partial LBC step at T+3 lacks wind/Td, so ws10 is evaluated strictly on shared T+0 hour (n=3)
+    assert icmp["overall_land"]["tempest"]["ws10"]["n"] == 3
+    assert icmp["overall_land"]["ifs"]["ws10"]["n"] == 3
+    csv_txt = Path(res["artifacts"]["hourly_csv"]).read_text(encoding="utf-8")
+    assert "ifs_t2m_rmse_k" in csv_txt and "t2m_skill_vs_ifs" in csv_txt
+    assert Path(res["artifacts"]["timeseries_png"]).stat().st_size > 10_000
