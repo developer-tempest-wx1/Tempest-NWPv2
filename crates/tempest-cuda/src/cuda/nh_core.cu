@@ -2226,7 +2226,11 @@ __global__ void nh_estimate_cs_max_kernel(
 
 __global__ void nh_lbc_relax_qv_kernel(
     NhGridConfig cfg,
+    DeviceStaticGrid g,
     float dt_s,
+    int32_t cap_sat,
+    const float* thp,
+    const float* pip,
     const float* lbc_qv,
     float* qv
 ) {
@@ -2248,11 +2252,66 @@ __global__ void nh_lbc_relax_qv_kernel(
     }
     if (tau <= 0.0f) return;
 
-    const size_t idx = static_cast<size_t>(k) * cfg.ny * cfg.nx + static_cast<size_t>(j) * cfg.nx + i;
+    const size_t h_idx = static_cast<size_t>(j) * cfg.nx + i;
+    const size_t idx = static_cast<size_t>(k) * cfg.ny * cfg.nx + h_idx;
     const float q_cur = qv[idx];
-    const float q_tgt = fmaxf(0.0f, lbc_qv[idx]);
+    float q_tgt = fmaxf(0.0f, lbc_qv[idx]);
+    if (cap_sat != 0 && thp != nullptr && pip != nullptr && q_tgt > q_cur) {
+        const float pi_sfc_f = powf(static_cast<float>(cfg.p_sfc_pa) / P0_PA_F, KAPPA_F);
+        const float hs = static_cast<float>(g.hs[h_idx]);
+        const float z = static_cast<float>(g.zeta_s[k]) + static_cast<float>(g.b_s[k]) * hs;
+        float thb = 0.0f, pib = 0.0f;
+        eval_theta_pi_bar_f32(
+            z, static_cast<float>(cfg.theta_sfc_k), pi_sfc_f, static_cast<float>(cfg.n_ref_s), thb, pib
+        );
+        const float pi_k = fmaxf(1e-4f, pib + pip[idx]);
+        const float t_k = fmaxf(150.0f, (thb + thp[idx]) * pi_k);
+        const float p_k = P0_PA_F * powf(pi_k, 1.0f / KAPPA_F);
+        const float es_w = 611.2f * expf(17.67f * (t_k - 273.15f) / fmaxf(t_k - 29.65f, 1.0f));
+        const float es_i = 611.2f * expf(21.8745584f * (t_k - 273.15f) / fmaxf(t_k - 7.66f, 1.0f));
+        const float w_ice = fminf(1.0f, fmaxf(0.0f, (273.15f - t_k) / 20.0f));
+        const float es_eff = (1.0f - w_ice) * es_w + w_ice * (1.02f * es_i);
+        const float qs_cap = 0.62198f * es_eff / fmaxf(p_k - 0.378f * es_eff, 10.0f);
+        q_tgt = fminf(q_tgt, fmaxf(q_cur, 0.99f * qs_cap));
+    }
     const float alpha = 1.0f - expf(-tau * dt_s);
     qv[idx] = fmaxf(0.0f, q_cur + alpha * (q_tgt - q_cur));
+}
+
+__global__ void nh_lbc_relax_hydrometeors_kernel(
+    NhGridConfig cfg,
+    float dt_s,
+    float* qc,
+    float* qr,
+    float* qi,
+    float* qs,
+    float* qg
+) {
+    const int32_t i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int32_t j = blockIdx.y * blockDim.y + threadIdx.y;
+    const int32_t k = blockIdx.z;
+    if (k >= cfg.nz || j >= cfg.ny || i >= cfg.nx) return;
+    if (cfg.lbc_tau_max_s <= 0.0 || cfg.lbc_rim_width <= 0) return;
+
+    const float tau_max = static_cast<float>(cfg.lbc_tau_max_s);
+    float tau = 0.0f;
+    if (cfg.bc_x == 2) {
+        if (cfg.lbc_edges & 1) tau = fmaxf(tau, davies_weight_f(i, cfg.lbc_rim_width, tau_max));
+        if (cfg.lbc_edges & 2) tau = fmaxf(tau, davies_weight_f(cfg.nx - 1 - i, cfg.lbc_rim_width, tau_max));
+    }
+    if (cfg.bc_y == 2) {
+        if (cfg.lbc_edges & 4) tau = fmaxf(tau, davies_weight_f(j, cfg.lbc_rim_width, tau_max));
+        if (cfg.lbc_edges & 8) tau = fmaxf(tau, davies_weight_f(cfg.ny - 1 - j, cfg.lbc_rim_width, tau_max));
+    }
+    if (tau <= 0.0f) return;
+
+    const size_t idx = static_cast<size_t>(k) * cfg.ny * cfg.nx + static_cast<size_t>(j) * cfg.nx + i;
+    const float decay = expf(-tau * dt_s);
+    if (qc) qc[idx] *= decay;
+    if (qr) qr[idx] *= decay;
+    if (qi) qi[idx] *= decay;
+    if (qs) qs[idx] *= decay;
+    if (qg) qg[idx] *= decay;
 }
 
 inline int32_t advect_one_tracer(
@@ -3113,7 +3172,10 @@ int32_t nh_cuda_step_rk3(NhCudaHandle* h, double dt_s, int32_t n_substeps) {
 
         if (advect_one_tracer(h, h->d_qv, dt_full_f, n_sub_h, dt_h, pi_sfc_f) != 0) return -1;
         if ((h->cfg.bc_x == 2 || h->cfg.bc_y == 2) && h->d_lbc_qv && h->has_lbc_qv && h->cfg.lbc_tau_max_s > 0.0) {
-            nh_lbc_relax_qv_kernel<<<grid_s, block>>>(h->cfg, dt_full_f, h->d_lbc_qv, h->d_qv);
+            const int32_t cap_sat = (h->has_physics_alloc != 0 && h->pcfg.enable_microphysics != 0) ? 1 : 0;
+            nh_lbc_relax_qv_kernel<<<grid_s, block>>>(
+                h->cfg, g, dt_full_f, cap_sat, h->d_thp, h->d_pip, h->d_lbc_qv, h->d_qv
+            );
             CUDA_CHECK(cudaGetLastError());
         }
         if (advect_one_tracer(h, h->d_qc, dt_full_f, n_sub_h, dt_h, pi_sfc_f) != 0) return -1;
@@ -3121,6 +3183,13 @@ int32_t nh_cuda_step_rk3(NhCudaHandle* h, double dt_s, int32_t n_substeps) {
         if (advect_one_tracer(h, h->d_qi, dt_full_f, n_sub_h, dt_h, pi_sfc_f) != 0) return -1;
         if (advect_one_tracer(h, h->d_qs, dt_full_f, n_sub_h, dt_h, pi_sfc_f) != 0) return -1;
         if (advect_one_tracer(h, h->d_qg, dt_full_f, n_sub_h, dt_h, pi_sfc_f) != 0) return -1;
+        if ((h->cfg.bc_x == 2 || h->cfg.bc_y == 2) && h->d_lbc_thp != nullptr &&
+            h->cfg.lbc_tau_max_s > 0.0 && h->cfg.lbc_rim_width > 0) {
+            nh_lbc_relax_hydrometeors_kernel<<<grid_s, block>>>(
+                h->cfg, dt_full_f, h->d_qc, h->d_qr, h->d_qi, h->d_qs, h->d_qg
+            );
+            CUDA_CHECK(cudaGetLastError());
+        }
     }
 
     CUDA_CHECK(cudaDeviceSynchronize());

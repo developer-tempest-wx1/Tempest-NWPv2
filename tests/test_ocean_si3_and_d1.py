@@ -1024,3 +1024,50 @@ def test_d1_coarse_0p4_and_0p5_specs_and_0p4_single_tile_coupled_ocean_smoke() -
     free_after, _ = cuda_vram_info()
     assert free_after > 3_500_000_000, f"VRAM leak after d1_global_0p4 coupled close: free={free_after}"
 
+
+def test_clark_2008_visibility_fog_regimes() -> None:
+    """Verify Clark (2008)/WMO visibility distinguishes clear air, windy humid air, and calm nocturnal radiation fog."""
+    from tempest_v2.diagnostics import compute_synoptic_convective_2d
+    from tempest_v2.projection import LCCProjection, VerticalGrid, _make_lcc_domain
+
+    ny, nx = 4, 4
+    vgrid = VerticalGrid(nz=16, z_top_m=15_000.0, stretch_power=1.2)
+    spec_small = _make_lcc_domain("vis_test", ny=ny, nx=nx, dx_m=2500.0, projection=LCCProjection(), vertical=vgrid)
+    hs = np.zeros((ny, nx), dtype=np.float64)
+    st = {
+        "u": np.full((16, ny, nx + 1), 6.0, dtype=np.float32),
+        "v": np.zeros((16, ny + 1, nx), dtype=np.float32),
+        "theta_p": np.full((16, ny, nx), -10.0, dtype=np.float32),  # ~277 K at k=0
+        "pi_p": np.zeros((16, ny, nx), dtype=np.float32),
+        "qv": np.full((16, ny, nx), 0.005, dtype=np.float32),
+        "qc": np.zeros((16, ny, nx), dtype=np.float32),
+        "qr": np.zeros((16, ny, nx), dtype=np.float32),
+        "qi": np.zeros((16, ny, nx), dtype=np.float32),
+        "qs": np.zeros((16, ny, nx), dtype=np.float32),
+        "qg": np.zeros((16, ny, nx), dtype=np.float32),
+    }
+
+    def _run_vis(t2m_val: float, q2m_val: float, wspd_val: float, thp0: float = -10.0, qs0: float = 0.0) -> float:
+        st_loc = {k: v.copy() for k, v in st.items()}
+        st_loc["theta_p"][0] = thp0
+        st_loc["qs"][0] = qs0
+        sf = {
+            "t2m": np.full((ny, nx), t2m_val, dtype=np.float32),
+            "q2m": np.full((ny, nx), q2m_val, dtype=np.float32),
+            "u10m": np.full((ny, nx), wspd_val, dtype=np.float32),
+            "v10m": np.zeros((ny, nx), dtype=np.float32),
+            "ustar": np.full((ny, nx), 0.05 * wspd_val, dtype=np.float32),
+        }
+        return float(np.mean(compute_synoptic_convective_2d(spec_small, hs, st_loc, sf)["vis_m"]))
+
+    # qs(275K, ~1010hPa) ~ 4.41e-3
+    v_clear = _run_vis(280.0, 0.0038, 4.0)      # RH ~ 61%
+    v_windy_moist = _run_vis(275.0, 0.0044, 6.0) # RH ~ 99.6%, windy, no 2m inversion -> mist, NOT fog
+    v_calm_fog = _run_vis(275.0, 0.0044, 1.2)    # RH ~ 99.6%, calm & inverted (T_k0~277.6 vs T_2m=275) -> fog!
+    v_trace_snow = _run_vis(275.0, 0.00434, 3.0, qs0=3.0e-6)  # RH ~ 98.3% + trace snow -> mist > 2000 m, NOT fog FA
+    assert v_clear > 15_000.0, f"Clear air vis too low: {v_clear:.1f}"
+    assert v_windy_moist > 1500.0, f"Windy high-RH should not trigger fog FA: {v_windy_moist:.1f}"
+    assert v_calm_fog < 1000.0, f"Calm inverted near-saturated nocturnal air should give fog <1000 m, got {v_calm_fog:.1f}"
+    assert v_trace_snow > 2000.0, f"Trace snow + 98.3% RH should remain > 2000 m, got {v_trace_snow:.1f}"
+
+

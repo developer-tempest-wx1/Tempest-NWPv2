@@ -225,7 +225,8 @@ def build_domain_static_fields(
     soil_type = np.where(is_land, np.where(soil_type >= 1.0, soil_type, 9.0), 0.0).astype(np.float32)
 
     # Roughness length z0m, albedo, greenness fraction derived physically from elevation & terrain sigma
-    z0m_land = np.clip(0.05 + 0.0015 * oro_std + 0.08 * np.clip(hs_m / 600.0, 0.0, 1.0), 0.03, 1.2)
+    # Effective 2.5km countryside roughness (~0.15 m base) matches HARMONIE/IFS aerodynamic drag
+    z0m_land = np.clip(0.15 + 0.0015 * oro_std + 0.08 * np.clip(hs_m / 600.0, 0.0, 1.0), 0.05, 1.2)
     z0m_base = np.where(is_land, z0m_land, 1.0e-4).astype(np.float32)
     albedo_base = np.where(is_land, np.where(hs_m > 1800.0, 0.35, 0.19), 0.06).astype(np.float32)
     veg_frac = np.where(is_land, np.clip(0.65 - 0.35 * np.clip((hs_m - 600.0) / 1400.0, 0.0, 1.0), 0.15, 0.75), 0.0).astype(np.float32)
@@ -519,6 +520,10 @@ def _vertical_map_isobaric_to_klemp(
             th_i = np.where(below, th_bel, th_i)
 
         pi_i = np.power(np.maximum(p_i, 10.0) / P0_PA, KAPPA)
+        t_i = np.maximum(150.0, th_i * pi_i)
+        es_w = 611.2 * np.exp(17.67 * (t_i - 273.15) / np.maximum(t_i - 29.65, 1.0))
+        qs_w = 0.62198 * es_w / np.maximum(p_i - 0.378 * es_w, 10.0)
+        q_i = np.minimum(q_i, 0.995 * qs_w)
         theta_p_out[:, j0:j1, :] = (th_i.reshape(nz, ny_c, nx) - theta_bar_c).astype(np.float32)
         pi_p_out[:, j0:j1, :] = (pi_i.reshape(nz, ny_c, nx) - pi_bar_c).astype(np.float32)
         qv_out[:, j0:j1, :] = np.clip(q_i.reshape(nz, ny_c, nx), 1e-7, 0.04).astype(np.float32)
@@ -636,7 +641,25 @@ def ecmwf_grib_to_domain_state(
     t2m_h = _get_sfc(("t2m", "2t"), 285.0)
     d2m_key = next((k for k in ("d2m", "2d") if k in sfc_vars), None)
     d2m_h = _get_sfc((d2m_key,), float(np.mean(t2m_h))) if d2m_key is not None else None
-    skt_h = _get_sfc(("skt", "t"), float(np.mean(t2m_h)))
+    skt_key = next((k for k in ("skt", "t") if k in sfc_vars), None)
+    skt_h = _get_sfc((skt_key,), float(np.mean(t2m_h))) if skt_key is not None else np.full((spec.ny, spec.nx), float(np.mean(t2m_h)), dtype=np.float64)
+    if skt_key is not None and "lsm" in sfc_vars:
+        skt_da, skt_la, skt_lo = sfc_vars[skt_key]
+        lsm_da, _, _ = sfc_vars["lsm"]
+        skt_raw = np.asarray(skt_da.values, dtype=np.float64)
+        lsm_raw = np.asarray(lsm_da.values, dtype=np.float64)
+        while skt_raw.ndim > 2:
+            skt_raw = skt_raw[0]
+        while lsm_raw.ndim > 2:
+            lsm_raw = lsm_raw[0]
+        if skt_raw.shape == lsm_raw.shape:
+            skt_water_raw = np.where(lsm_raw < 0.5, skt_raw, np.nan)
+            water_fallback = max(float(np.mean(t2m_h)), 278.0)
+            sst_water_h = _regrid_latlon_field(skt_water_raw, skt_la, skt_lo, spec, fill_nan_value=water_fallback)
+        else:
+            sst_water_h = skt_h
+    else:
+        sst_water_h = skt_h
     sd_h = _get_sfc(("sd", "snow"), 0.0)
     # ECMWF IFS GRIB2 snow depth is in meters of water equivalent -> kg/m^2 = mm
     if "sd" in sfc_vars and "m" in str(sfc_vars["sd"][0].attrs.get("units", "")).lower():
@@ -669,7 +692,10 @@ def ecmwf_grib_to_domain_state(
     else:
         surf["q2m"] = np.clip(state_3d["qv"][0], 1e-7, 0.04).astype(np.float32)
     surf["snow_swe"] = sd_h.astype(np.float32)
-    surf["sst_bulk"] = np.clip(skt_h, 271.15, 310.0).astype(np.float32)
+    surf["sst_bulk"] = np.clip(sst_water_h, 271.15, 310.0).astype(np.float32)
+    if surface_static is not None and "lsm" in surface_static:
+        is_ocean = (np.asarray(surface_static["lsm"]) < 0.5) & (np.asarray(surface_static.get("lake_mask", 0.0)) < 0.5)
+        surf["t_skin"] = np.where(is_ocean, surf["sst_bulk"], surf["t_skin"]).astype(np.float32)
     surf["lake_tbot"] = np.clip(skt_h - 1.5, 273.15, 305.0).astype(np.float32)
 
     if soil_grib is not None and Path(soil_grib).is_file():

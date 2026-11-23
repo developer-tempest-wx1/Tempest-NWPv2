@@ -674,3 +674,139 @@ def test_cy46_physics_lw_cdnc_snow_and_default_unchanged() -> None:
         assert float(res_sf[2]["lw_down"].mean()) < float(res_sf[0]["lw_down"].mean())
     finally:
         solver.close()
+
+
+def test_beljaars_holtslag_sbl_dew_and_flake_cap() -> None:
+    """Verify Beljaars-Holtslag SBL decoupling, unimpeded dew deposition (lhf<0), and FLake hmld<=40 m cap."""
+    nz, ny, nx = 24, 2, 4
+    vgrid = VerticalGrid(nz=nz, z_top_m=12_000.0, stretch_power=1.2)
+    hs = np.zeros((ny, nx), dtype=np.float64)
+    solver = NonHydrostaticGPUSolver(
+        vgrid,
+        dx_m=2500.0,
+        dy_m=2500.0,
+        hs_m=hs,
+        has_moist=True,
+        has_physics=True,
+        theta_sfc_k=278.0,
+        p_sfc_pa=102_000.0,
+        n_ref_s=0.011,
+    )
+    try:
+        solver.set_physics_config(
+            enable_microphysics=0,
+            enable_pbl=1,
+            enable_radiation=1,
+            enable_surface=1,
+            rad_interval_s=300.0,
+            julian_day=326.0,
+            utc_seconds=0.0,
+            cy46_physics=1,
+        )
+        sstatic = solver.default_surface_static(
+            lat_deg=52.7, lon_deg=6.5, lsm=1.0, soil_type=9.0, albedo_base=0.19, z0m_base=0.15, veg_frac=0.60
+        )
+        # Right column is a deep (>100 m) lake cell to test FLake h_ml <= 40 m cap
+        sstatic["lsm"][:, -1] = 0.0
+        sstatic["lake_mask"][:, -1] = 1.0
+        sstatic["bathy_depth_m"][:, -1] = 120.0
+        solver.set_surface_static(sstatic)
+
+        st = solver.empty_state()
+        st["u"][:] = 4.0
+        st["qv"][:] = 0.0052  # humid evening air (qs(277.5K) ~ 5.1 g/kg -> dew on radiative cooling)
+        solver.upload_state(st)
+
+        surf = solver.empty_surface_state()
+        surf["t_skin"].fill(275.0)
+        surf["soil_t"][:].fill(277.0)
+        surf["soil_m"][:].fill(0.28)
+        surf["lake_tbot"].fill(277.0)
+        surf["lake_hmld"].fill(10.0)
+        solver.upload_surface(surf)
+
+        solver.step_physics(dt_s=120.0, n_steps=30)
+        sf = solver.download_surface()
+
+        land_lhf = float(sf["lhf"][:, :-1].mean())
+        land_shf = float(sf["shf"][:, :-1].mean())
+        land_w10 = float(np.hypot(sf["u10m"][:, :-1], sf["v10m"][:, :-1]).mean())
+        land_t2m = float(sf["t2m"][:, :-1].mean())
+        assert land_shf < -2.0, f"Expected nocturnal cooling SHF < -2 W/m^2, got {land_shf:.2f}"
+        assert land_lhf < -0.5, f"Expected unimpeded nocturnal dew deposition (LHF < -0.5 W/m^2), got {land_lhf:.2f}"
+        assert land_w10 < 3.0, f"Expected SBL nocturnal wind decoupling (< 3.0 m/s), got {land_w10:.2f}"
+        assert land_t2m < 277.5, f"Expected nocturnal 2m cooling < 277.5 K, got {land_t2m:.2f}"
+        assert float(sf["lake_hmld"][:, -1].max()) <= 40.0
+    finally:
+        solver.close()
+
+
+def test_snow_deposition_cap_and_cloud_droplet_sedimentation() -> None:
+    """Verify ice-supersaturated snow deposition never drains qv below qsi and qc sediments conservatively."""
+    nz, ny, nx = 32, 2, 2
+    vgrid = VerticalGrid(nz=nz, z_top_m=15_000.0, stretch_power=1.2)
+    hs = np.zeros((ny, nx), dtype=np.float64)
+    solver = NonHydrostaticGPUSolver(
+        vgrid,
+        dx_m=2500.0,
+        dy_m=2500.0,
+        hs_m=hs,
+        has_moist=True,
+        has_physics=True,
+        theta_sfc_k=288.15,
+        p_sfc_pa=101_325.0,
+        n_ref_s=0.01,
+    )
+    try:
+        sstatic = solver.default_surface_static(lsm=1.0)
+        solver.set_surface_static(sstatic)
+        _, z_s, _ = vgrid.heights_3d(hs)
+        ref = VerticalGrid.reference_state(z_s, theta_sfc_k=288.15, p_sfc_pa=101_325.0, brunt_vaisala_hz=0.01)
+        thb = ref["theta_bar"]
+        pib = ref["pi_bar"]
+        p_s = ref["p_bar"]
+
+        # 1. Cold supersaturated layer with heavy snow must NOT drain qv to 0
+        st1 = solver.empty_state()
+        st1["theta_p"][:] = -18.0
+        t_cold = (thb - 18.0) * pib
+        qsi = _qsat_ice_np(np.minimum(t_cold, 273.15), p_s)
+        st1["qv"][:] = np.clip(1.08 * qsi, 1e-6, 0.02).astype(np.float32)
+        st1["qs"][12:18] = 2.5e-3
+        solver.upload_state(st1)
+        solver.upload_surface(solver.empty_surface_state())
+        solver.set_physics_config(
+            enable_microphysics=1, enable_pbl=0, enable_radiation=0, enable_surface=0, cy46_physics=1
+        )
+        solver.step_physics(dt_s=30.0, n_steps=10)
+        out1 = solver.download_state()
+        assert float(out1["qv"][14].min()) >= float(0.85 * qsi[14, 0, 0]), "Snow deposition drained qv below qsi"
+
+        # 2. Pure low-level fog (qc = 8e-4 below autoconversion qc0 at high CDNC) settles to surface & conserves mass
+        st2 = solver.empty_state()
+        st2["qv"][:] = 0.005
+        st2["qc"][1:3] = 8.0e-4
+        solver.upload_state(st2)
+        solver.upload_surface(solver.empty_surface_state())
+        solver.set_physics_config(
+            enable_microphysics=1,
+            enable_pbl=0,
+            enable_radiation=0,
+            enable_surface=0,
+            cloud_num_land=500.0e6,
+            cy46_physics=0,
+        )
+        q_tot_0 = st2["qv"].astype(np.float64) + st2["qc"] + st2["qr"] + st2["qi"] + st2["qs"] + st2["qg"]
+        m_before = solver.tracer_mass(q_tot_0)
+        solver.step_physics(dt_s=60.0, n_steps=60)
+        out2 = solver.download_state()
+        sf2 = solver.download_surface()
+        assert float(sf2["rain_acc"].mean()) > 1.0e-4, "Expected gravitational qc fog droplet settling at surface"
+        q_tot_1 = out2["qv"].astype(np.float64) + out2["qc"] + out2["qr"] + out2["qi"] + out2["qs"] + out2["qg"]
+        m_after = solver.tracer_mass(q_tot_1)
+        m_precip = float(np.sum((sf2["rain_acc"] + sf2["snow_acc"] + sf2["graupel_acc"]) * (2500.0 * 2500.0)))
+        rel_err = abs((m_after + m_precip) - m_before) / max(m_before, 1e-12)
+        assert rel_err < 1.0e-4, f"Droplet sedimentation broke water conservation: rel_err={rel_err:.3e}"
+    finally:
+        solver.close()
+

@@ -446,7 +446,8 @@ def compute_synoptic_convective_2d(
     qr = np.maximum(np.asarray(state_3d.get("qr", np.zeros_like(t_3d)), dtype=np.float64), 0.0)
     qi = np.maximum(np.asarray(state_3d.get("qi", np.zeros_like(t_3d)), dtype=np.float64), 0.0)
     qs = np.maximum(np.asarray(state_3d.get("qs", np.zeros_like(t_3d)), dtype=np.float64), 0.0)
-    qhyd = qc + qr + qi + qs + np.maximum(np.asarray(state_3d.get("qg", np.zeros_like(t_3d)), dtype=np.float64), 0.0)
+    qg = np.maximum(np.asarray(state_3d.get("qg", np.zeros_like(t_3d)), dtype=np.float64), 0.0)
+    qhyd = qc + qr + qi + qs + qg
     rho = p_3d / (R_D * t_3d * np.maximum(1.0 + 0.608 * qv - qhyd, 0.5))
 
     # Surface 2m dewpoint & RH
@@ -544,16 +545,28 @@ def compute_synoptic_convective_2d(
         z_0c = z_s[k] + np.clip(frac, 0.0, 1.0) * (z_s[k + 1] - z_s[k])
         freezing_level_m = np.where(cross, z_0c, freezing_level_m)
 
-    # Kunkel (1984) + Stoelinga-Warner (1999) + RH haze meteorological visibility [m]
+    # WMO/ICAO 5% contrast (-ln 0.05 = 2.996) + Kunkel (1984) / Stoelinga-Warner (1999) + Clark (2008) Kohler haze
     lwc_g_m3 = 1000.0 * rho[0] * np.maximum(qc[0], 0.0)
     rwc_g_m3 = 1000.0 * rho[0] * np.maximum(qr[0], 0.0)
-    iwc_g_m3 = 1000.0 * rho[0] * np.maximum(qi[0] + qs[0], 0.0)
+    iwc_g_m3 = 1000.0 * rho[0] * np.maximum(qi[0], 0.0)
+    swc_g_m3 = 1000.0 * rho[0] * np.maximum(qs[0], 0.0)
+    gwc_g_m3 = 1000.0 * rho[0] * np.maximum(qg[0], 0.0)
     beta_c = 144.7 * np.power(lwc_g_m3, 0.88)
     beta_r = 2.24 * np.power(rwc_g_m3, 0.75)
     beta_i = 163.9 * np.power(iwc_g_m3, 1.0)
-    beta_haze = np.where(rh2m > 75.0, 0.0025 * np.exp((rh2m - 92.0) * 0.18), 0.0)
-    beta_tot = np.maximum(beta_c + beta_r + beta_i + beta_haze + 0.07824, 0.07824)
-    vis_m = np.clip(3912.0 / beta_tot, 10.0, 50_000.0)
+    beta_s = 10.4 * np.power(swc_g_m3, 0.78)
+    beta_g = 1.12 * np.power(gwc_g_m3, 0.75)
+    # Clark et al. (2008) / IFS Kohler hygroscopic aerosol swelling (clean background beta_dry=0.020 km^-1, exp=-2/3)
+    rh_frac = np.clip(rh2m / 100.0, 0.0, 0.999)
+    beta_haze = 0.020 * np.power(1.0 - np.minimum(rh_frac, 0.990), -2.0 / 3.0)
+    # Shallow 2m nocturnal radiation ground-fog (sub-grid condensate below k=0 when calm, inverted, and >= 99.4% RH)
+    inv_2m = np.clip(t_3d[0] - t2m, 0.0, 5.0)
+    calm_fac = np.clip((2.2 - wspd10) / 1.2, 0.0, 1.0)
+    s_excess = np.clip((rh_frac - 0.994) / 0.006, 0.0, 1.0)
+    lwc_2m_g_m3 = 0.040 * s_excess * calm_fac * np.clip(inv_2m / 0.6, 0.0, 1.0)
+    beta_fog2m = 144.7 * np.power(lwc_2m_g_m3, 0.88)
+    beta_tot = np.maximum(beta_c + beta_fog2m + beta_r + beta_i + beta_s + beta_g + beta_haze + 0.015, 0.05992)
+    vis_m = np.clip(2996.0 / beta_tot, 10.0, 50_000.0)
 
     # Surface precipitation rate [kg m^-2 s^-1]
     p_tot = (

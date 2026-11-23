@@ -213,3 +213,134 @@ def test_d3_default_2p5km_1tile_vram_fit() -> None:
     assert d3_1p5.dx_m == 1500.0
 
 
+def test_lbc_hydrometeor_decay_and_sat_cap_with_physics() -> None:
+    """Verify Davies hydrometeor relaxation damps rim qi/qs while active physics LBC qv avoids supersaturation runaway."""
+    from tempest_v2.cuda_bridge import NonHydrostaticGPUSolver
+
+    nz, ny, nx = 24, 16, 48
+    vgrid = VerticalGrid(nz=nz, z_top_m=15_000.0, stretch_power=1.2)
+    hs = np.zeros((ny, nx), dtype=np.float64)
+    solver = NonHydrostaticGPUSolver(
+        vgrid,
+        dx_m=2500.0,
+        dy_m=2500.0,
+        hs_m=hs,
+        has_moist=True,
+        has_physics=True,
+        bc_x=2,
+        bc_y=2,
+        use_coriolis=False,
+        lbc_rim_width=10,
+        lbc_tau_max_s=0.02,
+    )
+    try:
+        solver.set_surface_static(solver.default_surface_static())
+        solver.set_physics_config(enable_microphysics=1, enable_pbl=0, enable_radiation=0, enable_surface=0)
+        st = solver.empty_state()
+        st["u"][:] = 5.0
+        st["qv"][:] = 0.002
+        st["qi"][:] = 1.0e-3
+        st["qs"][:] = 1.0e-3
+        lbc = {k: st[k].copy() for k in ("u", "v", "w", "theta_p", "pi_p", "qv")}
+        lbc["qv"][-6:, :, :] = 0.015  # Extreme supersaturation in upper-air LBC
+        solver.upload_state(st)
+        solver.upload_surface(solver.empty_surface_state())
+        solver.set_lbc_target(lbc)
+        solver.step_rk3(dt_s=10.0, n_steps=30)
+        out = solver.download_state()
+
+        rim_qi = float(out["qi"][10, 6:10, 0:2].mean())
+        int_qi = float(out["qi"][10, 6:10, nx // 2].mean())
+        assert rim_qi < 0.25 * int_qi, f"Expected Davies rim hydrometeor decay: rim={rim_qi:.3e} vs int={int_qi:.3e}"
+        assert float(out["qv"][-4:, :, 0].max()) < 0.005, "Expected saturation-capped LBC qv nudging at cold upper levels"
+    finally:
+        solver.close()
+
+
+def test_coastal_skt_water_masking_and_t0_10m_wind_reduction(tmp_path, monkeypatch) -> None:
+    """Verify land-masked skt prevents coastal sea freezing, vertical qv caps at saturation, and T+0 10m wind uses log law."""
+    from pathlib import Path
+    import datetime
+    import xarray as xr
+    import wx1
+    from tempest_v2 import ic_builder
+    from tempest_v2.runner import write_forecast_wx1
+
+    ny, nx = 8, 12
+    vgrid = VerticalGrid(nz=16, z_top_m=15_000.0, stretch_power=1.2)
+    spec = _make_lcc_domain("test_coast_sst", ny=ny, nx=nx, dx_m=2500.0, projection=LCCProjection(), vertical=vgrid)
+    hs_m = np.zeros((ny, nx), dtype=np.float64)
+
+    lats = np.linspace(float(spec.lat2d.min()) - 0.5, float(spec.lat2d.max()) + 0.5, 16)
+    lons = np.linspace(float(spec.lon2d.min()) - 0.5, float(spec.lon2d.max()) + 0.5, 20)
+    lon2, lat2 = np.meshgrid(lons, lats)
+    mid_lon = float(np.mean(lons))
+    lsm_ecmwf = np.where(lon2 >= mid_lon, 1.0, 0.0)
+    skt_ecmwf = np.where(lsm_ecmwf >= 0.5, 267.0, 282.5)  # Freezing land next to +9.4C sea!
+    p_hpa = np.array([1000, 850, 700, 500, 300, 100], dtype=np.float64)
+    z_pl = np.array([110.0, 1450.0, 3000.0, 5570.0, 9160.0, 16_200.0])
+    t_pl = 282.0 - 0.0065 * z_pl
+
+    def _da2(arr):
+        return xr.DataArray(arr.astype(np.float64), dims=("latitude", "longitude"), coords={"latitude": lats, "longitude": lons})
+
+    def _da3(prof1d):
+        arr = np.broadcast_to(prof1d[:, None, None], (len(p_hpa), len(lats), len(lons))).copy()
+        return xr.DataArray(arr, dims=("isobaricInhPa", "latitude", "longitude"), coords={"isobaricInhPa": p_hpa, "latitude": lats, "longitude": lons})
+
+    pl_vars = {
+        "t": (_da3(t_pl), lats, lons),
+        "u": (_da3(np.full(len(p_hpa), 10.0)), lats, lons),
+        "v": (_da3(np.zeros(len(p_hpa))), lats, lons),
+        "q": (_da3(np.full(len(p_hpa), 0.020)), lats, lons),  # Supersaturated 20 g/kg input -> must be capped!
+        "gh": (_da3(z_pl), lats, lons),
+    }
+    sfc_vars = {
+        "msl": (_da2(np.full_like(lat2, 101_325.0)), lats, lons),
+        "t2m": (_da2(np.full_like(lat2, 276.0)), lats, lons),
+        "d2m": (_da2(np.full_like(lat2, 275.0)), lats, lons),
+        "skt": (_da2(skt_ecmwf), lats, lons),
+        "lsm": (_da2(lsm_ecmwf), lats, lons),
+        "sd": (_da2(np.zeros_like(lat2)), lats, lons),
+    }
+
+    sfc_p = tmp_path / "dummy_sfc.grib2"
+    pl_p = tmp_path / "dummy_pl.grib2"
+    sfc_p.write_bytes(b"grib")
+    pl_p.write_bytes(b"grib")
+    monkeypatch.setattr(ic_builder, "_read_cfgrib_var_map", lambda p: sfc_vars if "sfc" in str(p) else pl_vars)
+
+    sstatic = {
+        "lsm": np.where(spec.lon2d >= mid_lon + 0.05, 1.0, 0.0).astype(np.float32),  # Coastal water overlaps ECMWF land edge!
+        "lake_mask": np.where((spec.lon2d >= mid_lon + 0.05) & (spec.lat2d > float(np.mean(lats))), 1.0, 0.0).astype(np.float32),
+        "z0m_base": np.where(spec.lon2d >= mid_lon + 0.05, 0.15, 1e-4).astype(np.float32),
+        "bathy_depth_m": np.full((ny, nx), 20.0, dtype=np.float32),
+    }
+    state3d, surf, _ = ic_builder.ecmwf_grib_to_domain_state(sfc_p, pl_p, spec, hs_m, surface_static=sstatic)
+
+    is_ocean = (sstatic["lsm"] < 0.5) & (sstatic["lake_mask"] < 0.5)
+    assert float(surf["sst_bulk"][is_ocean].min()) > 280.0, f"Land skt contaminated coastal sst_bulk: {surf['sst_bulk'][is_ocean].min()}"
+    assert float(surf["t_skin"][is_ocean].min()) > 280.0
+    assert float(state3d["qv"][0].max()) < 0.008, "Vertical qv interpolation failed to cap supersaturation"
+
+    # Also verify T+0 10m wind uses logarithmic reduction and dynamic lake_tml uses t_skin
+    out_wx1 = Path(tmp_path) / "t0_test.wx1"
+    surf["t_skin"][:] = 278.5
+    write_forecast_wx1(
+        out_wx1,
+        datetime.datetime(2026, 11, 22, 18, 0, tzinfo=datetime.timezone.utc),
+        0.0,
+        spec,
+        hs_m,
+        state3d,
+        surf,
+        include_3d_diagnostics=False,
+        surface_static=sstatic,
+    )
+    with wx1.open_dataset(out_wx1) as ds:
+        w10_land = float(np.hypot(ds["u10m_geo"].values, ds["v10m_geo"].values)[sstatic["lsm"] >= 0.5].mean())
+        assert w10_land < 8.5, f"Expected T+0 log-law 10m wind reduction < 8.5 m/s for 10 m/s k=0 wind, got {w10_land:.2f}"
+        assert abs(float(ds["lake_tml"].values[sstatic["lake_mask"] >= 0.5].mean()) - 278.5) < 1e-3
+
+
+

@@ -254,6 +254,7 @@ def write_forecast_wx1(
     ocean_diag: Optional[Dict[str, np.ndarray]] = None,
     prev_precip_total: Optional[np.ndarray] = None,
     interval_s: float = 0.0,
+    surface_static: Optional[Dict[str, np.ndarray]] = None,
 ) -> Path:
     """Write synoptic 2D, soil, optional 3D isobaric & NEMO+SI3 forecast product in WX-1 (`zstd_shuffle`)."""
     p = Path(out_path)
@@ -278,7 +279,15 @@ def write_forecast_wx1(
         u_grid, v_grid = u10_r.astype(np.float64), v10_r.astype(np.float64)
     else:
         uc, vc = unstagger_uv(state_3d["u"][:1], state_3d["v"][:1])
-        u_grid, v_grid = uc[0].astype(np.float64), vc[0].astype(np.float64)
+        z0_arr: Any = (
+            np.clip(np.asarray(surface_static["z0m_base"], dtype=np.float64), 1e-4, 2.0)
+            if (surface_static is not None and "z0m_base" in surface_static)
+            else 0.15
+        )
+        z_0_agl = max(float(spec.vertical.zeta_s[0]), 10.5)
+        fac_10m = np.clip(np.log(10.0 / z0_arr) / np.maximum(np.log(z_0_agl / z0_arr), 0.5), 0.25, 1.0)
+        u_grid = fac_10m * uc[0].astype(np.float64)
+        v_grid = fac_10m * vc[0].astype(np.float64)
 
     if spec.is_projected and spec.projection is not None:
         u10_geo, v10_geo = spec.projection.grid_to_geo_wind(u_grid, v_grid, spec.lon2d)
@@ -290,6 +299,12 @@ def write_forecast_wx1(
         if arr is None:
             return np.full((spec.ny, spec.nx), fallback, dtype=np.float32)
         return np.asarray(arr, dtype=np.float32)
+
+    lake_tml_out = (
+        np.where(np.asarray(surface_static["lake_mask"]) >= 0.5, _var2d("t_skin", 283.0), _var2d("lake_tml", 283.0)).astype(np.float32)
+        if (surface_static is not None and "lake_mask" in surface_static)
+        else _var2d("lake_tml", 283.0)
+    )
 
     data_vars: Dict[str, Any] = {
         "t2m": (("y", "x"), _var2d("t2m", 285.0), {"units": "K", "standard_name": "air_temperature"}),
@@ -316,7 +331,7 @@ def write_forecast_wx1(
         "dt_cool": (("y", "x"), _var2d("dt_cool"), {"units": "K"}),
         "dt_warm": (("y", "x"), _var2d("dt_warm"), {"units": "K"}),
         "sst_bulk": (("y", "x"), _var2d("sst_bulk", 285.0), {"units": "K"}),
-        "lake_tml": (("y", "x"), _var2d("lake_tml", 283.0), {"units": "K"}),
+        "lake_tml": (("y", "x"), lake_tml_out, {"units": "K"}),
         "lake_tbot": (("y", "x"), _var2d("lake_tbot", 277.15), {"units": "K"}),
         "lake_hmld": (("y", "x"), _var2d("lake_hmld", 4.0), {"units": "m"}),
         "lake_hice": (("y", "x"), _var2d("lake_hice"), {"units": "m"}),
@@ -563,8 +578,8 @@ def run_domain_forecast(
         hyperdiff_coeff=0.005,
         sponge_depth_m=min(6000.0, 0.22 * spec.vertical.z_top_m),
         sponge_tau_max_s=0.01,
-        lbc_rim_width=max(2, min(8, spec.nx // 4)) if has_parent_lbc else 0,
-        lbc_tau_max_s=min(0.04, 0.45 / max(float(dt_s), 1.0)) if has_parent_lbc else 0.0,
+        lbc_rim_width=max(2, min(14, spec.nx // 4)) if has_parent_lbc else 0,
+        lbc_tau_max_s=min(0.015, 0.25 / max(float(dt_s), 1.0)) if has_parent_lbc else 0.0,
         theta_sfc_k=theta_sfc_ref,
         p_sfc_pa=p_sfc_ref,
         n_ref_s=n_ref_hz,
@@ -864,6 +879,7 @@ def run_domain_forecast(
                     ocean_diag=cur_oce_state,
                     prev_precip_total=prev_out_precip if step_idx > prev_out_step else None,
                     interval_s=max(0.0, (step_idx - prev_out_step) * float(dt_s)),
+                    surface_static=eff_static,
                 )
                 out_paths.append(fp)
                 logger.info("[%s] Wrote %s in %.2fs", spec.name, fp.name, time.perf_counter() - t_wx0)

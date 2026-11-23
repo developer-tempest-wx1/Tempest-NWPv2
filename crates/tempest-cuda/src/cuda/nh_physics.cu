@@ -653,7 +653,7 @@ __global__ void nh_apply_rad_kernel(
 // ===========================================================================
 
 __device__ inline float psim_jimenez(float zol) {
-    // Jimenez et al. (2012) / MMM sf_sfclayrev.F90 (BSD-3-Clause)
+    // Jimenez et al. (2012) unstable + Beljaars & Holtslag (1991) ECMWF IFS stable profile
     if (zol <= 0.0f) {
         const float z = fmaxf(zol, -15.0f);
         const float x = powf(1.0f - 16.0f * z, 0.25f);
@@ -667,7 +667,8 @@ __device__ inline float psim_jimenez(float zol) {
         return (1.0f - f) * psim_k + f * psim_c;
     } else {
         const float z = fminf(zol, 10.0f);
-        return -6.1f * logf(z + powf(1.0f + powf(z, 2.5f), 0.4f));
+        constexpr float A = 1.0f, B = 2.0f / 3.0f, C = 5.0f, D = 0.35f;
+        return -A * z - B * (z - C / D) * expf(-D * z) - (B * C) / D;
     }
 }
 
@@ -684,7 +685,8 @@ __device__ inline float psih_jimenez(float zol) {
         return (1.0f - f) * psih_k + f * psih_c;
     } else {
         const float z = fminf(zol, 10.0f);
-        return -5.3f * logf(z + powf(1.0f + powf(z, 1.1f), 1.0f / 1.1f));
+        constexpr float A = 1.0f, B = 2.0f / 3.0f, C = 5.0f, D = 0.35f;
+        return -powf(1.0f + (2.0f / 3.0f) * A * z, 1.5f) - B * (z - C / D) * expf(-D * z) - (B * C) / D + 1.0f;
     }
 }
 
@@ -709,7 +711,7 @@ __device__ inline void solve_mo_sfclayrev(
     }
     const float denom_m = fmaxf(ln_zm - psim_jimenez(zol) + psim_jimenez(zol * z0m / za), 0.5f);
     const float denom_h = fmaxf(ln_zh - psih_jimenez(zol) + psih_jimenez(zol * z0h / za), 0.5f);
-    ustar = fmaxf(0.02f, KARMAN_F * wspd / denom_m);
+    ustar = fmaxf(0.015f, KARMAN_F * wspd / denom_m);
     cm_out = (KARMAN_F / denom_m) * (KARMAN_F / denom_m);
     ch_out = (KARMAN_F / denom_m) * (KARMAN_F / denom_h);
     zol_out = zol;
@@ -868,39 +870,44 @@ __global__ void nh_surface_and_lsm_kernel(
         z0h_v = z0m_v * 0.1f;
 
         const float r_abs = (1.0f - alb) * sw_in + emis * lw_in;
-        const float lambda_sk = (1.0f - snow_cov) * (15.0f * (1.0f - veg_v) + 10.0f * veg_v) + snow_cov * 20.0f;
+        const float lambda_sk = (1.0f - snow_cov) * (15.0f * (1.0f - veg_v) + 10.0f * veg_v) + snow_cov * 7.0f;
         const float f_sm = fminf(1.0f, fmaxf(0.05f, (ms_soil[0] - th_wilt) / fmaxf(th_fc - th_wilt, 0.05f)));
         const float f_rad = (0.55f * sw_in * 2.0f / 100.0f + 0.02f) / (0.55f * sw_in * 2.0f / 100.0f + 1.0f);
         const float r_canopy = 110.0f / fmaxf(f_sm * f_rad, 0.04f);
+        const float r_soil = 50.0f / fmaxf(f_sm, 0.05f);
         float beta_ev = snow_cov + (1.0f - snow_cov) * f_sm * (1.0f - 0.5f * veg_v);
 
         t_sk_new = t_skin ? fminf(340.0f, fmaxf(210.0f, t_skin[col])) : ts_soil[0];
         if (t_sk_new <= 0.0f) t_sk_new = ts_soil[0];
 
-        const float land_ri_max = (pcfg.cy46_physics != 0) ? 0.2f : 1.0e6f;
-        // 2-outer coupled (M-O <-> Newton skin balance) closure
+        const float land_ri_max = (pcfg.cy46_physics != 0) ? 1.5f : 1.0e6f;
+        // 2-outer coupled (M-O <-> Newton skin balance) closure with HTESSEL bare-soil resistance & dew deposition
         for (int outer = 0; outer < 2; ++outer) {
             const float th_sk = t_sk_new / pi_s;
             const float q_sat_sk = qsat_water(t_sk_new, p_s);
-            const float q_sk_est = qv_a + beta_ev * (q_sat_sk - qv_a);
+            const float beta_outer = (q_sat_sk < qv_a) ? 1.0f : beta_ev;
+            const float q_sk_est = qv_a + beta_outer * (q_sat_sk - qv_a);
             const float thv_a = th_a * (1.0f + EPS_V_F * qv_a);
             const float thv_s = th_sk * (1.0f + EPS_V_F * q_sk_est);
             solve_mo_sfclayrev(za, wspd_eff, thv_a, thv_s, z0m_v, z0h_v, ustar_v, zol_v, cm_v, ch_v, land_ri_max);
 
             const float g_exch = ch_v * wspd_eff;
             const float beta_veg = 1.0f / (1.0f + g_exch * r_canopy);
-            beta_ev = snow_cov * 1.0f + (1.0f - snow_cov) * (veg_v * beta_veg + (1.0f - veg_v) * f_sm);
+            const float beta_bare = 1.0f / (1.0f + g_exch * r_soil);
+            beta_ev = snow_cov * 1.0f + (1.0f - snow_cov) * (veg_v * beta_veg + (1.0f - veg_v) * beta_bare);
+            const float lat_sfc = (swe > 0.1f) ? LS0_F : LV0_F;
             const float flhc = rho_a * CP_D_F * g_exch / pi_s;
-            const float flqc = rho_a * ((swe > 0.1f) ? LS0_F : LV0_F) * g_exch * beta_ev;
 
             for (int it = 0; it < 6; ++it) {
                 const float qs_t = qsat_water(t_sk_new, p_s);
                 const float dqs_t = dqsat_water_dt(t_sk_new, p_s);
+                const float beta_iter = (qs_t < qv_a) ? 1.0f : beta_ev;
+                const float flqc_iter = rho_a * lat_sfc * g_exch * beta_iter;
                 const float t2 = t_sk_new * t_sk_new;
                 const float t3 = t2 * t_sk_new;
                 const float rad_out = emis * STEFAN_BOLTZMANN_F * t3 * t_sk_new;
-                const float f_val = r_abs - rad_out - flhc * (t_sk_new - t_a_at_sfc) - flqc * (qs_t - qv_a) - lambda_sk * (t_sk_new - ts_soil[0]);
-                const float df = -4.0f * emis * STEFAN_BOLTZMANN_F * t3 - flhc - flqc * dqs_t - lambda_sk;
+                const float f_val = r_abs - rad_out - flhc * (t_sk_new - t_a_at_sfc) - flqc_iter * (qs_t - qv_a) - lambda_sk * (t_sk_new - ts_soil[0]);
+                const float df = -4.0f * emis * STEFAN_BOLTZMANN_F * t3 - flhc - flqc_iter * dqs_t - lambda_sk;
                 const float dt_step = fminf(15.0f, fmaxf(-15.0f, -f_val / fminf(df, -1.0f)));
                 t_sk_new = fminf(340.0f, fmaxf(200.0f, t_sk_new + dt_step));
                 if (fabsf(dt_step) < 1e-4f) break;
@@ -910,8 +917,10 @@ __global__ void nh_surface_and_lsm_kernel(
             }
             h_flux = flhc * (t_sk_new - t_a_at_sfc);
             const float qs_fin = qsat_water(t_sk_new, p_s);
-            le_flux = flqc * (qs_fin - qv_a);
-            q_sk_eff = qv_a + beta_ev * (qs_fin - qv_a);
+            const float beta_fin = (qs_fin < qv_a) ? 1.0f : beta_ev;
+            const float flqc_fin = rho_a * lat_sfc * g_exch * beta_fin;
+            le_flux = flqc_fin * (qs_fin - qv_a);
+            q_sk_eff = qv_a + beta_fin * (qs_fin - qv_a);
         }
 
         const float g0_flux = lambda_sk * (t_sk_new - ts_soil[0]);
@@ -989,10 +998,11 @@ __global__ void nh_surface_and_lsm_kernel(
     } else if (lake_v >= 0.5f) {
         constexpr float RHO_W = 1000.0f, CP_W = 4192.0f, RHO_CP_W = RHO_W * CP_W;
         constexpr float K_ICE = 2.29f, RHO_ICE = 917.0f, C_ALB_MR = 95.6f, T_MAX_DENS = 277.13f;
+        const float lake_depth = fminf(depth_v, 40.0f);
 
         float t_w = t_skin ? fminf(315.0f, fmaxf(250.0f, t_skin[col])) : 283.0f;
         float t_b = lake_tbot ? fminf(315.0f, fmaxf(273.15f, lake_tbot[col])) : 280.0f;
-        float h_ml = lake_hmld ? fminf(depth_v, fmaxf(0.01f, lake_hmld[col])) : fminf(depth_v, 2.5f);
+        float h_ml = lake_hmld ? fminf(lake_depth, fmaxf(0.01f, lake_hmld[col])) : fminf(lake_depth, 2.5f);
         float c_th = lake_ctheta ? fminf(0.80f, fmaxf(0.50f, lake_ctheta[col])) : 0.65f;
         float h_ice = lake_hice ? fminf(3.0f, fmaxf(0.0f, lake_hice[col])) : 0.0f;
 
@@ -1032,21 +1042,21 @@ __global__ void nh_surface_and_lsm_kernel(
             if (h_ice <= 1e-4f) { h_ice = 0.0f; t_w = T_FREEZE_F; }
             t_sk_new = t_w;
         } else {
-            const float c_eff = RHO_CP_W * fminf(depth_v, fmaxf(0.5f, h_ml + (1.0f - c_th) * (depth_v - h_ml)));
+            const float c_eff = RHO_CP_W * fminf(lake_depth, fmaxf(0.5f, h_ml + (1.0f - c_th) * (lake_depth - h_ml)));
             const float alpha_t = 1.6509e-5f * (t_w - T_MAX_DENS);
             const float buoy_s = GRAVITY_F * alpha_t * q_net / RHO_CP_W;
             const float u_star_w = sqrtf(rho_a / RHO_W) * ustar_v;
             if (buoy_s < 0.0f || u_star_w > 0.015f) {
                 const float w_conv = (buoy_s < 0.0f) ? cbrtf(-buoy_s * h_ml) : 0.0f;
                 const float dh = 0.25f * sqrtf(u_star_w * u_star_w + w_conv * w_conv);
-                h_ml = fminf(depth_v, h_ml + dh * dt_f * 0.2f);
+                h_ml = fminf(lake_depth, h_ml + dh * dt_f * 0.2f);
             } else {
                 const float us3 = u_star_w * u_star_w * u_star_w;
                 const float l_ob = fmaxf(0.2f, us3 / fmaxf(KARMAN_F * buoy_s, 1e-12f));
-                h_ml = fminf(depth_v, fmaxf(0.2f, h_ml + (fminf(depth_v, l_ob) - h_ml) * (dt_f / 3600.0f)));
+                h_ml = fminf(lake_depth, fmaxf(0.2f, h_ml + (fminf(lake_depth, l_ob) - h_ml) * (dt_f / 3600.0f)));
             }
             t_w = fminf(315.0f, fmaxf(T_FREEZE_F, t_w + q_net * dt_f / c_eff));
-            if (h_ml >= 0.98f * depth_v) {
+            if (h_ml >= 0.98f * lake_depth) {
                 t_b = t_w;
             } else {
                 t_b += (t_w - t_b) * (dt_f / (14.0f * 86400.0f));
@@ -1187,7 +1197,7 @@ __global__ void nh_pbl_scalar_kernel(
     const float hs = static_cast<float>(g.hs[col]);
     const float lsm_v = lsm ? lsm[col] : 1.0f;
     const float f_cor = fabsf(static_cast<float>(g.fcor[col]));
-    const float ustar_v = ustar ? fmaxf(0.05f, ustar[col]) : 0.15f;
+    const float ustar_v = ustar ? fmaxf(0.015f, ustar[col]) : 0.15f;
     const float shf_v = shf ? shf[col] : 0.0f;
     const float lhf_v = lhf ? lhf[col] : 0.0f;
 
@@ -1242,8 +1252,13 @@ __global__ void nh_pbl_scalar_kernel(
 
     const float wstar = (wtv0 > 0.0f) ? cbrtf((GRAVITY_F / fmaxf(thv0_raw, 150.0f)) * wtv0 * hpbl) : 0.0f;
     const float wstar3 = wstar * wstar * wstar;
-    const float wscale = fminf(16.0f * ustar_v, fmaxf(0.2f * ustar_v, cbrtf(us3_i + 4.0f * KARMAN_F * wstar3)));
     const float obukhov_l = (fabsf(wtv0) > 1e-8f) ? (-thv0_raw * us3_i / (KARMAN_F * GRAVITY_F * wtv0)) : 1e6f;
+    const float phi_m_sbl = (wtv0 <= 0.0f && obukhov_l > 0.0f)
+        ? fminf(6.0f, 1.0f + 5.0f * (0.1f * hpbl / fmaxf(obukhov_l, 2.0f)))
+        : 1.0f;
+    const float wscale = (wtv0 > 0.0f)
+        ? fminf(16.0f * ustar_v, fmaxf(0.2f * ustar_v, cbrtf(us3_i + 4.0f * KARMAN_F * wstar3)))
+        : fmaxf(0.05f * ustar_v, ustar_v / phi_m_sbl);
 
     // 2. Compute YSU K_h[k] -> kh_scratch[k] and Shallow EDMF Updraft Mass Flux M_u[k] -> mu_scratch[k]
     constexpr float AU_EDMF = 0.10f;
@@ -1274,7 +1289,9 @@ __global__ void nh_pbl_scalar_kernel(
         if (z_if < hpbl) {
             const float s = z_if / hpbl;
             const float km = KARMAN_F * wscale * z_if * (1.0f - s) * (1.0f - s);
-            const float pr = fminf(2.5f, fmaxf(0.65f, 1.0f + 2.1f * ((z_0 - hs) / fmaxf(fabsf(obukhov_l), 5.0f))));
+            const float pr = (wtv0 > 0.0f)
+                ? 0.85f
+                : fminf(3.0f, fmaxf(1.0f, 1.0f + 2.1f * (0.1f * hpbl / fmaxf(obukhov_l, 5.0f))));
             kh_val = fminf(1000.0f, fmaxf(0.01f, km / pr));
         } else {
             const float uk = 0.5f * (read_u_f(u, k, j, i, nz, cfg.ny, cfg.nx, cfg.bc_x, cfg.bc_y)
@@ -1440,12 +1457,23 @@ __global__ void nh_pbl_scalar_kernel(
     }
 }
 
+__device__ inline float eval_km_face(
+    const float* kh_scratch, int32_t k_iface, size_t n2, size_t col_a, size_t col_b, float pr_m
+) {
+    const float kh_if = kh_scratch
+        ? 0.5f * (kh_scratch[static_cast<size_t>(k_iface) * n2 + col_a]
+                + kh_scratch[static_cast<size_t>(k_iface) * n2 + col_b])
+        : 0.02f;
+    return fminf(1000.0f, fmaxf(0.02f, kh_if * pr_m));
+}
+
 __global__ void nh_pbl_momentum_u_kernel(
     NhGridConfig cfg,
     DeviceStaticGrid g,
     double dt_s,
     int32_t pass_edge,
     const float* pblh, const float* ustar, const float* sfc_drag_coeff,
+    const float* shf, const float* kh_scratch,
     float* u, double* tri_c, double* tri_d
 ) {
     const int32_t i = pass_edge ? cfg.nx : (blockIdx.x * blockDim.x + threadIdx.x);
@@ -1454,6 +1482,8 @@ __global__ void nh_pbl_momentum_u_kernel(
     if (!pass_edge && i >= cfg.nx) return;
     if (cfg.bc_x == 0 && (i == 0 || i == cfg.nx)) return;
 
+    (void)pblh;
+    (void)ustar;
     const int32_t nz = cfg.nz;
     const int32_t nx_u = cfg.nx + 1;
     const size_t n2 = static_cast<size_t>(cfg.ny) * cfg.nx;
@@ -1468,8 +1498,8 @@ __global__ void nh_pbl_momentum_u_kernel(
     const float th0_f = static_cast<float>(cfg.theta_sfc_k);
     const float nref_f = static_cast<float>(cfg.n_ref_s);
     const float hs = 0.5f * (static_cast<float>(g.hs[col_l]) + static_cast<float>(g.hs[col_r]));
-    const float hpbl = pblh ? 0.5f * (pblh[col_l] + pblh[col_r]) : 500.0f;
-    const float us = ustar ? fmaxf(0.05f, 0.5f * (ustar[col_l] + ustar[col_r])) : 0.15f;
+    const float shf_face = shf ? 0.5f * (shf[col_l] + shf[col_r]) : 0.0f;
+    const float pr_m = (shf_face < 0.0f) ? 1.5f : 1.0f;
     const float c_drag = sfc_drag_coeff ? 0.5f * (sfc_drag_coeff[col_l] + sfc_drag_coeff[col_r]) : 0.0f;
 
     float z_km = 0.0f, rhob_km = 0.0f;
@@ -1487,10 +1517,7 @@ __global__ void nh_pbl_momentum_u_kernel(
         if (k == 0) {
             sfc_impl = static_cast<double>(c_drag);
         } else {
-            const float z_if = (static_cast<float>(g.zeta_w[k]) + static_cast<float>(g.b_w[k]) * hs) - hs;
-            const float km = (z_if < hpbl)
-                ? fmaxf(0.1f, fminf(1000.0f, KARMAN_F * us * 2.0f * z_if * (1.0f - z_if / hpbl) * (1.0f - z_if / hpbl)))
-                : 0.2f;
+            const float km = eval_km_face(kh_scratch, k - 1, n2, col_l, col_r, pr_m);
             a_d = -static_cast<double>((0.5f * (rhob_km + rhob_c)) * km / fmaxf(1.0f, z_c - z_km));
         }
 
@@ -1498,10 +1525,7 @@ __global__ void nh_pbl_momentum_u_kernel(
         if (k + 1 < nz) {
             z_kp = static_cast<float>(g.zeta_s[k + 1]) + static_cast<float>(g.b_s[k + 1]) * hs;
             rhob_kp = eval_rho_bar_f32(z_kp, th0_f, pi_sfc_f, nref_f);
-            const float z_if = (static_cast<float>(g.zeta_w[k + 1]) + static_cast<float>(g.b_w[k + 1]) * hs) - hs;
-            const float km = (z_if < hpbl)
-                ? fmaxf(0.1f, fminf(1000.0f, KARMAN_F * us * 2.0f * z_if * (1.0f - z_if / hpbl) * (1.0f - z_if / hpbl)))
-                : 0.2f;
+            const float km = eval_km_face(kh_scratch, k, n2, col_l, col_r, pr_m);
             c_d = -static_cast<double>((0.5f * (rhob_c + rhob_kp)) * km / fmaxf(1.0f, z_kp - z_c));
         }
         const double b_d = mass_k / dt_s + sfc_impl - a_d - c_d;
@@ -1531,6 +1555,7 @@ __global__ void nh_pbl_momentum_v_kernel(
     double dt_s,
     int32_t pass_edge,
     const float* pblh, const float* ustar, const float* sfc_drag_coeff,
+    const float* shf, const float* kh_scratch,
     float* v, double* tri_c, double* tri_d
 ) {
     const int32_t i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1539,6 +1564,8 @@ __global__ void nh_pbl_momentum_v_kernel(
     if (!pass_edge && j >= cfg.ny) return;
     if (cfg.bc_y == 0 && (j == 0 || j == cfg.ny)) return;
 
+    (void)pblh;
+    (void)ustar;
     const int32_t nz = cfg.nz;
     const int32_t ny_v = cfg.ny + 1;
     const size_t n2 = static_cast<size_t>(cfg.ny) * cfg.nx;
@@ -1553,8 +1580,8 @@ __global__ void nh_pbl_momentum_v_kernel(
     const float th0_f = static_cast<float>(cfg.theta_sfc_k);
     const float nref_f = static_cast<float>(cfg.n_ref_s);
     const float hs = 0.5f * (static_cast<float>(g.hs[col_s]) + static_cast<float>(g.hs[col_n]));
-    const float hpbl = pblh ? 0.5f * (pblh[col_s] + pblh[col_n]) : 500.0f;
-    const float us = ustar ? fmaxf(0.05f, 0.5f * (ustar[col_s] + ustar[col_n])) : 0.15f;
+    const float shf_face = shf ? 0.5f * (shf[col_s] + shf[col_n]) : 0.0f;
+    const float pr_m = (shf_face < 0.0f) ? 1.5f : 1.0f;
     const float c_drag = sfc_drag_coeff ? 0.5f * (sfc_drag_coeff[col_s] + sfc_drag_coeff[col_n]) : 0.0f;
 
     float z_km = 0.0f, rhob_km = 0.0f;
@@ -1572,10 +1599,7 @@ __global__ void nh_pbl_momentum_v_kernel(
         if (k == 0) {
             sfc_impl = static_cast<double>(c_drag);
         } else {
-            const float z_if = (static_cast<float>(g.zeta_w[k]) + static_cast<float>(g.b_w[k]) * hs) - hs;
-            const float km = (z_if < hpbl)
-                ? fmaxf(0.1f, fminf(1000.0f, KARMAN_F * us * 2.0f * z_if * (1.0f - z_if / hpbl) * (1.0f - z_if / hpbl)))
-                : 0.2f;
+            const float km = eval_km_face(kh_scratch, k - 1, n2, col_s, col_n, pr_m);
             a_d = -static_cast<double>((0.5f * (rhob_km + rhob_c)) * km / fmaxf(1.0f, z_c - z_km));
         }
 
@@ -1583,10 +1607,7 @@ __global__ void nh_pbl_momentum_v_kernel(
         if (k + 1 < nz) {
             z_kp = static_cast<float>(g.zeta_s[k + 1]) + static_cast<float>(g.b_s[k + 1]) * hs;
             rhob_kp = eval_rho_bar_f32(z_kp, th0_f, pi_sfc_f, nref_f);
-            const float z_if = (static_cast<float>(g.zeta_w[k + 1]) + static_cast<float>(g.b_w[k + 1]) * hs) - hs;
-            const float km = (z_if < hpbl)
-                ? fmaxf(0.1f, fminf(1000.0f, KARMAN_F * us * 2.0f * z_if * (1.0f - z_if / hpbl) * (1.0f - z_if / hpbl)))
-                : 0.2f;
+            const float km = eval_km_face(kh_scratch, k, n2, col_s, col_n, pr_m);
             c_d = -static_cast<double>((0.5f * (rhob_c + rhob_kp)) * km / fmaxf(1.0f, z_kp - z_c));
         }
         const double b_d = mass_k / dt_s + sfc_impl - a_d - c_d;
@@ -1614,12 +1635,17 @@ __global__ void nh_pbl_momentum_v_kernel(
 // PILLAR 1 (6-Class Mixed-Phase Microphysics + SLW + ICON compute_sink + Fallout)
 // ===========================================================================
 
-__device__ inline float mp_fall_speed(int sp_idx, float rho, float t_k, float q) {
-    // sp_idx: 2=rain, 3=ice, 4=snow, 5=graupel (WSM6 Gamma-weighted terminal velocities)
+__device__ inline float mp_fall_speed(int sp_idx, float rho, float t_k, float q, float n_drop_m3 = 1.0e8f) {
+    // sp_idx: 1=cloud (HARMONIE Stokes), 2=rain, 3=ice, 4=snow, 5=graupel (WSM6 Gamma-weighted terminal velocities)
     if (q <= 1e-12f) return 0.0f;
     const float rho_corr = sqrtf(1.225f / fmaxf(rho, 0.05f));
     const float rq = rho * q;
     if (rq <= 1e-18f) return 0.0f;
+    if (sp_idx == 1) {
+        const float nc = fmaxf(n_drop_m3, 2.0e7f);
+        const float rv = cbrtf((3.0f * rq) / (4.0f * PI_CONST_F * 1000.0f * nc));
+        return fminf(0.15f, 1.35f * 1.19e8f * rv * rv * rho_corr);
+    }
     if (sp_idx == 2) {
         const float lam_r = powf(PI_CONST_F * 1000.0f * 8.0e6f / rq, 0.25f);
         return fminf(12.0f, 2502.8f * rho_corr * powf(lam_r, -0.8f));
@@ -1793,8 +1819,15 @@ __global__ void nh_microphysics_kernel(
             if (q[4] > 1e-8f) {
                 if (q[1] > 1e-6f) sx2x[1][4] += 2.2f * rho * q[4] * q[1] * rho_corr;
                 const float f_sdep = 4.0e-3f * (q[0] - qsi) / fmaxf(qsi, 1e-6f) * powf(rho * q[4], 0.6f);
-                if (q[0] > qsi) sx2x[0][4] += fmaxf(0.0f, f_sdep);
-                else sx2x[4][0] += fmaxf(0.0f, -f_sdep);
+                if (q[0] > qsi) sx2x[0][4] += fmaxf(0.0f, fminf(f_sdep, (q[0] - qsi) / dt_f));
+                else sx2x[4][0] += fmaxf(0.0f, fminf(-f_sdep, (qsi - q[0]) / dt_f));
+            }
+            const float dep_tot = (sx2x[0][3] + sx2x[0][4]) * dt_f;
+            const float dep_max = fmaxf(0.0f, q[0] - qsi);
+            if (dep_tot > dep_max && dep_tot > 0.0f) {
+                const float dep_scale = dep_max / dep_tot;
+                sx2x[0][3] *= dep_scale;
+                sx2x[0][4] *= dep_scale;
             }
             if (q[2] > 1e-7f && dtemp > 4.0f) {
                 sx2x[2][5] += 0.1f * (expf(0.66f * dtemp) - 1.0f) * (rho * q[2] * q[2]);
@@ -1861,12 +1894,12 @@ __global__ void nh_microphysics_kernel(
         qg[idx] = q[5];
     }
 
-    // Pass 2: Subcycled Conservative Float64 Budget Column Fallout (qr, qi, qs, qg)
-    float* fall_ptrs[4] = {qr, qi, qs, qg};
-    const int fall_ids[4] = {2, 3, 4, 5};
-    double acc_col[4] = {0.0, 0.0, 0.0, 0.0};
+    // Pass 2: Subcycled Conservative Float64 Budget Column Fallout (qc, qr, qi, qs, qg)
+    float* fall_ptrs[5] = {qc, qr, qi, qs, qg};
+    const int fall_ids[5] = {1, 2, 3, 4, 5};
+    double acc_col[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
 
-    for (int f = 0; f < 4; ++f) {
+    for (int f = 0; f < 5; ++f) {
         float* qf = fall_ptrs[f];
         const int sp_id = fall_ids[f];
         double max_cfl = 0.0;
@@ -1887,7 +1920,8 @@ __global__ void nh_microphysics_kernel(
                 const float t_k = (thb + thp[idx]) * pi_k;
                 const float p_k = P0_PA_F * powf(pi_k, 1.0f / KAPPA_F);
                 const float rho_act = fmaxf(1e-5f, p_k / (R_D_F * t_k));
-                const float vt = mp_fall_speed(sp_id, rho_act, t_k, static_cast<float>(q_k));
+                const float n_drop_k = (pcfg.cy46_physics != 0) ? cy46_cdnc_m3(p_k, k) : n_drop;
+                const float vt = mp_fall_speed(sp_id, rho_act, t_k, static_cast<float>(q_k), n_drop_k);
                 max_cfl = fmax(max_cfl, static_cast<double>(vt) * dt_s / dz_k);
             }
         }
@@ -1913,7 +1947,8 @@ __global__ void nh_microphysics_kernel(
                     const float t_k = (thb + thp[idx]) * pi_k;
                     const float p_k = P0_PA_F * powf(pi_k, 1.0f / KAPPA_F);
                     const float rho_act = fmaxf(1e-5f, p_k / (R_D_F * t_k));
-                    const float vt = mp_fall_speed(sp_id, rho_act, t_k, static_cast<float>(q_k));
+                    const float n_drop_k = (pcfg.cy46_physics != 0) ? cy46_cdnc_m3(p_k, k) : n_drop;
+                    const float vt = mp_fall_speed(sp_id, rho_act, t_k, static_cast<float>(q_k), n_drop_k);
                     const double cfl = fmin(0.95, static_cast<double>(vt) * dt_sub / dz_k);
                     flux_out = mk * cfl;
                 }
@@ -1929,11 +1964,11 @@ __global__ void nh_microphysics_kernel(
         }
     }
 
-    if (rain_acc) rain_acc[col] = static_cast<float>(static_cast<double>(rain_acc[col]) + acc_col[0]);
-    if (snow_acc) snow_acc[col] = static_cast<float>(static_cast<double>(snow_acc[col]) + acc_col[1] + acc_col[2]);
-    if (graupel_acc) graupel_acc[col] = static_cast<float>(static_cast<double>(graupel_acc[col]) + acc_col[3]);
-    if (precip_liq_rate) precip_liq_rate[col] = static_cast<float>(acc_col[0] / dt_s);
-    if (precip_ice_rate) precip_ice_rate[col] = static_cast<float>((acc_col[1] + acc_col[2] + acc_col[3]) / dt_s);
+    if (rain_acc) rain_acc[col] = static_cast<float>(static_cast<double>(rain_acc[col]) + acc_col[0] + acc_col[1]);
+    if (snow_acc) snow_acc[col] = static_cast<float>(static_cast<double>(snow_acc[col]) + acc_col[2] + acc_col[3]);
+    if (graupel_acc) graupel_acc[col] = static_cast<float>(static_cast<double>(graupel_acc[col]) + acc_col[4]);
+    if (precip_liq_rate) precip_liq_rate[col] = static_cast<float>((acc_col[0] + acc_col[1]) / dt_s);
+    if (precip_ice_rate) precip_ice_rate[col] = static_cast<float>((acc_col[2] + acc_col[3] + acc_col[4]) / dt_s);
 }
 
 // ---------------------------------------------------------------------------
@@ -2297,19 +2332,19 @@ int32_t nh_cuda_step_physics(NhCudaHandle* h, double dt_s) {
 
             nh_pbl_momentum_u_kernel<<<grid, block>>>(
                 h->cfg, g, dt_s, 0, h->d_pblh, h->d_ustar, h->d_sfc_drag_coeff,
-                h->d_u, h->d_tri_c, h->d_tri_d
+                h->d_shf, h->d_q_tmp, h->d_u, h->d_tri_c, h->d_tri_d
             );
             nh_pbl_momentum_u_kernel<<<dim3(1, (h->cfg.ny + 15) / 16), dim3(1, 16)>>>(
                 h->cfg, g, dt_s, 1, h->d_pblh, h->d_ustar, h->d_sfc_drag_coeff,
-                h->d_u, h->d_tri_c, h->d_tri_d
+                h->d_shf, h->d_q_tmp, h->d_u, h->d_tri_c, h->d_tri_d
             );
             nh_pbl_momentum_v_kernel<<<grid, block>>>(
                 h->cfg, g, dt_s, 0, h->d_pblh, h->d_ustar, h->d_sfc_drag_coeff,
-                h->d_v, h->d_tri_c, h->d_tri_d
+                h->d_shf, h->d_q_tmp, h->d_v, h->d_tri_c, h->d_tri_d
             );
             nh_pbl_momentum_v_kernel<<<dim3((h->cfg.nx + 15) / 16, 1), dim3(16, 1)>>>(
                 h->cfg, g, dt_s, 1, h->d_pblh, h->d_ustar, h->d_sfc_drag_coeff,
-                h->d_v, h->d_tri_c, h->d_tri_d
+                h->d_shf, h->d_q_tmp, h->d_v, h->d_tri_c, h->d_tri_d
             );
             NH_CUDA_CHECK(cudaGetLastError());
         }
