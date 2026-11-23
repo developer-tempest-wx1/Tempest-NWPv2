@@ -288,6 +288,91 @@ def test_diurnal_cycle_radiation_lsm_pbl_debilt() -> None:
         solver.close()
 
 
+def test_november_clear_sky_sw_and_midpoint_debilt() -> None:
+    """Verify Nov 23 clear-sky De Bilt SW_down matches ~286-314 W/m2 (no NIR CO2 over-absorption) and midpoint hour angle."""
+    nz, ny, nx = 40, 2, 2
+    vgrid = VerticalGrid(nz=nz, z_top_m=22_000.0, stretch_power=1.4)
+    hs = np.zeros((ny, nx), dtype=np.float64)
+    solver = NonHydrostaticGPUSolver(
+        vgrid,
+        dx_m=2500.0,
+        dy_m=2500.0,
+        hs_m=hs,
+        has_moist=True,
+        has_physics=True,
+        theta_sfc_k=276.0,
+        p_sfc_pa=102_500.0,
+        n_ref_s=0.011,
+    )
+    try:
+        sstatic = solver.default_surface_static(
+            lat_deg=52.10,
+            lon_deg=5.18,
+            lsm=1.0,
+            soil_type=9.0,
+            albedo_base=0.19,
+            z0m_base=0.05,
+            veg_frac=0.60,
+        )
+        solver.set_surface_static(sstatic)
+        _, z_s, _ = vgrid.heights_3d(hs)
+        state = solver.empty_state()
+        state["qv"][:] = (0.004 * np.exp(-z_s / 2500.0)).astype(np.float32)
+        solver.upload_state(state)
+
+        surf = solver.empty_surface_state()
+        surf["t_skin"].fill(276.0)
+        surf["soil_t"].fill(276.0)
+        solver.upload_surface(surf)
+
+        # 12:00 UTC Nov 23 (DOY 327): instantaneous clear-sky SW_down at De Bilt (~286-314 W/m2 measured)
+        solver.set_physics_config(
+            enable_microphysics=0,
+            enable_pbl=0,
+            enable_radiation=1,
+            enable_surface=0,
+            rad_interval_s=0.0,
+            julian_day=327.0,
+            utc_seconds=12.0 * 3600.0,
+            co2_ppm=425.0,
+        )
+        solver.step_physics(dt_s=12.0, n_steps=1)
+        sw_inst = float(solver.download_surface()["sw_down"].mean())
+        assert 240.0 <= sw_inst <= 330.0, f"Unexpected Nov 23 12Z De Bilt clear-sky SW_down={sw_inst:.1f} W/m^2"
+
+        # 09:00 UTC Nov 23 with 900s interval must use midpoint (09:07:30 UTC > 09:00:00 UTC)
+        solver.set_physics_config(
+            enable_microphysics=0,
+            enable_pbl=0,
+            enable_radiation=1,
+            enable_surface=0,
+            rad_interval_s=0.0,
+            julian_day=327.0,
+            utc_seconds=9.0 * 3600.0,
+            co2_ppm=425.0,
+        )
+        solver.step_physics(dt_s=12.0, n_steps=1)
+        sw_09_exact = float(solver.download_surface()["sw_down"].mean())
+
+        solver.set_physics_config(
+            enable_microphysics=0,
+            enable_pbl=0,
+            enable_radiation=1,
+            enable_surface=0,
+            rad_interval_s=900.0,
+            julian_day=327.0,
+            utc_seconds=9.0 * 3600.0,
+            co2_ppm=425.0,
+        )
+        solver.step_physics(dt_s=12.0, n_steps=1)
+        sw_09_mid = float(solver.download_surface()["sw_down"].mean())
+        assert sw_09_mid > sw_09_exact + 5.0, (
+            f"Expected morning midpoint 09:07:30Z SW ({sw_09_mid:.1f}) > 09:00Z ({sw_09_exact:.1f})"
+        )
+    finally:
+        solver.close()
+
+
 def test_nemo_north_sea_coare_skin_and_flake_ijsselmeer() -> None:
     """Verify COARE 3.6 cool-skin/warm-layer, shallow-water z0, and FLake open water & freezing."""
     nz, ny, nx = 24, 2, 6

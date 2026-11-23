@@ -167,7 +167,8 @@ __device__ inline void sw_layer_optics(
         od_gas = 0.025f * (dp / 101325.0f) + 0.032f * o3_prof * (dp / 8000.0f);
     } else {
         od_sca_ray = 0.012f * (dp / 101325.0f);
-        od_gas = 0.0085f * dm_wv_p + 0.00018f * (co2_ppm / 425.0f) * dm_air * p_scale;
+        // Dimensionless pressure fraction matches Band 0 (column broadband NIR CO2+O2 OD ~ 0.017)
+        od_gas = 0.0085f * dm_wv_p + 0.030f * (co2_ppm / 425.0f) * (dp / 101325.0f) * p_scale;
     }
 
     const float lwc = rho * fmaxf(0.0f, qc + 0.15f * qr);
@@ -440,7 +441,8 @@ __global__ void nh_radiation_ecrad_kernel(
                      - 0.002697f * cosf(3.0f * gamma) + 0.001480f * sinf(3.0f * gamma);
     const float eqt = 0.000075f + 0.001868f * cosf(gamma) - 0.032077f * sinf(gamma)
                     - 0.014615f * cosf(2.0f * gamma) - 0.040849f * sinf(2.0f * gamma);
-    const float hr_ang = (static_cast<float>(pcfg.utc_seconds) / 86400.0f - 0.5f) * 2.0f * PI_CONST_F
+    const float rad_mid_s = (pcfg.rad_interval_s > 0.0) ? (0.5f * static_cast<float>(pcfg.rad_interval_s)) : 0.0f;
+    const float hr_ang = ((static_cast<float>(pcfg.utc_seconds) + rad_mid_s) / 86400.0f - 0.5f) * 2.0f * PI_CONST_F
                        + lon_v * (PI_CONST_F / 180.0f) + eqt;
     const float lat_r = lat_v * (PI_CONST_F / 180.0f);
     const float mu0 = sinf(lat_r) * sinf(decl) + cosf(lat_r) * cosf(decl) * cosf(hr_ang);

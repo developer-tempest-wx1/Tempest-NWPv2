@@ -535,7 +535,8 @@ def compute_synoptic_convective_2d(
     v10 = np.asarray(surf_state.get("v10m", v_3d[0]), dtype=np.float64)
     wspd10 = np.hypot(u10, v10)
     ustar = np.maximum(np.asarray(surf_state.get("ustar", 0.04 * wspd10), dtype=np.float64), 0.0)
-    gust10m = wspd10 + 2.4 * ustar + 0.15 * np.sqrt(np.maximum(cape_sb, 0.0))
+    # Beljaars (1987) / Brasseur (2001) / ECMWF IFS 3s peak gust (~3*sigma_u = 7.2*ustar) + convective downdraft term
+    gust10m = wspd10 + 7.2 * ustar + 0.15 * np.sqrt(np.maximum(cape_sb, 0.0))
 
     # Highest freezing level [m ASL]
     freezing_level_m = np.zeros((spec.ny, spec.nx), dtype=np.float64)
@@ -558,12 +559,12 @@ def compute_synoptic_convective_2d(
     beta_g = 1.12 * np.power(gwc_g_m3, 0.75)
     # Clark et al. (2008) / IFS Kohler hygroscopic aerosol swelling (clean background beta_dry=0.020 km^-1, exp=-2/3)
     rh_frac = np.clip(rh2m / 100.0, 0.0, 0.999)
-    beta_haze = 0.020 * np.power(1.0 - np.minimum(rh_frac, 0.990), -2.0 / 3.0)
-    # Shallow 2m nocturnal radiation ground-fog (sub-grid condensate below k=0 when calm, inverted, and >= 99.4% RH)
+    beta_haze = 0.020 * np.power(1.0 - np.minimum(rh_frac, 0.992), -2.0 / 3.0)
+    # Shallow 2m nocturnal radiation ground-fog (sub-grid condensate below k=0 when calm, inverted, and >= 98.8% RH)
     inv_2m = np.clip(t_3d[0] - t2m, 0.0, 5.0)
-    calm_fac = np.clip((2.2 - wspd10) / 1.2, 0.0, 1.0)
-    s_excess = np.clip((rh_frac - 0.994) / 0.006, 0.0, 1.0)
-    lwc_2m_g_m3 = 0.040 * s_excess * calm_fac * np.clip(inv_2m / 0.6, 0.0, 1.0)
+    calm_fac = np.clip((2.5 - wspd10) / 1.5, 0.0, 1.0)
+    s_excess = np.clip((rh_frac - 0.988) / 0.012, 0.0, 1.0)
+    lwc_2m_g_m3 = 0.045 * np.power(s_excess, 1.5) * calm_fac * np.clip(inv_2m / 0.5, 0.0, 1.0)
     beta_fog2m = 144.7 * np.power(lwc_2m_g_m3, 0.88)
     beta_tot = np.maximum(beta_c + beta_fog2m + beta_r + beta_i + beta_s + beta_g + beta_haze + 0.015, 0.05992)
     vis_m = np.clip(2996.0 / beta_tot, 10.0, 50_000.0)

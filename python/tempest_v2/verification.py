@@ -8,6 +8,7 @@ from __future__ import annotations
 import datetime
 import logging
 import math
+import re
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -61,16 +62,57 @@ def compute_mslp_pa(
     return (p0 * np.exp((GRAVITY_M_S2 * z_0) / (R_D * np.maximum(tv0, 160.0)))).astype(np.float32)
 
 
-def _expand_obs_search_dirs(obs_dir: Path) -> List[Path]:
+_OBS_DIR_TS_RE = re.compile(r"^(\d{8})_(\d{2,4})Z$")
+
+
+def _parse_obs_dir_utc(dirname: str) -> Optional[datetime.datetime]:
+    """Parse `YYYYMMDD_HHMMZ` or `YYYYMMDD_HHZ` observation directory timestamp into UTC datetime."""
+    m = _OBS_DIR_TS_RE.match(dirname.strip())
+    if m is None:
+        return None
+    date_part, time_part = m.group(1), m.group(2)
+    try:
+        if len(time_part) == 4:
+            dt = datetime.datetime.strptime(f"{date_part}_{time_part}", "%Y%m%d_%H%M")
+        elif len(time_part) == 2:
+            dt = datetime.datetime.strptime(f"{date_part}_{time_part}", "%Y%m%d_%H")
+        else:
+            return None
+        return dt.replace(tzinfo=datetime.timezone.utc)
+    except ValueError:
+        return None
+
+
+def _to_utc_dt(dt: datetime.datetime) -> datetime.datetime:
+    return dt.astimezone(datetime.timezone.utc) if dt.tzinfo else dt.replace(tzinfo=datetime.timezone.utc)
+
+
+def _expand_obs_search_dirs(
+    obs_dir: Path,
+    valid_time_utc: Optional[datetime.datetime] = None,
+) -> List[Path]:
     roots = [obs_dir]
     runs_sub = obs_dir / "runs"
+    ref_dt = _to_utc_dt(valid_time_utc) if valid_time_utc is not None else None
     for parent in (obs_dir, runs_sub):
         if parent.is_dir():
             ts_dirs = sorted(
                 d for d in parent.iterdir() if d.is_dir() and len(d.name) >= 11 and d.name.endswith("Z")
             )
             if ts_dirs:
-                roots.append(ts_dirs[-1])
+                if ref_dt is not None:
+                    parsed: List[Tuple[float, Path]] = []
+                    for d in ts_dirs:
+                        dt_d = _parse_obs_dir_utc(d.name)
+                        if dt_d is not None:
+                            parsed.append((abs((dt_d - ref_dt).total_seconds()), d))
+                    if parsed:
+                        parsed.sort(key=lambda item: (item[0], item[1].name))
+                        roots.extend(item[1] for item in parsed)
+                    else:
+                        roots.append(ts_dirs[-1])
+                else:
+                    roots.append(ts_dirs[-1])
     search_dirs: List[Path] = []
     seen: set[Path] = set()
     for r in roots:
@@ -81,23 +123,13 @@ def _expand_obs_search_dirs(obs_dir: Path) -> List[Path]:
     return search_dirs
 
 
-def _read_obs_prefix(obs_dir: Path, prefix: str) -> Optional[Dict[str, np.ndarray]]:
-    search_dirs = _expand_obs_search_dirs(Path(obs_dir))
-    found_dir: Optional[Path] = None
-    main_path: Optional[Path] = None
-    for d in search_dirs:
-        cand = d / f"{prefix}.wx1"
-        if cand.is_file():
-            found_dir = d
-            main_path = cand
-            break
-        if any(
-            (d / f"{prefix}_{suf}.wx1").is_file()
-            for suf in ("u_wind", "lat", "latitude", "temp", "pressure", "ztd", "ice_conc")
-        ):
-            found_dir = d
-            break
-    if found_dir is None:
+def _load_obs_prefix_from_dir(d: Path, prefix: str) -> Optional[Dict[str, np.ndarray]]:
+    cand = d / f"{prefix}.wx1"
+    main_path = cand if cand.is_file() else None
+    if main_path is None and not any(
+        (d / f"{prefix}_{suf}.wx1").is_file()
+        for suf in ("u_wind", "lat", "latitude", "temp", "pressure", "ztd", "ice_conc")
+    ):
         return None
 
     all_keys = (
@@ -122,7 +154,7 @@ def _read_obs_prefix(obs_dir: Path, prefix: str) -> Optional[Dict[str, np.ndarra
         "ice_thick",
     )
     fields: Dict[str, np.ndarray] = {}
-    if main_path is not None and main_path.is_file():
+    if main_path is not None:
         with wx1.open_dataset(main_path) as ds:
             for k in all_keys:
                 if k in ds:
@@ -152,7 +184,7 @@ def _read_obs_prefix(obs_dir: Path, prefix: str) -> Optional[Dict[str, np.ndarra
         "ice_thick",
     ):
         if k not in fields:
-            sub_p = found_dir / f"{prefix}_{k}.wx1"
+            sub_p = d / f"{prefix}_{k}.wx1"
             if sub_p.is_file():
                 with wx1.open_dataset(sub_p) as sds:
                     if k in sds:
@@ -172,6 +204,32 @@ def _read_obs_prefix(obs_dir: Path, prefix: str) -> Optional[Dict[str, np.ndarra
     return fields
 
 
+def _read_obs_prefix(
+    obs_dir: Path,
+    prefix: str,
+    *,
+    valid_time_utc: Optional[datetime.datetime] = None,
+    max_window_hours: Optional[float] = None,
+) -> Optional[Dict[str, np.ndarray]]:
+    search_dirs = _expand_obs_search_dirs(Path(obs_dir), valid_time_utc=valid_time_utc)
+    ref_ts = _to_utc_dt(valid_time_utc).timestamp() if valid_time_utc is not None else None
+    fallback_fields: Optional[Dict[str, np.ndarray]] = None
+
+    for d in search_dirs:
+        fields = _load_obs_prefix_from_dir(d, prefix)
+        if fields is None:
+            continue
+        if fallback_fields is None:
+            fallback_fields = fields
+        if ref_ts is not None and max_window_hours is not None and "time" in fields:
+            t_arr = np.asarray(fields["time"], dtype=np.float64)
+            t_fin = t_arr[np.isfinite(t_arr) & (t_arr > 1e8)]
+            if t_fin.size > 0 and float(np.min(np.abs(t_fin - ref_ts))) > float(max_window_hours) * 3600.0:
+                continue
+        return fields
+    return fallback_fields
+
+
 def _qsat_water_scalar(t_k: float, p_pa: float) -> float:
     tc = max(173.15, min(373.15, t_k)) - 273.15
     es = 611.21 * math.exp(17.502 * tc / (tc + 240.97))
@@ -185,6 +243,7 @@ def load_station_obs_wx1(
     *,
     valid_time_utc: Optional[datetime.datetime] = None,
     max_window_hours: float = 6.0,
+    max_sfc_window_hours: float = 0.75,
     theta_sfc_ref: float = 288.15,
     p_sfc_ref: float = 101_325.0,
     n_ref_hz: float = 0.01,
@@ -201,19 +260,21 @@ def load_station_obs_wx1(
     x_min, x_max = float(spec.x_m[0]) + margin_x, float(spec.x_m[-1]) - margin_x
     y_min, y_max = float(spec.y_m[0]) + margin_y, float(spec.y_m[-1]) - margin_y
 
+    eff_sfc_win_h = min(float(max_sfc_window_hours), float(max_window_hours))
+
     ref_ts: Optional[float] = None
     if valid_time_utc is not None:
-        dt_utc = (
-            valid_time_utc.astimezone(datetime.timezone.utc)
-            if valid_time_utc.tzinfo
-            else valid_time_utc.replace(tzinfo=datetime.timezone.utc)
-        )
-        ref_ts = dt_utc.timestamp()
+        ref_ts = _to_utc_dt(valid_time_utc).timestamp()
 
     obs_list: List[VarObservation] = []
     stn_rows: List[Dict[str, Any]] = []
 
-    def _in_domain_and_window(lat: float, lon: float, t_epoch: float) -> Optional[Tuple[float, float, float]]:
+    def _in_domain_and_window(
+        lat: float,
+        lon: float,
+        t_epoch: float,
+        window_hours: Optional[float] = None,
+    ) -> Optional[Tuple[float, float, float]]:
         if not (math.isfinite(lat) and math.isfinite(lon)):
             return None
         if spec.is_projected and spec.projection is not None:
@@ -222,10 +283,11 @@ def load_station_obs_wx1(
                 return None
         else:
             xm, ym = lon, lat
+        eff_win_h = float(max_window_hours) if window_hours is None else float(window_hours)
         t_off = 0.0
         if ref_ts is not None and math.isfinite(t_epoch) and t_epoch > 1e8:
             t_off = float(t_epoch - ref_ts)
-            if abs(t_off) > max_window_hours * 3600.0:
+            if abs(t_off) > eff_win_h * 3600.0:
                 return None
         return float(xm), float(ym), t_off
 
@@ -239,7 +301,8 @@ def load_station_obs_wx1(
         ("marine", "marine_buoy_obs"),
     )
     for provider, prefix in surface_sources:
-        data = _read_obs_prefix(odir, prefix)
+        read_win_h = float(max_window_hours) if provider == "marine" else eff_sfc_win_h
+        data = _read_obs_prefix(odir, prefix, valid_time_utc=valid_time_utc, max_window_hours=read_win_h)
         if data is None:
             continue
         n = len(data["lat"])
@@ -258,7 +321,7 @@ def load_station_obs_wx1(
         for idx in range(0, n, step_sfc):
             lat = float(lats[idx])
             lon = float(lons[idx])
-            chk = _in_domain_and_window(lat, lon, float(times[idx]))
+            chk = _in_domain_and_window(lat, lon, float(times[idx]), window_hours=read_win_h)
             if chk is None:
                 continue
             xm, ym, t_off = chk
@@ -274,6 +337,25 @@ def load_station_obs_wx1(
             elev = float(elevs[idx]) if math.isfinite(float(elevs[idx])) else 0.0
             elev = float(np.clip(elev, -10.0, 4000.0))
             sid = f"{provider}_{idx:04d}"
+
+            sst_val = float(ssts[idx])
+            if math.isfinite(sst_val) and 271.0 <= sst_val <= 310.0:
+                obs_list.append(
+                    VarObservation(
+                        station_id=sid,
+                        var_type="sst",
+                        lat=lat,
+                        lon=lon,
+                        alt_m=0.0,
+                        value=sst_val,
+                        error_variance=0.8**2,
+                        time_offset_sec=t_off,
+                    )
+                )
+
+            # Enforce tight synoptic surface window on rapidly evolving atmospheric surface variables
+            if abs(t_off) > eff_sfc_win_h * 3600.0:
+                continue
 
             t_val = float(temps[idx])
             if math.isfinite(t_val) and 220.0 <= t_val <= 330.0:
@@ -310,21 +392,6 @@ def load_station_obs_wx1(
                 )
             else:
                 p_mslp = float("nan")
-
-            sst_val = float(ssts[idx])
-            if math.isfinite(sst_val) and 271.0 <= sst_val <= 310.0:
-                obs_list.append(
-                    VarObservation(
-                        station_id=sid,
-                        var_type="sst",
-                        lat=lat,
-                        lon=lon,
-                        alt_m=0.0,
-                        value=sst_val,
-                        error_variance=0.8**2,
-                        time_offset_sec=t_off,
-                    )
-                )
 
             u_v = float(u_ws[idx])
             v_v = float(v_ws[idx])
@@ -375,7 +442,7 @@ def load_station_obs_wx1(
 
     # 2. Upper-Air Radiosonde & SondeHub vertical soundings (theta_p, u_geo, v_geo, qv at pressure_pa)
     for provider, prefix in (("radiosonde", "radiosonde_obs"), ("sondehub", "sondehub_soundings")):
-        data = _read_obs_prefix(odir, prefix)
+        data = _read_obs_prefix(odir, prefix, valid_time_utc=valid_time_utc, max_window_hours=max_window_hours)
         if data is None or "pressure" not in data:
             continue
         n = len(data["lat"])
@@ -464,7 +531,7 @@ def load_station_obs_wx1(
                 )
 
     # 3. European E-GVAP Ground GNSS Zenith Total Delay (ZTD)
-    ztd_data = _read_obs_prefix(odir, "egvap_gnss_ztd")
+    ztd_data = _read_obs_prefix(odir, "egvap_gnss_ztd", valid_time_utc=valid_time_utc, max_window_hours=max_window_hours)
     if ztd_data is not None and "ztd" in ztd_data:
         n = len(ztd_data["lat"])
         lats = np.asarray(ztd_data["lat"], dtype=np.float64)
@@ -506,7 +573,7 @@ def load_station_obs_wx1(
     )
     seen_sat_prefixes: set[str] = set()
     for provider, prefix in sat_sources:
-        data = _read_obs_prefix(odir, prefix)
+        data = _read_obs_prefix(odir, prefix, valid_time_utc=valid_time_utc, max_window_hours=max_window_hours)
         if data is None:
             continue
         if provider == "eumetsat_amv" and "eumetsat_amv" in seen_sat_prefixes:
@@ -560,7 +627,7 @@ def load_station_obs_wx1(
             )
 
     # 4b. Copernicus / Coriolis GDAC Argo float near-surface (5 m) in-situ temperature -> SST observations
-    argo_data = _read_obs_prefix(odir, "argo_ocean_profiles")
+    argo_data = _read_obs_prefix(odir, "argo_ocean_profiles", valid_time_utc=valid_time_utc, max_window_hours=max_window_hours)
     if argo_data is not None and "temp" in argo_data:
         a_lats = np.asarray(argo_data["lat"], dtype=np.float64)
         a_lons = np.asarray(argo_data["lon"], dtype=np.float64)

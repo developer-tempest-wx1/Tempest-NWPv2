@@ -416,3 +416,61 @@ def test_multisource_da_radiosonde_ztd_marine_lhn_and_fgat(tmp_path: Path) -> No
     # Radar LHN positive latent heating & moisture scaling applied in radar cell [7:10, 7:10]
     assert float(np.max(iau_f["theta_p"][:, 7:10, 7:10])) > float(np.max(iau_f["theta_p"][:, 0:3, 0:3]))
     assert float(np.mean(ana_st["qv"][1:3, 7:10, 7:10])) > float(np.mean(ana_st["qv"][1:3, 0:3, 0:3]))
+
+
+def test_obs_dir_nearest_timestamp_selection_and_sfc_window(tmp_path: Path) -> None:
+    """Verify DA selects nearest obs timestamp subdir to valid_time_utc and rejects stale/future sfc t2m."""
+    from dataclasses import replace
+    from tempest_v2.projection import get_domain_spec
+
+    d3_base = get_domain_spec("d3", nz=12, z_top_m=18_000.0)
+    cy, cx = d3_base.ny // 2, d3_base.nx // 2
+    sy, sx = slice(cy - 6, cy + 6), slice(cx - 6, cx + 6)
+    spec = replace(
+        d3_base,
+        ny=12,
+        nx=12,
+        x_m=d3_base.x_m[sx].copy(),
+        y_m=d3_base.y_m[sy].copy(),
+        lat2d=d3_base.lat2d[sy, sx].copy(),
+        lon2d=d3_base.lon2d[sy, sx].copy(),
+        map_factor=d3_base.map_factor[sy, sx].copy(),
+        coriolis_f=d3_base.coriolis_f[sy, sx].copy(),
+    )
+
+    t_09z = datetime.datetime(2026, 11, 23, 9, 0, tzinfo=datetime.timezone.utc)
+    t_11z = datetime.datetime(2026, 11, 23, 11, 0, tzinfo=datetime.timezone.utc)
+    lat_pt = np.array([float(spec.lat2d[6, 6])], dtype=np.float32)
+    lon_pt = np.array([float(spec.lon2d[6, 6])], dtype=np.float32)
+
+    def _write_knmi_dir(sub: Path, temp_k: float, obs_dt: datetime.datetime) -> None:
+        sub.mkdir(parents=True, exist_ok=True)
+        wx1.write_array(sub / "knmi_insitu_obs.wx1", np.array([102500.0], dtype=np.float32), dataset_id="p", variable_path="pressure", dimensions=["station_id"], codec="zstd_shuffle")
+        for nm, arr in (
+            ("lat", lat_pt),
+            ("lon", lon_pt),
+            ("elev", np.array([2.0], dtype=np.float32)),
+            ("temp", np.array([temp_k], dtype=np.float32)),
+            ("u_wind", np.array([1.0], dtype=np.float32)),
+            ("v_wind", np.array([1.0], dtype=np.float32)),
+            ("time", np.array([obs_dt.timestamp()], dtype=np.float64)),
+        ):
+            wx1.write_array(sub / f"knmi_insitu_obs_{nm}.wx1", arr, dataset_id=f"knmi_{nm}", variable_path=nm, dimensions=["station_id"], codec="zstd_shuffle")
+
+    # Case 1: Root contains both 0900Z (274 K) and later 1111Z (280 K) -> must pick 0900Z for 09:00Z target
+    obs_root = tmp_path / "obs_multi"
+    _write_knmi_dir(obs_root / "20261123_0900Z" / "sfc", 274.0, t_09z)
+    _write_knmi_dir(obs_root / "20261123_1111Z" / "sfc", 280.0, t_11z)
+
+    obs_list, stn_rows = load_station_obs_wx1(obs_root, spec, valid_time_utc=t_09z)
+    t2m_vals = [o.value for o in obs_list if o.var_type == "t2m"]
+    assert len(t2m_vals) == 1
+    assert abs(t2m_vals[0] - 274.0) < 1e-4
+    assert len(stn_rows) == 1 and abs(stn_rows[0]["t2m_k"] - 274.0) < 1e-4
+
+    # Case 2: Only 11:00Z obs exist -> must reject >45-min off-time surface t2m for 09:00Z target
+    obs_only_late = tmp_path / "obs_late_only"
+    _write_knmi_dir(obs_only_late / "20261123_1111Z" / "sfc", 280.0, t_11z)
+    obs_late, stn_late = load_station_obs_wx1(obs_only_late, spec, valid_time_utc=t_09z)
+    assert [o for o in obs_late if o.var_type == "t2m"] == []
+    assert stn_late == []

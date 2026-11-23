@@ -39,6 +39,12 @@ def test_continuous_wind_and_fog_metrics() -> None:
     assert wd["mae_deg"] == pytest.approx(10.0)
     assert wd["rmse_deg"] == pytest.approx(10.0)
 
+    # Default min_ws_ms = 3.0 excludes light-wind (< 3 m/s) stations
+    wd_def = compute_wind_dir_stats_deg([5.0, 180.0, 90.0], [355.0, 190.0, 0.0], [4.0, 2.5, 0.5])
+    assert wd_def["n"] == 1
+    assert wd_def["min_ws_ms"] == pytest.approx(3.0)
+    assert wd_def["mae_deg"] == pytest.approx(10.0)
+
     fg = compute_fog_contingency([500.0, 1500.0, 400.0, 2000.0], [300.0, 800.0, 1800.0, 3000.0], threshold_m=1000.0)
     assert fg["hits"] == 1
     assert fg["misses"] == 1
@@ -58,6 +64,7 @@ def _write_synthetic_knmi_nc(
     dd_deg: np.ndarray,
     rh_pct: np.ndarray,
     vis_m: np.ndarray,
+    qg_wm2: np.ndarray | None = None,
 ) -> Path:
     path.parent.mkdir(parents=True, exist_ok=True)
     epoch = datetime.datetime(1950, 1, 1, tzinfo=datetime.timezone.utc)
@@ -85,6 +92,7 @@ def _write_synthetic_knmi_nc(
         v_dd = ds.createVariable("dd", "f8", ("station", "time"))
         v_zm = ds.createVariable("zm", "f8", ("station", "time"))
         v_rg = ds.createVariable("rg", "f8", ("station", "time"))
+        v_qg = ds.createVariable("qg", "f8", ("station", "time"))
 
         v_id[:] = np.array([s[0].encode() for s in stns], dtype="S5")
         v_nm[:] = np.array([s[1].ljust(20)[:20].encode() for s in stns], dtype="S20")
@@ -100,6 +108,7 @@ def _write_synthetic_knmi_nc(
         v_dd[:, 0] = dd_deg
         v_zm[:, 0] = vis_m
         v_rg[:, 0] = [0.0, 0.2, 0.0]
+        v_qg[:, 0] = qg_wm2 if qg_wm2 is not None else [250.0, 260.0, 240.0]
     return path
 
 
@@ -124,6 +133,7 @@ def _write_synthetic_wx1(path: Path, spec, valid_dt: datetime.datetime, lead_h: 
             "v10m_geo": (("y", "x"), np.full(shape, 0.0, dtype=np.float32)),  # 270 deg, 5.0 m/s
             "gust10m": (("y", "x"), np.full(shape, 8.0, dtype=np.float32)),
             "vis_m": (("y", "x"), np.full(shape, 600.0 if lead_h > 0 else 5000.0, dtype=np.float32)),
+            "sw_down": (("y", "x"), np.full(shape, 250.0, dtype=np.float32)),
             "precip_rate": (("y", "x"), pr_si),
             "rain_acc": (("y", "x"), rain),
             "snow_acc": (("y", "x"), np.zeros(shape, dtype=np.float32)),
@@ -137,6 +147,7 @@ def _write_synthetic_wx1(path: Path, spec, valid_dt: datetime.datetime, lead_h: 
         },
         attrs={
             "domain_name": spec.name,
+            "git_commit": "deadbeef",
             "lead_hours": f"{lead_h:.3f}",
             "valid_time_utc": valid_dt.isoformat(),
         },
@@ -193,6 +204,12 @@ def test_verify_run_offline_synthetic_wx1_and_knmi_nc(tmp_path: Path) -> None:
     assert res["hourly"][1]["land"]["fog"]["hits"] == 2
     assert res["hourly"][1]["land"]["fog"]["false_alarms"] == 1
     assert res["independent_land"]["t2m"]["n"] == 3
+    assert res["overall_land"]["n_unique_stations"] == 3
+    assert res["overall_land"]["n_stations"] == 3
+    assert res["overall_land"]["n_station_hours"] == 6
+    assert res["overall_land"]["sw_down"]["n"] == 6
+    assert res["overall_land"]["sw_down"]["bias"] == pytest.approx(0.0, abs=1e-3)
+    assert res["run_metadata"]["git_commit"] == "deadbeef"
     assert Path(res["artifacts"]["summary_json"]).is_file()
     assert Path(res["artifacts"]["hourly_csv"]).is_file()
     assert Path(res["artifacts"]["station_csv"]).is_file()

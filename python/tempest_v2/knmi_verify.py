@@ -414,6 +414,23 @@ def sample_wx1_at_stations(
         )
         gust10 = np.asarray(ds["gust10m"].values, dtype=np.float64) if "gust10m" in ds else np.full_like(t2m_c, np.nan)
         vis_m = np.asarray(ds["vis_m"].values, dtype=np.float64) if "vis_m" in ds else np.full_like(t2m_c, np.nan)
+        sw_down = np.asarray(ds["sw_down"].values, dtype=np.float64) if "sw_down" in ds else np.full_like(t2m_c, np.nan)
+        wx1_attrs = {
+            str(k): str(ds.attrs[k])
+            for k in (
+                "model",
+                "git_commit",
+                "nz",
+                "dt_s",
+                "physics_every",
+                "cy46_physics",
+                "pbl_last",
+                "enable_ocean_si3",
+                "lbc_rim_width",
+                "lbc_tau_max_s",
+            )
+            if k in ds.attrs
+        }
 
         rain_acc = np.asarray(ds["rain_acc"].values, dtype=np.float64) if "rain_acc" in ds else np.zeros_like(t2m_c)
         snow_acc = np.asarray(ds["snow_acc"].values, dtype=np.float64) if "snow_acc" in ds else np.zeros_like(t2m_c)
@@ -483,6 +500,7 @@ def sample_wx1_at_stations(
         m_v10 = _sample_2d_bilinear(v10, j0, j1, i0, i1, wy, wx)
         m_gust = _sample_2d_bilinear(gust10, j0, j1, i0, i1, wy, wx)
         m_vis = _sample_2d_bilinear(vis_m, j0, j1, i0, i1, wy, wx)
+        m_sw = _sample_2d_bilinear(sw_down, j0, j1, i0, i1, wy, wx)
         m_pr = _sample_2d_bilinear(precip_mmh, j0, j1, i0, i1, wy, wx)
         m_p1h = _sample_2d_bilinear(precip_step_mm, j0, j1, i0, i1, wy, wx)
     else:
@@ -499,6 +517,7 @@ def sample_wx1_at_stations(
         m_v10 = v10[jj, ii]
         m_gust = gust10[jj, ii]
         m_vis = vis_m[jj, ii]
+        m_sw = sw_down[jj, ii]
         m_pr = precip_mmh[jj, ii]
         m_p1h = precip_step_mm[jj, ii]
 
@@ -522,6 +541,7 @@ def sample_wx1_at_stations(
                 "mod_wd10_deg": mwd,
                 "mod_gust10_ms": float(m_gust[k]),
                 "mod_vis_m": float(m_vis[k]),
+                "mod_sw_down_wm2": float(m_sw[k]),
                 "mod_precip_mmh": float(m_pr[k]),
                 "mod_precip_step_mm": float(m_p1h[k]),
             }
@@ -534,6 +554,7 @@ def sample_wx1_at_stations(
     nl_mask = (lat2d >= 50.6) & (lat2d <= 53.6) & (lon2d >= 3.2) & (lon2d <= 7.3)
     grid_bundle = {
         "domain_name": domain_name or "tempest_lam",
+        "wx1_attrs": wx1_attrs,
         "lat": lat2d,
         "lon": lon2d,
         "t2m_c": t2m_c,
@@ -592,7 +613,7 @@ def compute_wind_dir_stats_deg(
     mod_deg: Sequence[float],
     obs_deg: Sequence[float],
     obs_ws_ms: Sequence[float],
-    min_ws_ms: float = 1.5,
+    min_ws_ms: float = 3.0,
 ) -> Dict[str, Any]:
     """Compute circular shortest-arc wind direction error [deg] for wind speeds >= `min_ws_ms`."""
     m = np.asarray(mod_deg, dtype=np.float64)
@@ -601,10 +622,17 @@ def compute_wind_dir_stats_deg(
     valid = np.isfinite(m) & np.isfinite(o) & np.isfinite(w) & (w >= float(min_ws_ms))
     n = int(np.sum(valid))
     if n == 0:
-        return {"n": 0, "bias_deg": float("nan"), "mae_deg": float("nan"), "rmse_deg": float("nan")}
+        return {
+            "n": 0,
+            "min_ws_ms": float(min_ws_ms),
+            "bias_deg": float("nan"),
+            "mae_deg": float("nan"),
+            "rmse_deg": float("nan"),
+        }
     diff = ((m[valid] - o[valid] + 180.0) % 360.0) - 180.0
     return {
         "n": n,
+        "min_ws_ms": float(min_ws_ms),
         "bias_deg": float(np.mean(diff)),
         "mae_deg": float(np.mean(np.abs(diff))),
         "rmse_deg": float(math.sqrt(float(np.mean(diff * diff)))),
@@ -773,14 +801,23 @@ def _summarize_matched_rows(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     ws10 = compute_continuous_stats([r["mod_ws10_ms"] for r in rows], [r["ws10_ms"] for r in rows])
     gust = compute_continuous_stats([r["mod_gust10_ms"] for r in rows], [r["gust10_ms"] for r in rows])
     precip = compute_continuous_stats([r["mod_precip_cmp"] for r in rows], [r["obs_precip_cmp"] for r in rows])
+    sw_down = compute_continuous_stats(
+        [r.get("mod_sw_down_wm2", float("nan")) for r in rows],
+        [r.get("sw_down_wm2", float("nan")) for r in rows],
+    )
     wdir = compute_wind_dir_stats_deg(
         [r["mod_wd10_deg"] for r in rows],
         [r["wd10_deg"] for r in rows],
         [r["ws10_ms"] for r in rows],
     )
     fog = compute_fog_contingency([r["mod_vis_m"] for r in rows], [r["vis_m"] for r in rows])
+    n_station_hours = len(rows)
+    unique_ids = {str(r["station_id"]) for r in rows if r.get("station_id")}
+    n_unique_stations = len(unique_ids) if unique_ids else n_station_hours
     return {
-        "n_stations": len(rows),
+        "n_stations": n_unique_stations,
+        "n_unique_stations": n_unique_stations,
+        "n_station_hours": n_station_hours,
         "t2m": t2m,
         "td2m": td2m,
         "rh": rh,
@@ -790,6 +827,7 @@ def _summarize_matched_rows(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         "wdir": wdir,
         "fog": fog,
         "precip": precip,
+        "sw_down": sw_down,
     }
 
 
@@ -960,6 +998,7 @@ def sample_ifs_grib_at_stations(
                 "mod_wd10_deg": mwd,
                 "mod_gust10_ms": float("nan"),
                 "mod_vis_m": float("nan"),
+                "mod_sw_down_wm2": float("nan"),
                 "mod_precip_mmh": float("nan"),
                 "mod_precip_step_mm": float("nan"),
                 "obs_precip_cmp": float("nan"),
@@ -1430,6 +1469,7 @@ def verify_run_against_knmi(
     prev_tot_precip: Optional[np.ndarray] = None
     prev_lead_h: Optional[float] = None
     domain_name = "tempest_lam"
+    first_wx1_attrs: Dict[str, str] = {}
     map_paths: List[Path] = []
     skipped_hours: List[Dict[str, Any]] = []
 
@@ -1460,6 +1500,8 @@ def verify_run_against_knmi(
             interval_h=dt_h,
         )
         domain_name = grid["domain_name"]
+        if not first_wx1_attrs and isinstance(grid.get("wx1_attrs"), dict):
+            first_wx1_attrs = dict(grid["wx1_attrs"])
         prev_tot_precip = grid["tot_precip_mm"]
         prev_lead_h = lead_h
 
@@ -1594,7 +1636,10 @@ def verify_run_against_knmi(
             "land_mslp_rmse_hpa": round(st_b["mslp"]["rmse"], 3),
             "land_ws10_bias_ms": round(st_b["ws10"]["bias"], 3),
             "land_ws10_rmse_ms": round(st_b["ws10"]["rmse"], 3),
+            "land_gust10_bias_ms": round(st_b["gust10"]["bias"], 3),
             "land_wdir_mae_deg": round(st_b["wdir"]["mae_deg"], 1),
+            "land_sw_down_bias_wm2": round(st_b["sw_down"]["bias"], 1),
+            "land_sw_down_rmse_wm2": round(st_b["sw_down"]["rmse"], 1),
             "land_fog_hits": st_b["fog"]["hits"],
             "land_fog_misses": st_b["fog"]["misses"],
             "land_fog_fa": st_b["fog"]["false_alarms"],
@@ -1684,8 +1729,33 @@ def verify_run_against_knmi(
             "independent_land": _cmp_block(ifs_indep_t_land, ifs_indep_i_land),
         }
 
+    run_metadata: Dict[str, Any] = {}
+    if isinstance(manifest, dict):
+        for mk in (
+            "git_commit",
+            "mode",
+            "domain",
+            "init_time_utc",
+            "ic_source",
+            "warm_start",
+            "forecast_hours",
+            "nz",
+            "dt_s",
+            "physics_every",
+            "cy46_physics",
+            "pbl_last",
+        ):
+            if mk in manifest:
+                run_metadata[mk] = manifest[mk]
+        da_blk = manifest.get("da")
+        run_metadata["da_enabled"] = bool(isinstance(da_blk, dict) and da_blk.get("var3d"))
+    for ak, av in first_wx1_attrs.items():
+        if ak not in run_metadata:
+            run_metadata[ak] = av
+
     summary: Dict[str, Any] = {
         "domain_name": domain_name,
+        "run_metadata": run_metadata,
         "input_path": str(root),
         "outdir": str(eff_outdir),
         "independent_after_hour": indep_h,

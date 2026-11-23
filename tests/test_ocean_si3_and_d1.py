@@ -608,6 +608,8 @@ def test_diagnostics_pressure_levels_convective_and_wx1_roundtrip(tmp_path: Path
     syn_stable = compute_synoptic_convective_2d(spec, hs, st_isa, surf_base)
     assert float(np.max(syn_stable["cape_sb"])) == 0.0
     assert float(np.min(syn_stable["vis_m"])) > 10_000.0
+    expected_gust = math.hypot(8.0, -2.0) + 7.2 * 0.35
+    assert abs(float(np.mean(syn_stable["gust10m"])) - expected_gust) < 1e-3
 
     st_unstab = {k: v.copy() for k, v in st_isa.items()}
     # Warm moist PBL below ~1500 m + midlevel cold anomaly + dense surface fog in right half

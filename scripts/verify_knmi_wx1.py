@@ -83,8 +83,10 @@ def main() -> None:
         verify_radar_fss=args.verify_radar_fss,
     )
 
+    rmeta = summary.get("run_metadata") or {}
+    commit_str = f" | Commit: {rmeta['git_commit']}" if rmeta.get("git_commit") else ""
     print(
-        f"\n=== KNMI 10-min Verificatie | Domein: {summary['domain_name']} "
+        f"\n=== KNMI 10-min Verificatie | Domein: {summary['domain_name']}{commit_str} "
         f"| Uren geverifieerd: {summary['verified_hours']} (overgeslagen: {len(summary['skipped_hours'])}) ==="
     )
     print(
@@ -97,7 +99,7 @@ def main() -> None:
         gp = rec["grid_precip"]
         flag = "JA " if rec["independent"] else "NEE"
         print(
-            f"T+{rec['lead_hours']:02.0f}h {rec['valid_time_utc'][:16]}Z  {flag}    {b['n_stations']:3d}  | "
+            f"T+{rec['lead_hours']:02.0f}h {rec['valid_time_utc'][:16]}Z  {flag}    {b.get('n_unique_stations', b['n_stations']):3d}  | "
             f"{_fmt(b['t2m']['bias'])} / {_fmt(b['t2m']['rmse'], '.2f')} K | "
             f"{_fmt(b['td2m']['bias'])} K | {_fmt(b['rh']['bias'], '+.1f')}% | "
             f"{_fmt(b['mslp']['bias'])} / {_fmt(b['mslp']['rmse'], '.2f')} | "
@@ -112,15 +114,26 @@ def main() -> None:
         (f"Onafhankelijk T>={summary['independent_after_hour']:.0f}u (alle stations)", "independent_all"),
     ):
         blk = summary[key]
-        print(f"\n[{label}] n_obs={blk['t2m']['n']}")
+        n_uniq = blk.get("n_unique_stations", blk["n_stations"])
+        n_st_hrs = blk.get("n_station_hours", blk["t2m"]["n"])
+        w_min = float(blk["wdir"].get("min_ws_ms", 3.0))
+        print(f"\n[{label}] stations={n_uniq}, station_hours={n_st_hrs}, n_obs={blk['t2m']['n']}")
         print(
             f"  T2m: bias={_fmt(blk['t2m']['bias'])} K, RMSE={_fmt(blk['t2m']['rmse'], '.2f')} K, r={_fmt(blk['t2m']['corr'], '.2f')} | "
             f"Td2m bias={_fmt(blk['td2m']['bias'])} K | RH bias={_fmt(blk['rh']['bias'], '+.1f')}%"
         )
         print(
             f"  MSLP: bias={_fmt(blk['mslp']['bias'])} hPa, RMSE={_fmt(blk['mslp']['rmse'], '.2f')} hPa | "
-            f"Wind10m: bias={_fmt(blk['ws10']['bias'])} m/s, RMSE={_fmt(blk['ws10']['rmse'], '.2f')} m/s, dir MAE={_fmt(blk['wdir']['mae_deg'], '.1f')}°"
+            f"Wind10m: bias={_fmt(blk['ws10']['bias'])} m/s, RMSE={_fmt(blk['ws10']['rmse'], '.2f')} m/s, "
+            f"gust bias={_fmt(blk['gust10']['bias'])} m/s, dir MAE (>={w_min:.0f} m/s)={_fmt(blk['wdir']['mae_deg'], '.1f')}°"
         )
+        sw_blk = blk.get("sw_down") or {}
+        if int(sw_blk.get("n", 0)) > 0:
+            print(
+                f"  Straling SW↓ (vs KNMI qg, n={sw_blk['n']}): "
+                f"bias={_fmt(sw_blk['bias'], '+.1f')} W/m², RMSE={_fmt(sw_blk['rmse'], '.1f')} W/m², "
+                f"obs_mean={_fmt(sw_blk['obs_mean'], '.1f')} vs mod_mean={_fmt(sw_blk['mod_mean'], '.1f')} W/m²"
+            )
         fg = blk["fog"]
         print(
             f"  Mist (<1000m): H={fg['hits']}, M={fg['misses']}, FA={fg['false_alarms']}, "
