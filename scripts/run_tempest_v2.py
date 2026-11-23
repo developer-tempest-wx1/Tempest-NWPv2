@@ -55,6 +55,7 @@ from tempest_v2.runner import (  # noqa: E402
     forecast_output_schedule_hours,
     run_domain_forecast,
     run_ecmwf_lbc_lam_pipeline,
+    run_era5_hindcast_lam_pipeline,
     run_three_nest_pipeline,
     run_two_nest_pipeline,
 )
@@ -75,6 +76,7 @@ def main() -> None:
             "d1_to_d2_to_d3",
             "d2_to_d3",
             "lam_ecmwf_lbc",
+            "lam_era5_hindcast",
             "lam_bnl_ns_de_2p5km",
             "lam_eu_5km",
             "d3",
@@ -105,6 +107,8 @@ def main() -> None:
     )
     parser.add_argument("--lbc-dir", type=Path, default=None, help="Optional prebuilt LBC WX-1 directory")
     parser.add_argument("--lbc-cache-dir", type=Path, default=None, help="Shared GRIB2 cache dir across LAM domains")
+    parser.add_argument("--era5-cache-dir", type=Path, default=None, help="Shared ARCO-ERA5 regional WX-1 cache dir for --mode lam_era5_hindcast")
+    parser.add_argument("--era5-land-soil", type=Path, default=None, help="Optional 9 km ERA5-Land soil/skin/snow file (.wx1/.nc/.grib2)")
     parser.add_argument("--init-time", type=str, default=None, help="Optional UTC ISO init time (e.g. 2026-11-22T18:00Z)")
     parser.add_argument(
         "--dt-lam",
@@ -264,6 +268,57 @@ def main() -> None:
         )
         printable = {
             "mode": "lam_ecmwf_lbc",
+            "domain": args.lam_domain,
+            "run_dir": str(summary.get("run_dir")),
+            "elapsed_s": summary["lam"]["elapsed_s"],
+            "num_tiles": summary["lam"]["num_tiles"],
+            "outputs": [str(p) for p in summary["lam"]["output_paths"]],
+            "lbc": summary.get("lbc"),
+            "restart": str(summary["lam"].get("restart_path")) if summary["lam"].get("restart_path") else None,
+            "ocean_restart": str(summary["lam"].get("ocean_restart_path")) if summary["lam"].get("ocean_restart_path") else None,
+            "cycle_restart_paths": [str(p) for p in summary.get("cycle_restart_paths", [])],
+            "da": summary["da"],
+            "ensemble": summary.get("ensemble"),
+        }
+        print(json.dumps(printable, indent=2, default=str))
+        return
+
+    if args.mode == "lam_era5_hindcast":
+        if init_dt_arg is None:
+            raise SystemExit("--init-time (ISO UTC, e.g. 2024-01-15T00:00Z) is required for --mode lam_era5_hindcast")
+        phys_lam = args.physics_every if "--physics-every" in sys.argv else None
+        lbc_int_h = args.lbc_interval_hours if "--lbc-interval-hours" in sys.argv else 1.0
+        summary = run_era5_hindcast_lam_pipeline(
+            init_dt_arg,
+            lam_domain=args.lam_domain,
+            forecast_hours=args.hours,
+            nz=args.nz,
+            era5_land_soil_path=args.era5_land_soil,
+            obs_dir=obs_dir_eff if args.enable_da else None,
+            outdir=args.outdir,
+            runs_root=args.runs_root,
+            cycle_restart_hours=cyc_rst_hours,
+            ensemble_members=args.ensemble_members,
+            ensemble_lead_hours=args.ensemble_hours,
+            ensemble_seed=args.ensemble_seed,
+            ecmwf_schedule=args.ecmwf,
+            enable_da=args.enable_da,
+            dt_s=args.dt_lam,
+            physics_every=phys_lam,
+            lbc_dir=args.lbc_dir,
+            era5_cache_dir=args.era5_cache_dir,
+            lbc_interval_hours=lbc_int_h,
+            enable_ocean_si3=use_ocean,
+            include_3d_diagnostics=include_3d_diag,
+            osisaf_wx1_path=args.osisaf_wx1,
+            show_progress=show_progress,
+            log_steps=log_steps,
+            mem_profile_every=args.mem_profile_every,
+            pbl_last=args.pbl_last,
+            cy46_physics=args.cy46_physics,
+        )
+        printable = {
+            "mode": "lam_era5_hindcast",
             "domain": args.lam_domain,
             "run_dir": str(summary.get("run_dir")),
             "elapsed_s": summary["lam"]["elapsed_s"],
