@@ -272,18 +272,36 @@ def prepare_bathymetry_on_2d_grid(
 
     lat_arr = np.asarray(lat2d, dtype=np.float64)
     lon_arr = ((np.asarray(lon2d, dtype=np.float64) + 180.0) % 360.0) - 180.0
-    lat_min, lat_max = float(lat_arr.min()) - 0.1, float(lat_arr.max()) + 0.1
-    lon_min, lon_max = float(lon_arr.min()) - 0.1, float(lon_arr.max()) + 0.1
-
     with xr.open_dataset(src_p) as ds:
-        sub = ds["elevation"].sel(lat=slice(lat_min, lat_max), lon=slice(lon_min, lon_max))
-        if sub.sizes.get("lat", 0) > 4096 or sub.sizes.get("lon", 0) > 4096:
-            sy = max(1, int(sub.sizes["lat"]) // 2048)
-            sx = max(1, int(sub.sizes["lon"]) // 2048)
-            sub = sub.isel(lat=slice(None, None, sy), lon=slice(None, None, sx))
-        sub_lats = np.asarray(sub.coords["lat"].values, dtype=np.float64)
-        sub_lons = np.asarray(sub.coords["lon"].values, dtype=np.float64)
+        lat_coord = "lat" if "lat" in ds.coords or "lat" in ds.dims else "latitude"
+        lon_coord = "lon" if "lon" in ds.coords or "lon" in ds.dims else "longitude"
+        elev_var = "elevation" if "elevation" in ds.data_vars else next(iter(ds.data_vars))
+        lat_head = np.asarray(ds.coords[lat_coord].isel({lat_coord: slice(0, 2)}).values, dtype=np.float64)
+        lon_head = np.asarray(ds.coords[lon_coord].isel({lon_coord: slice(0, 2)}).values, dtype=np.float64)
+        lat_step = abs(float(lat_head[1] - lat_head[0])) if len(lat_head) > 1 else 0.25
+        lon_step = abs(float(lon_head[1] - lon_head[0])) if len(lon_head) > 1 else 0.25
+        pad_lat = max(0.1, 2.0 * lat_step)
+        pad_lon = max(0.1, 2.0 * lon_step)
+        la0, la1 = float(lat_arr.min()) - pad_lat, float(lat_arr.max()) + pad_lat
+        lo0, lo1 = float(lon_arr.min()) - pad_lon, float(lon_arr.max()) + pad_lon
+        lat_desc = len(lat_head) > 1 and lat_head[0] > lat_head[1]
+        lon_desc = len(lon_head) > 1 and lon_head[0] > lon_head[1]
+        lat_slice = slice(la1, la0) if lat_desc else slice(la0, la1)
+        lon_slice = slice(lo1, lo0) if lon_desc else slice(lo0, lo1)
+        sub = ds[elev_var].sel({lat_coord: lat_slice, lon_coord: lon_slice})
+        if sub.sizes.get(lat_coord, 0) > 4096 or sub.sizes.get(lon_coord, 0) > 4096:
+            sy = max(1, int(sub.sizes[lat_coord]) // 2048)
+            sx = max(1, int(sub.sizes[lon_coord]) // 2048)
+            sub = sub.isel({lat_coord: slice(None, None, sy), lon_coord: slice(None, None, sx)})
+        sub_lats = np.asarray(sub.coords[lat_coord].values, dtype=np.float64)
+        sub_lons = np.asarray(sub.coords[lon_coord].values, dtype=np.float64)
         elev = np.asarray(sub.values, dtype=np.float64)
+        if len(sub_lats) > 1 and sub_lats[0] > sub_lats[-1]:
+            sub_lats = sub_lats[::-1]
+            elev = elev[::-1, :]
+        if len(sub_lons) > 1 and sub_lons[0] > sub_lons[-1]:
+            sub_lons = sub_lons[::-1]
+            elev = elev[:, ::-1]
 
     interp = RegularGridInterpolator((sub_lats, sub_lons), elev, method="linear", bounds_error=False, fill_value=0.0)
     sampled_elev = interp(np.column_stack([lat_arr.ravel(), lon_arr.ravel()])).reshape(lat_arr.shape)

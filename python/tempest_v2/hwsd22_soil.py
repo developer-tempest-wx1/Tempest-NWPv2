@@ -31,6 +31,14 @@ STATIC_ROOT = PROJECT_ROOT / "data" / "static"
 SOURCE_ROOT = STATIC_ROOT / "hwsd_v22"
 DOWNLOAD_ROOT = SOURCE_ROOT / "downloads"
 EXTRACT_ROOT = SOURCE_ROOT / "extracted"
+
+
+def resolve_hwsd_root() -> Path:
+    """Resolve HWSD v2.2 directory via `TEMPEST_HWSD_V22_DIR` or default `data/static/hwsd_v22`."""
+    env_dir = os.environ.get("TEMPEST_HWSD_V22_DIR")
+    if env_dir:
+        return Path(env_dir)
+    return SOURCE_ROOT
 RASTER_SHAPE = (21600, 43200)
 RASTER_DTYPE = "<u2"
 RASTER_NODATA = 65535
@@ -83,19 +91,24 @@ def _find_one(root: Path, suffix: str) -> Path:
 
 
 def _extract_archives(force: bool = False) -> tuple[Path, Path]:
-    EXTRACT_ROOT.mkdir(parents=True, exist_ok=True)
-    db_root, raster_root = EXTRACT_ROOT / "db", EXTRACT_ROOT / "raster"
+    env_dir = os.environ.get("TEMPEST_HWSD_V22_DIR")
+    source_root = Path(env_dir) if env_dir else SOURCE_ROOT
+    download_root = (source_root / "downloads") if env_dir else DOWNLOAD_ROOT
+    extract_root = (source_root / "extracted") if env_dir else EXTRACT_ROOT
+
+    extract_root.mkdir(parents=True, exist_ok=True)
+    db_root, raster_root = extract_root / "db", extract_root / "raster"
     db_file = db_root / "HWSD2.2.mdb"
     bil_file = raster_root / "HWSD2.bil"
     if not force and db_file.is_file() and bil_file.is_file():
         return db_file, bil_file
 
-    db_zip = DOWNLOAD_ROOT / "hwsd2.2_db.zip"
+    db_zip = download_root / "hwsd2.2_db.zip"
     if not db_zip.is_file():
-        db_zip = SOURCE_ROOT / "hwsd2.2_db.zip"
-    raster_zip = DOWNLOAD_ROOT / "hwsd2.2_raster.zip"
+        db_zip = source_root / "hwsd2.2_db.zip"
+    raster_zip = download_root / "hwsd2.2_raster.zip"
     if not raster_zip.is_file():
-        raster_zip = SOURCE_ROOT / "hwsd2.2_raster.zip"
+        raster_zip = source_root / "hwsd2.2_raster.zip"
     if not db_zip.is_file() or not raster_zip.is_file():
         raise FileNotFoundError(
             f"HWSD v2.2 archives missing. Expected {db_zip} and {raster_zip}; "

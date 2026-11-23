@@ -6,14 +6,56 @@ build-backend = "setuptools.build_meta"
 name = "tempest-nwp-v2"
 version = "0.2.0"
 description = "Tempest-NWP v2: Classical Non-Hydrostatic Split-Explicit GPU LAM (0% AI / 0% ML)"
-readme = "AGENTS.md"
+readme = "README.md"
 requires-python = ">=3.10"
+license = { text = "Apache-2.0" }
 dependencies = [
     "numpy>=1.26.0",
     "scipy>=1.11.0",
     "xarray>=2024.1.0",
     "tempest-wx1>=0.1.8",
+    "pyproj>=3.6.0",
+    "netCDF4>=1.6.5",
+    "tqdm>=4.66.0",
 ]
+
+[project.optional-dependencies]
+era5 = [
+    "zarr>=2.16.0",
+    "gcsfs>=2024.1.0",
+    "dask>=2024.1.0",
+]
+ecmwf = [
+    "cfgrib>=0.9.10",
+    "eccodes>=1.6.0",
+]
+static = [
+    "rasterio>=1.3.9",
+    "affine>=2.4.0",
+]
+plots = [
+    "matplotlib>=3.8.0",
+    "cartopy>=0.22.0",
+]
+dev = [
+    "pytest>=8.0.0",
+]
+all = [
+    "zarr>=2.16.0",
+    "gcsfs>=2024.1.0",
+    "dask>=2024.1.0",
+    "cfgrib>=0.9.10",
+    "eccodes>=1.6.0",
+    "rasterio>=1.3.9",
+    "affine>=2.4.0",
+    "matplotlib>=3.8.0",
+    "cartopy>=0.22.0",
+    "pytest>=8.0.0",
+]
+
+[project.urls]
+"WX-1 on PyPI" = "https://pypi.org/project/tempest-wx1/"
+"WX-1 GitHub" = "https://github.com/developer-tempest-wx1/tempest-wx1"
 
 [tool.setuptools.packages.find]
 where = ["python"]

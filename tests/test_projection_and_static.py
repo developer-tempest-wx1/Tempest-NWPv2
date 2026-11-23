@@ -86,8 +86,11 @@ def test_domain_presets_and_vertical_grid_137():
 
 
 def test_offline_copernicus_dem_polders_lakes_mountains_and_wx1_write(tmp_path):
+    import os
+
     repo_root = Path(__file__).resolve().parents[1]
-    dem_root = repo_root / "data/static/copernicus_dem_raw"
+    env_dem = os.environ.get("TEMPEST_COPERNICUS_DEM_DIR")
+    dem_root = Path(env_dem) if env_dem else (repo_root / "data/static/copernicus_dem_raw")
     if not dem_root.exists():
         dem_root = Path("/mnt/d/AI/weer-ai/Tempest/COPERNICUS_DEM")
     if not dem_root.exists():
@@ -138,9 +141,13 @@ def test_offline_copernicus_dem_polders_lakes_mountains_and_wx1_write(tmp_path):
 
 
 def test_offline_hwsd22_and_gebco_bathymetry_2d_patch(tmp_path):
+    import os
+
     repo_root = Path(__file__).resolve().parents[1]
-    hwsd_dir = repo_root / "data/static/hwsd_v22/extracted/db/HWSD2.2.mdb"
-    gebco_nc = repo_root / "data/static/bathymetry_raw/GEBCO_2026/GEBCO_2026.nc"
+    hwsd_root = Path(os.environ.get("TEMPEST_HWSD_V22_DIR") or (repo_root / "data/static/hwsd_v22"))
+    bathy_root = Path(os.environ.get("TEMPEST_BATHY_DIR") or (repo_root / "data/static/bathymetry_raw"))
+    hwsd_dir = hwsd_root / "extracted/db/HWSD2.2.mdb"
+    gebco_nc = bathy_root / "GEBCO_2026/GEBCO_2026.nc"
     if not hwsd_dir.is_file() or not gebco_nc.is_file():
         pytest.skip("Local HWSD v2.2 or GEBCO_2026 not present")
 

@@ -17,11 +17,25 @@ import argparse
 import csv
 import datetime
 import gzip
+import os
 import re
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
-DEFAULT_CASES_DIR = Path("/home/j_ord/AI/Tempest/era5_cases")
+
+def resolve_era5_cases_dir() -> Path:
+    """Resolve local KNMI hourly archive dir via `TEMPEST_ERA5_CASES_DIR` or defaults."""
+    env_dir = os.environ.get("TEMPEST_ERA5_CASES_DIR")
+    if env_dir:
+        return Path(env_dir)
+    repo_cases = Path(__file__).resolve().parents[1] / "data" / "knmi_cases"
+    if repo_cases.exists():
+        return repo_cases
+    legacy = Path("/home/j_ord/AI/Tempest/era5_cases")
+    return legacy if legacy.exists() else repo_cases
+
+
+DEFAULT_CASES_DIR = resolve_era5_cases_dir()
 SEASON_MONTHS: Dict[str, Tuple[int, ...]] = {
     "winter": (12, 1, 2),
     "spring": (3, 4, 5),

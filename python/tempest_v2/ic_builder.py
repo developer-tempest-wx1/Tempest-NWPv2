@@ -12,6 +12,7 @@ from __future__ import annotations
 import datetime
 import json
 import logging
+import os
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
 
@@ -42,15 +43,26 @@ from tempest_v2.static_fields import (
 
 logger = logging.getLogger("tempest_v2.ic_builder")
 
-DEFAULT_COPERNICUS_ROOT = (
-    STATIC_DIR / "copernicus_dem_raw"
-    if (STATIC_DIR / "copernicus_dem_raw").exists()
-    else Path("/mnt/d/AI/weer-ai/Tempest/COPERNICUS_DEM")
+def _resolve_default_static_dir(env_name: str, local_sub: str, legacy_path: str) -> Path:
+    env_val = os.environ.get(env_name)
+    if env_val:
+        return Path(env_val)
+    local_dir = STATIC_DIR / local_sub
+    if local_dir.exists():
+        return local_dir
+    legacy = Path(legacy_path)
+    return legacy if legacy.exists() else local_dir
+
+
+DEFAULT_COPERNICUS_ROOT = _resolve_default_static_dir(
+    "TEMPEST_COPERNICUS_DEM_DIR",
+    "copernicus_dem_raw",
+    "/mnt/d/AI/weer-ai/Tempest/COPERNICUS_DEM",
 )
-DEFAULT_GEBCO_ROOT = (
-    STATIC_DIR / "bathymetry_raw"
-    if (STATIC_DIR / "bathymetry_raw").exists()
-    else Path("/mnt/d/AI/weer-ai/Tempest/bathymetrie")
+DEFAULT_GEBCO_ROOT = _resolve_default_static_dir(
+    "TEMPEST_BATHY_DIR",
+    "bathymetry_raw",
+    "/mnt/d/AI/weer-ai/Tempest/bathymetrie",
 )
 
 

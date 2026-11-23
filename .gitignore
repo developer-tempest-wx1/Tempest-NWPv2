@@ -31,3 +31,12 @@ external_refs/
 *.tar.gz
 *.rar
 *.log
+*.part
+
+# Credentials, API keys & OS metadata
+.env
+.env.*
+config/knmi_api_key.txt
+*.key
+*.pem
+.DS_Store

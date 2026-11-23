@@ -17,6 +17,7 @@ import datetime
 import json
 import logging
 import math
+import os
 import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence, Tuple
@@ -31,6 +32,7 @@ if str(PY_ROOT) not in sys.path:
 if str(SCRIPTS_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_ROOT))
 
+from select_era5_cases import DEFAULT_CASES_DIR, rank_knmi_cases  # noqa: E402
 from tempest_v2.knmi_verify import verify_run_against_knmi  # noqa: E402
 from tempest_v2.runner import run_era5_hindcast_lam_pipeline  # noqa: E402
 
@@ -356,7 +358,7 @@ def resolve_selected_cases(
     dates_arg: Optional[str] = None,
     season: str = "all",
     extra_from_selector: int = 0,
-    cases_dir: Path | str = Path("/home/j_ord/AI/Tempest/era5_cases"),
+    cases_dir: Path | str = DEFAULT_CASES_DIR,
 ) -> List[Dict[str, str]]:
     """Resolve ordered benchmark case definitions from preset, IDs, dates, season, and selector."""
     selected: List[Dict[str, str]] = []
