@@ -81,8 +81,8 @@ sudo apt install -y build-essential git curl pkg-config mdbtools libeccodes-dev
 
 ### 2. Clone, Install Python Package & Build CUDA/Rust Core
 ```bash
-git clone <YOUR_REPO_URL> Tempest-NWP
-cd Tempest-NWP
+git clone https://github.com/developer-tempest-wx1/Tempest-NWPv2.git
+cd Tempest-NWPv2
 
 # Create/activate Python environment, then install Tempest + tempest-wx1 (PyPI) + optional deps
 pip install -e ".[all]"

@@ -54,6 +54,8 @@ all = [
 ]
 
 [project.urls]
+Homepage = "https://github.com/developer-tempest-wx1/Tempest-NWPv2"
+Repository = "https://github.com/developer-tempest-wx1/Tempest-NWPv2"
 "WX-1 on PyPI" = "https://pypi.org/project/tempest-wx1/"
 "WX-1 GitHub" = "https://github.com/developer-tempest-wx1/tempest-wx1"
 
