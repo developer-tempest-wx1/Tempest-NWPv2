@@ -15,6 +15,7 @@ from tempest_v2.knmi_verify import (
     _bilinear_sample_latlon_2d,
     compute_continuous_stats,
     compute_fog_contingency,
+    compute_fractions_skill_score,
     compute_skill_score_vs_ifs,
     compute_wind_dir_stats_deg,
     sample_ifs_grib_at_stations,
@@ -302,3 +303,84 @@ def test_ifs_latlon_bilinear_sampling_and_comparison(tmp_path: Path, monkeypatch
     csv_txt = Path(res["artifacts"]["hourly_csv"]).read_text(encoding="utf-8")
     assert "ifs_t2m_rmse_k" in csv_txt and "t2m_skill_vs_ifs" in csv_txt
     assert Path(res["artifacts"]["timeseries_png"]).stat().st_size > 10_000
+
+
+def test_fractions_skill_score_roberts_lean_and_radar_pipeline(tmp_path: Path) -> None:
+    """Verify Roberts & Lean (2008) FSS math, NaN radar-mask handling, clim NetCDF4 decoder, and verify_run wiring."""
+    from tempest_v2.ingest_radar_qpe import KNMI_RADAR_PROJ4_DEFAULT, decode_knmi_clim_radar_01h_netcdf
+
+    # 1. Analytical FSS properties on 40x40 @ 2.5 km grid
+    obs = np.zeros((40, 40), dtype=np.float64)
+    mod_same = np.zeros((40, 40), dtype=np.float64)
+    mod_shift = np.zeros((40, 40), dtype=np.float64)
+    obs[18:22, 18:22] = 3.0
+    mod_same[18:22, 18:22] = 3.0
+    mod_shift[18:22, 22:26] = 3.0  # Displaced 4 cells (10 km) east
+    obs[:, :4] = np.nan  # Outside radar coverage
+
+    fss_id = compute_fractions_skill_score(mod_same, obs, dx_km=2.5, thresholds_mm=(1.0,), scales_km=(2.5, 10.0, 25.0))
+    assert fss_id["n_valid"] == 40 * 36
+    assert fss_id["thresholds"]["1mm"]["scales"]["2.5km"]["fss"] == pytest.approx(1.0, abs=1e-9)
+
+    fss_sh = compute_fractions_skill_score(mod_shift, obs, dx_km=2.5, thresholds_mm=(1.0,), scales_km=(2.5, 10.0, 25.0, 50.0))
+    sc = fss_sh["thresholds"]["1mm"]["scales"]
+    assert sc["2.5km"]["fss"] == pytest.approx(0.0, abs=1e-9)
+    assert sc["2.5km"]["fss"] < sc["10km"]["fss"] < sc["25km"]["fss"] < sc["50km"]["fss"]
+    assert sc["50km"]["fss"] > fss_sh["thresholds"]["1mm"]["fss_uniform"]
+
+    # 2. Synthetic climatological rad_nl25_rac_mfbs_01h_netcdf4 NetCDF4 decoder check
+    spec = get_domain_spec("d3_nl_2p5km", nz=16)
+    rad_nc = tmp_path / "clim_01h.nc"
+    with nc.Dataset(rad_nc, "w") as ds:
+        ds.createDimension("y", 20)
+        ds.createDimension("x", 20)
+        vx = ds.createVariable("x", "f8", ("x",))
+        vy = ds.createVariable("y", "f8", ("y",))
+        vp = ds.createVariable("precipitation", "f4", ("y", "x"))
+        vcrs = ds.createVariable("projection", "i4")
+        vcrs.proj4_params = KNMI_RADAR_PROJ4_DEFAULT
+        # Stereographic coordinates around De Bilt (~x=350 km, y=-3950 km)
+        vx[:] = np.linspace(200.0, 580.0, 20)
+        vy[:] = np.linspace(-3750.0, -4130.0, 20)
+        vp[:, :] = 2.5
+    reproj = decode_knmi_clim_radar_01h_netcdf(rad_nc, spec)
+    assert reproj.shape == (spec.ny, spec.nx)
+    assert np.any(np.isfinite(reproj))
+    assert float(np.nanmean(reproj)) == pytest.approx(2.5, abs=0.1)
+
+    # 3. End-to-end verify_run_against_knmi(..., verify_radar_fss=True)
+    t0 = datetime.datetime(2026, 11, 22, 18, 0, tzinfo=datetime.timezone.utc)
+    t1 = datetime.datetime(2026, 11, 22, 19, 0, tzinfo=datetime.timezone.utc)
+    run_dir = tmp_path / "run_rad"
+    _write_synthetic_wx1(run_dir / "d3" / f"forecast_{spec.name}_T+000h.wx1", spec, t0, 0.0, t2m_c=4.0, mslp_hpa=1012.0)
+    _write_synthetic_wx1(run_dir / "d3" / f"forecast_{spec.name}_T+001h.wx1", spec, t1, 1.0, t2m_c=3.0, mslp_hpa=1014.0)
+    cache_dir = tmp_path / "knmi_cache_rad"
+    for dt_x in (t0, t1):
+        _write_synthetic_knmi_nc(
+            cache_dir / f"KMDS__OPER_P___10M_OBS_L2_{dt_x:%Y%m%d%H%M}.nc",
+            dt_x,
+            ta_c=np.array([4.0, 4.0, 4.0]),
+            pp_hpa=np.array([1012.0, 1012.0, 1012.0]),
+            ff_ms=np.array([5.0, 5.0, 5.0]),
+            dd_deg=np.array([270.0, 270.0, 270.0]),
+            rh_pct=np.array([92.0, 92.0, 92.0]),
+            vis_m=np.array([5000.0, 5000.0, 5000.0]),
+        )
+
+    def _fake_radar(_dt, rspec):
+        arr = np.zeros((rspec.ny, rspec.nx), dtype=np.float32)
+        arr[rspec.ny // 2, rspec.nx // 2] = 0.5
+        return arr
+
+    res = verify_run_against_knmi(
+        run_dir,
+        outdir=tmp_path / "out_rad",
+        knmi_cache_dir=cache_dir,
+        independent_after_hour=1.0,
+        make_maps=False,
+        verify_radar_fss=True,
+        radar_hourly_fetcher=_fake_radar,
+    )
+    assert res["radar_fss"] is not None
+    assert res["radar_fss"]["overall"]["n_hours"] == 1
+    assert res["radar_fss"]["overall"]["thresholds"]["0.1mm"]["scales"]["10km"]["fss"] > 0.5

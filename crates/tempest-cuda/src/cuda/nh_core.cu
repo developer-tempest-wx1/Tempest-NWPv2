@@ -2683,7 +2683,7 @@ uint64_t nh_cuda_estimate_vram_bytes_ex(
     if (has_moist) float32_arrays += 6;
     if (has_lbc) float32_arrays += (has_moist ? 5 : 4);
     if (has_iau) float32_arrays += 4;
-    if (has_physics) float32_arrays += 1; // d_rad_dth_dt
+    if (has_physics) float32_arrays += 2; // d_rad_dth_dt + d_tke
     const uint64_t field_bytes = cells * float32_arrays * 4ULL;
     uint64_t static_2d = static_cast<uint64_t>(ny) * static_cast<uint64_t>(nx) * 24ULL;
     if (has_physics) {
@@ -2862,6 +2862,15 @@ int32_t nh_cuda_upload_state(NhCudaHandle* h, const NhConstStatePtrs* src) {
         CUDA_CHECK(cudaMemcpy(h->d_qs, src->qs, h->n_s * sizeof(float), cudaMemcpyHostToDevice));
         CUDA_CHECK(cudaMemcpy(h->d_qg, src->qg, h->n_s * sizeof(float), cudaMemcpyHostToDevice));
     }
+    if (src->tke != nullptr) {
+        if (!h->d_tke) {
+            CUDA_CHECK(cudaMalloc(&h->d_tke, h->n_s * sizeof(float)));
+        }
+        CUDA_CHECK(cudaMemcpy(h->d_tke, src->tke, h->n_s * sizeof(float), cudaMemcpyHostToDevice));
+        h->tke_initialized = 1;
+    } else if (h->d_tke != nullptr) {
+        h->tke_initialized = 0;
+    }
     return 0;
 }
 
@@ -2882,6 +2891,15 @@ int32_t nh_cuda_download_state(NhCudaHandle* h, const NhStatePtrs* dst) {
         if (dst->qi) CUDA_CHECK(cudaMemcpy(dst->qi, h->d_qi, h->n_s * sizeof(float), cudaMemcpyDeviceToHost));
         if (dst->qs) CUDA_CHECK(cudaMemcpy(dst->qs, h->d_qs, h->n_s * sizeof(float), cudaMemcpyDeviceToHost));
         if (dst->qg) CUDA_CHECK(cudaMemcpy(dst->qg, h->d_qg, h->n_s * sizeof(float), cudaMemcpyDeviceToHost));
+    }
+    if (dst->tke != nullptr) {
+        if (h->d_tke != nullptr && h->tke_initialized != 0) {
+            CUDA_CHECK(cudaMemcpy(dst->tke, h->d_tke, h->n_s * sizeof(float), cudaMemcpyDeviceToHost));
+        } else {
+            for (size_t idx = 0; idx < h->n_s; ++idx) {
+                dst->tke[idx] = 0.01f;
+            }
+        }
     }
     return 0;
 }
@@ -3183,6 +3201,10 @@ int32_t nh_cuda_step_rk3(NhCudaHandle* h, double dt_s, int32_t n_substeps) {
         if (advect_one_tracer(h, h->d_qi, dt_full_f, n_sub_h, dt_h, pi_sfc_f) != 0) return -1;
         if (advect_one_tracer(h, h->d_qs, dt_full_f, n_sub_h, dt_h, pi_sfc_f) != 0) return -1;
         if (advect_one_tracer(h, h->d_qg, dt_full_f, n_sub_h, dt_h, pi_sfc_f) != 0) return -1;
+        if (h->d_tke != nullptr && h->tke_initialized != 0 &&
+            h->has_physics_alloc != 0 && h->pcfg.enable_pbl != 0 && h->pcfg.cy46_physics != 0) {
+            if (advect_one_tracer(h, h->d_tke, dt_full_f, n_sub_h, dt_h, pi_sfc_f) != 0) return -1;
+        }
         if ((h->cfg.bc_x == 2 || h->cfg.bc_y == 2) && h->d_lbc_thp != nullptr &&
             h->cfg.lbc_tau_max_s > 0.0 && h->cfg.lbc_rim_width > 0) {
             nh_lbc_relax_hydrometeors_kernel<<<grid_s, block>>>(

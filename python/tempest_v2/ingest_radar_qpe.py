@@ -13,10 +13,12 @@ import datetime
 import gzip
 import json
 import logging
+import os
 import re
+import urllib.error
 import urllib.request
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Callable, Dict, Optional, Tuple
 
 import h5py
 import numpy as np
@@ -31,6 +33,8 @@ logger = logging.getLogger("tempest_v2.ingest_radar_qpe")
 
 KNMI_RADAR_DATASET = "nl_rdr_data_rtcor_5m"
 KNMI_RADAR_VERSION = "1.0"
+KNMI_RADAR_CLIM_01H_DATASET = "rad_nl25_rac_mfbs_01h_netcdf4"
+KNMI_RADAR_CLIM_01H_VERSION = "2.0"
 DWD_RADOLAN_RW_BASE = "https://opendata.dwd.de/climate_environment/CDC/grids_germany/hourly/radolan/recent/bin/"
 
 KNMI_RADAR_PROJ4_DEFAULT = (
@@ -179,6 +183,163 @@ def fetch_knmi_radar_qpe_5m(
         y_ascending=bool(meta["y_ascending"]),
     )
     return grid, fname
+
+
+def fetch_knmi_radar_5m_at_time(
+    valid_time_utc: datetime.datetime,
+    cache_dir: Path | str = "data/cache/radar",
+    *,
+    api_key: Optional[str] = None,
+) -> Optional[Path]:
+    """Download (or reuse cached) live gauge-adjusted KNMI 5-min radar HDF5 (`nl_rdr_data_rtcor_5m`)."""
+    dt_u = (
+        valid_time_utc.astimezone(datetime.timezone.utc)
+        if valid_time_utc.tzinfo is not None
+        else valid_time_utc.replace(tzinfo=datetime.timezone.utc)
+    )
+    snap = dt_u.replace(minute=(dt_u.minute // 5) * 5, second=0, microsecond=0)
+    fname = f"RAD_NL25_RAC_RT_{snap:%Y%m%d%H%M}.h5"
+    cdir = Path(cache_dir)
+    cdir.mkdir(parents=True, exist_ok=True)
+    out_p = cdir / fname
+    if out_p.is_file() and out_p.stat().st_size > 1024:
+        return out_p
+
+    key = get_knmi_api_key(api_key)
+    if not key:
+        return None
+
+    headers = {"Authorization": key, "User-Agent": "Tempest-NWP/1.0"}
+    dl_api = (
+        f"{KNMI_API_BASE}/datasets/{KNMI_RADAR_DATASET}/versions/{KNMI_RADAR_VERSION}"
+        f"/files/{fname}/url"
+    )
+    try:
+        with urllib.request.urlopen(urllib.request.Request(dl_api, headers=headers), timeout=15) as resp:
+            dl_url = json.loads(resp.read().decode("utf-8")).get("temporaryDownloadUrl")
+        if not dl_url:
+            return None
+        tmp_p = cdir / f".{fname}.{os.getpid()}.tmp"
+        tmp_p.write_bytes(urllib.request.urlopen(urllib.request.Request(dl_url), timeout=25).read())
+        os.replace(tmp_p, out_p)
+        return out_p
+    except urllib.error.HTTPError as exc:
+        if exc.code == 404:
+            return None
+        if exc.code in (401, 403):
+            raise PermissionError(f"KNMI Radar API auth failed (HTTP {exc.code}) for {fname}") from exc
+        logger.warning("KNMI Radar API HTTP %d for %s: %s", exc.code, fname, exc)
+        return None
+    except Exception as exc:
+        logger.warning("KNMI Radar download failed for %s: %s", fname, exc)
+        return None
+
+
+def decode_knmi_clim_radar_01h_netcdf(nc_path: Path | str, spec: DomainSpec) -> np.ndarray:
+    """Decode extracted KNMI `rad_nl25_rac_mfbs_01h_netcdf4` NetCDF4 file and reproject onto `spec` [mm/1h]."""
+    import netCDF4 as nc
+
+    with nc.Dataset(Path(nc_path), "r") as ds:
+        vname = next(
+            (
+                k
+                for k in ("precipitation", "rainfall", "image1_image_data", "rain_depth")
+                if k in ds.variables
+            ),
+            None,
+        )
+        if vname is None:
+            vname = next(
+                (k for k, v in ds.variables.items() if v.ndim >= 2 and k not in ("x", "y", "lat", "lon")),
+                None,
+            )
+        if vname is None:
+            raise ValueError(f"No 2D precipitation variable found in {nc_path}")
+        raw = np.ma.filled(np.ma.asarray(ds.variables[vname][:], dtype=np.float64), np.nan)
+        while raw.ndim > 2:
+            raw = raw[0]
+        raw = np.where((raw >= 0.0) & (raw < 1000.0), raw, np.nan)
+
+        proj4 = KNMI_RADAR_PROJ4_DEFAULT
+        for pk in ("projection", "crs", "polar_stereographic"):
+            if pk in ds.variables:
+                p_attr = getattr(ds.variables[pk], "proj4_params", None) or getattr(ds.variables[pk], "proj4", None)
+                if p_attr:
+                    proj4 = str(p_attr)
+                    break
+        if "x" in ds.variables and "y" in ds.variables:
+            xv = np.asarray(ds.variables["x"][:], dtype=np.float64)
+            yv = np.asarray(ds.variables["y"][:], dtype=np.float64)
+            scale_km = 0.001 if (np.nanmax(np.abs(xv)) > 10_000.0 or np.nanmax(np.abs(yv)) > 10_000.0) else 1.0
+            xv_km = xv * scale_km
+            yv_km = yv * scale_km
+            dx_km = abs(float(xv_km[1] - xv_km[0])) if xv_km.size > 1 else 1.0
+            dy_km = abs(float(yv_km[1] - yv_km[0])) if yv_km.size > 1 else 1.0
+            y_asc = bool(yv_km[-1] > yv_km[0]) if yv_km.size > 1 else False
+            x_orig = float(xv_km[0]) - 0.5 * dx_km
+            y_orig = (float(yv_km[0]) - 0.5 * dy_km) if y_asc else (float(yv_km[0]) + 0.5 * dy_km)
+        else:
+            x_orig, y_orig, dx_km, dy_km, y_asc = 0.0, -3650.0, 1.0, 1.0, False
+
+    return _reproject_radar_to_domain(
+        raw, proj4, x_orig, y_orig, dx_km, dy_km, spec, y_ascending=y_asc
+    )
+
+
+def fetch_knmi_radar_hourly_mm(
+    valid_time_utc: datetime.datetime,
+    spec: DomainSpec,
+    *,
+    api_key: Optional[str] = None,
+    cache_dir: Path | str = "data/cache/radar",
+    fetcher: Optional[Callable[[datetime.datetime, Path | str], Optional[Path]]] = None,
+) -> Optional[np.ndarray]:
+    """Accumulate twelve 5-min gauge-adjusted KNMI radar scans (`-55m .. 00m`) onto `spec` [mm/1h]."""
+    dt_u = (
+        valid_time_utc.astimezone(datetime.timezone.utc)
+        if valid_time_utc.tzinfo is not None
+        else valid_time_utc.replace(tzinfo=datetime.timezone.utc)
+    )
+    end_dt = dt_u.replace(minute=(dt_u.minute // 5) * 5, second=0, microsecond=0)
+    fetch_fn = fetcher if fetcher is not None else (lambda t, c: fetch_knmi_radar_5m_at_time(t, c, api_key=api_key))
+
+    acc_sum: Optional[np.ndarray] = None
+    acc_cnt: Optional[np.ndarray] = None
+    meta_ref: Optional[Dict[str, Any]] = None
+    n_files = 0
+    for back_min in range(55, -1, -5):
+        t_scan = end_dt - datetime.timedelta(minutes=back_min)
+        h5_p = fetch_fn(t_scan, cache_dir)
+        if h5_p is None:
+            continue
+        rain_mm_h, meta = decode_knmi_radar_hdf5(h5_p)
+        rain_5m_mm = rain_mm_h / 12.0
+        if acc_sum is None:
+            acc_sum = np.zeros_like(rain_5m_mm, dtype=np.float64)
+            acc_cnt = np.zeros_like(rain_5m_mm, dtype=np.int32)
+            meta_ref = meta
+        valid = np.isfinite(rain_5m_mm) & (rain_5m_mm >= 0.0)
+        acc_sum[valid] += rain_5m_mm[valid]
+        assert acc_cnt is not None
+        acc_cnt[valid] += 1
+        n_files += 1
+
+    if acc_sum is None or acc_cnt is None or meta_ref is None or n_files < 9:
+        return None
+
+    hourly_src = np.full_like(acc_sum, np.nan, dtype=np.float64)
+    ok = acc_cnt >= 9
+    hourly_src[ok] = acc_sum[ok] * (12.0 / acc_cnt[ok])
+    return _reproject_radar_to_domain(
+        hourly_src,
+        meta_ref["proj4"],
+        meta_ref["x_origin_km"],
+        meta_ref["y_origin_km"],
+        meta_ref["dx_km"],
+        meta_ref["dy_km"],
+        spec,
+        y_ascending=bool(meta_ref["y_ascending"]),
+    )
 
 
 def parse_dwd_radolan_rw_bytes(raw_bytes: bytes) -> Tuple[np.ndarray, Dict[str, Any]]:

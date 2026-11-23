@@ -69,6 +69,7 @@ typedef struct NhStatePtrs {
     float* qi;
     float* qs;
     float* qg;
+    float* tke; /* Optional prognostic 3D TKE [m^2/s^2] (nullable) */
 } NhStatePtrs;
 
 /**
@@ -86,6 +87,7 @@ typedef struct NhConstStatePtrs {
     const float* qi;
     const float* qs;
     const float* qg;
+    const float* tke; /* Optional prognostic 3D TKE [m^2/s^2] (nullable) */
 } NhConstStatePtrs;
 
 /**

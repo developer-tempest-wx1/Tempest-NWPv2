@@ -61,6 +61,7 @@ class NhStatePtrsC(ctypes.Structure):
         ("qi", ctypes.c_void_p),
         ("qs", ctypes.c_void_p),
         ("qg", ctypes.c_void_p),
+        ("tke", ctypes.c_void_p),
     ]
 
 
@@ -356,6 +357,7 @@ def _pack_state_ptrs(state: Dict[str, np.ndarray], moist: bool) -> Tuple[NhState
         qi=ptr_of("qi", optional=not moist),
         qs=ptr_of("qs", optional=not moist),
         qg=ptr_of("qg", optional=not moist),
+        tke=ptr_of("tke", optional=True),
     )
     return ptrs, kept
 
@@ -762,6 +764,8 @@ class NonHydrostaticGPUSolver:
         if self.has_moist:
             for sp in self.SPECIES:
                 state[sp] = np.zeros((self.nz, self.ny, self.nx), dtype=np.float32)
+        if self.has_physics:
+            state["tke"] = np.full((self.nz, self.ny, self.nx), 0.01, dtype=np.float32)
         return state
 
     def _slice_tile_state(
@@ -780,6 +784,8 @@ class NonHydrostaticGPUSolver:
                 out[sp] = np.ascontiguousarray(src[sp][:, tile.pj0 : tile.pj1, tile.pi0 : tile.pi1], dtype=np.float32)
         elif include_qv and "qv" in src:
             out["qv"] = np.ascontiguousarray(src["qv"][:, tile.pj0 : tile.pj1, tile.pi0 : tile.pi1], dtype=np.float32)
+        if moist is None and "tke" in src:
+            out["tke"] = np.ascontiguousarray(src["tke"][:, tile.pj0 : tile.pj1, tile.pi0 : tile.pi1], dtype=np.float32)
         return out
 
     def _write_tile_interior(self, dst: Dict[str, np.ndarray], tile_state: Dict[str, np.ndarray], tile: _TileBox) -> None:
@@ -791,6 +797,8 @@ class NonHydrostaticGPUSolver:
         if self.has_moist:
             for sp in self.SPECIES:
                 dst[sp][:, tile.j0 : tile.j1, tile.i0 : tile.i1] = tile_state[sp][:, lj0:lj1, li0:li1]
+        if "tke" in dst and "tke" in tile_state:
+            dst["tke"][:, tile.j0 : tile.j1, tile.i0 : tile.i1] = tile_state["tke"][:, lj0:lj1, li0:li1]
 
         u_end = tile.i1 + (1 if tile.i1 == self.nx else 0)
         lu_end = li1 + (1 if tile.i1 == self.nx else 0)
@@ -814,6 +822,8 @@ class NonHydrostaticGPUSolver:
                     else np.ascontiguousarray(v, dtype=np.float32)
                     for k, v in state.items()
                 }
+            if self.has_physics and "tke" not in self._state_host:
+                self._state_host["tke"] = np.full((self.nz, self.ny, self.nx), 0.01, dtype=np.float32)
             if self._tile_handles:
                 for h, tile in zip(self._tile_handles, self._tiles):
                     t_state = self._slice_tile_state(self._state_host, tile)

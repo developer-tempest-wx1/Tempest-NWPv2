@@ -61,7 +61,7 @@ def test_new_lam_domain_specs_and_bboxes() -> None:
     assert float(eu.lon2d.max()) > 31.0
     assert get_domain_spec("lam_eu", nz=65).name == "lam_eu_5km"
     assert get_domain_spec("europe_5km", nz=65).name == "lam_eu_5km"
-    assert LAM_DOMAIN_DEFAULT_DT_S["lam_bnl_ns_de_2p5km"] == pytest.approx(6.0)
+    assert LAM_DOMAIN_DEFAULT_DT_S["lam_bnl_ns_de_2p5km"] == pytest.approx(12.0)
     assert LAM_DOMAIN_DEFAULT_DT_S["lam_eu_5km"] == pytest.approx(15.0)
 
 

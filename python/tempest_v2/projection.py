@@ -284,19 +284,19 @@ D1_DOMAIN_DEFAULT_DT_S: Dict[str, float] = {
 }
 
 LAM_DOMAIN_DEFAULT_DT_S: Dict[str, float] = {
-    "lam_bnl_ns_de_2p5km": 6.0,
+    "lam_bnl_ns_de_2p5km": 12.0,
     "lam_eu_5km": 15.0,
-    "d3_nl_2p5km": 6.0,
-    "d3_benelux_de_2p5km": 6.0,
-    "d3_benelux_de_1p5km": 4.0,
+    "d3_nl_2p5km": 12.0,
+    "d3_benelux_de_2p5km": 12.0,
+    "d3_benelux_de_1p5km": 6.0,
     "d2_eu_lcc": 20.0,
 }
 
 LAM_DOMAIN_DEFAULT_PHYSICS_EVERY: Dict[str, int] = {
-    "lam_bnl_ns_de_2p5km": 5,
+    "lam_bnl_ns_de_2p5km": 3,
     "lam_eu_5km": 3,
-    "d3_nl_2p5km": 5,
-    "d3_benelux_de_2p5km": 5,
+    "d3_nl_2p5km": 3,
+    "d3_benelux_de_2p5km": 3,
     "d3_benelux_de_1p5km": 5,
     "d2_eu_lcc": 2,
 }

@@ -62,6 +62,7 @@ pub struct NhStatePtrs {
     pub qi: *mut f32,
     pub qs: *mut f32,
     pub qg: *mut f32,
+    pub tke: *mut f32,
 }
 
 #[repr(C)]
@@ -77,6 +78,7 @@ pub struct NhConstStatePtrs {
     pub qi: *const f32,
     pub qs: *const f32,
     pub qg: *const f32,
+    pub tke: *const f32,
 }
 
 #[repr(C)]
@@ -387,6 +389,7 @@ impl NhSolver {
             qi: ptr::null(),
             qs: ptr::null(),
             qg: ptr::null(),
+            tke: ptr::null(),
         };
         let rc = unsafe { nh_cuda_upload_state(self.handle, &ptrs) };
         if rc != 0 {
@@ -415,6 +418,7 @@ impl NhSolver {
             qi: ptr::null_mut(),
             qs: ptr::null_mut(),
             qg: ptr::null_mut(),
+            tke: ptr::null_mut(),
         };
         let rc = unsafe { nh_cuda_download_state(self.handle, &ptrs) };
         if rc != 0 {
@@ -450,6 +454,7 @@ impl NhSolver {
             qi: qi.as_ptr(),
             qs: qs.as_ptr(),
             qg: qg.as_ptr(),
+            tke: ptr::null(),
         };
         let rc = unsafe { nh_cuda_upload_state(self.handle, &ptrs) };
         if rc != 0 {
@@ -485,6 +490,7 @@ impl NhSolver {
             qi: qi.as_mut_ptr(),
             qs: qs.as_mut_ptr(),
             qg: qg.as_mut_ptr(),
+            tke: ptr::null_mut(),
         };
         let rc = unsafe { nh_cuda_download_state(self.handle, &ptrs) };
         if rc != 0 {

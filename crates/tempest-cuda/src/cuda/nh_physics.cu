@@ -1174,16 +1174,59 @@ __global__ void nh_surface_and_lsm_kernel(
 }
 
 // ===========================================================================
-// PILLAR 2 (YSU Nonlocal PBL + Shallow EDMFm + Implicit Double Thomas Solver)
+// PILLAR 2 (YSU Nonlocal PBL + HARATU 1.5-Order Prognostic TKE + Shallow EDMF)
 // ===========================================================================
+
+__device__ inline void eval_haratu_lengths_k(
+    float z_if, float hpbl, float p_if, float e_if, float n2, float wtv0,
+    float ustar_v, float wstar,
+    float& l_m_out, float& l_h_out, float& km_out, float& kh_out
+) {
+    // HARATU (de Rooy et al. 2022 GMD 15, Eqs. 4, 14-16, 27-28; Lenderink & Holtslag 2004):
+    //   c_0 = 3.75, c_n = 1/sqrt(c_0) = 0.5163978, c_h = 0.11, c_m = 0.20, p = 2, l_inf = 40 m.
+    //   ECMWF IFS Cy50r1 (May 2026): reduced stable stratospheric diffusion (l_inf = 10 m for p < 200 hPa).
+    constexpr float C_N = 0.51639778f;
+    constexpr float C_H = 0.11f;
+    constexpr float C_M = 0.20f;
+    const float sqe = sqrtf(fmaxf(e_if, 1.0e-4f));
+    const float l_inf = (p_if < 20000.0f && n2 > 0.0f) ? 10.0f : 40.0f;
+    const float l_min = 1.0f / (1.0f / l_inf + 1.0f / fmaxf(0.5f * C_N * KARMAN_F * fmaxf(z_if, 1.0f), 0.2f));
+
+    float l_int = 0.0f;
+    if (z_if < hpbl) {
+        const float s = fminf(0.99f, fmaxf(0.0f, z_if / fmaxf(hpbl, 20.0f)));
+        const float phi_c = (wtv0 > 0.0f)
+            ? fminf(2.5f, 1.0f + 0.5f * sqrtf(wstar / fmaxf(ustar_v, 0.05f)))
+            : 1.0f;
+        l_int = C_N * KARMAN_F * z_if * (1.0f - s) * phi_c;
+    }
+    const float inv_l0_sq = 1.0f / fmaxf(l_int * l_int + l_min * l_min, 0.04f);
+
+    float l_m, l_h;
+    if (n2 > 1.0e-8f) {
+        const float n_bv = sqrtf(n2);
+        const float ls_m = fmaxf(0.2f, C_M * sqe / n_bv);
+        const float ls_h = fmaxf(0.2f, C_H * sqe / n_bv);
+        l_m = rsqrtf(inv_l0_sq + 1.0f / (ls_m * ls_m));
+        l_h = rsqrtf(inv_l0_sq + 1.0f / (ls_h * ls_h));
+    } else {
+        l_m = rsqrtf(inv_l0_sq);
+        l_h = (wtv0 > 0.0f) ? (1.18f * l_m) : l_m;
+    }
+    l_m_out = l_m;
+    l_h_out = l_h;
+    km_out = fminf(1000.0f, fmaxf(0.01f, l_m * sqe));
+    kh_out = fminf(1000.0f, fmaxf(0.01f, l_h * sqe));
+}
 
 __global__ void nh_pbl_scalar_kernel(
     NhGridConfig cfg,
+    NhPhysicsConfig pcfg,
     DeviceStaticGrid g,
     double dt_s,
     const float* u, const float* v, const float* pip,
     const float* lsm, const float* shf, const float* lhf, const float* ustar,
-    float* thp, float* qv, float* qc, float* qi, float* pblh,
+    float* thp, float* qv, float* qc, float* qi, float* tke, float* pblh,
     float* mu_scratch, float* kh_scratch, double* tri_c, double* tri_d
 ) {
     const int32_t i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1260,8 +1303,12 @@ __global__ void nh_pbl_scalar_kernel(
         ? fminf(16.0f * ustar_v, fmaxf(0.2f * ustar_v, cbrtf(us3_i + 4.0f * KARMAN_F * wstar3)))
         : fmaxf(0.05f * ustar_v, ustar_v / phi_m_sbl);
 
-    // 2. Compute YSU K_h[k] -> kh_scratch[k] and Shallow EDMF Updraft Mass Flux M_u[k] -> mu_scratch[k]
+    // 2. Compute PBL diffusivities K_h (HARATU 1.5-order prognostic TKE when cy46_physics != 0, else YSU)
+    //    and Shallow EDMF Updraft Mass Flux M_u[k] -> mu_scratch[k]
+    const bool use_haratu = (pcfg.cy46_physics != 0) && (tke != nullptr);
     constexpr float AU_EDMF = 0.10f;
+    constexpr float C0_HARATU = 3.75f;
+    constexpr float C0_SQ_HARATU = C0_HARATU * C0_HARATU; // 14.0625 (de Rooy et al. 2022 Eq. 27)
     float w_u2 = (wtv0 > 0.0f) ? fmaxf(0.25f, 1.5f * wstar * wstar + ustar_v * ustar_v) : 0.0f;
     const float qc0 = (cfg.has_moist && qc) ? fmaxf(0.0f, qc[col]) : 0.0f;
     float thl_u = th0 - (LV0_F / (CP_D_F * pi0)) * qc0 + ((wtv0 > 0.0f) ? 1.5f * wth0 / wscale : 0.0f);
@@ -1269,89 +1316,215 @@ __global__ void nh_pbl_scalar_kernel(
     bool updraft_alive = (wtv0 > 0.05f * ustar_v * 0.01f || wtv0 > 1e-4f);
 
     float zk = z_0, dzk = dz_0, thbk = thb0, pibk = pib0, thk = th0, pik = pi0, tk = t0, pk = p0, rhok = rho0;
-    for (int32_t k = 0; k < nz - 1; ++k) {
+    float uk_cur = 0.5f * (read_u_f(u, 0, j, i, nz, cfg.ny, cfg.nx, cfg.bc_x, cfg.bc_y)
+                         + read_u_f(u, 0, j, i + 1, nz, cfg.ny, cfg.nx, cfg.bc_x, cfg.bc_y));
+    float vk_cur = 0.5f * (read_v_f(v, 0, j, i, nz, cfg.ny, cfg.nx, cfg.bc_x, cfg.bc_y)
+                         + read_v_f(v, 0, j + 1, i, nz, cfg.ny, cfg.nx, cfg.bc_x, cfg.bc_y));
+    // Sliding downward-interface quantities for implicit prognostic TKE Thomas assembly
+    float km_dn_e = 0.01f, kh_dn_e = 0.01f, lm_dn_e = 2.0f, s2_dn_e = 0.0f, n2_dn_e = 0.0f;
+    float rho_dn_e = rho0, dz_dn_e = dz_0, wcasc_dn_e = 0.0f;
+    double c_prev_e = 0.0;
+
+    for (int32_t k = 0; k < nz; ++k) {
         const size_t idx_k = static_cast<size_t>(k) * n2 + col;
-        const size_t idx_kp = static_cast<size_t>(k + 1) * n2 + col;
-        float zkp, dzkp, thbkp, pibkp, thkp, pikp, tkp, pkp, rhokp;
-        eval_cell_thermo(cfg, g, k + 1, col, hs, pi_sfc_f, thp, pip, qv, qc, nullptr, qi, nullptr, nullptr,
-                         zkp, dzkp, thbkp, pibkp, thkp, pikp, tkp, pkp, rhokp);
+        float km_up_e = 0.01f, kh_up_e = 0.01f, lm_up_e = 2.0f, s2_up_e = 0.0f, n2_up_e = 0.0f;
+        float rho_up_e = rhok, dz_up_e = dzk, wcasc_up_e = 0.0f;
 
-        const float z_if = (static_cast<float>(g.zeta_w[k + 1]) + static_cast<float>(g.b_w[k + 1]) * hs) - hs;
-        const float dz_mid = fmaxf(1.0f, zkp - zk);
-        const float rho_if = 0.5f * (rhok + rhokp);
+        float zkp = zk, dzkp = dzk, thbkp = thbk, pibkp = pibk, thkp = thk, pikp = pik, tkp = tk, pkp = pk, rhokp = rhok;
+        float uk_nxt = uk_cur, vk_nxt = vk_cur;
 
-        const float qvk = (cfg.has_moist && qv) ? fmaxf(0.0f, qv[idx_k]) : 0.0f;
-        const float qvkp = (cfg.has_moist && qv) ? fmaxf(0.0f, qv[idx_kp]) : 0.0f;
-        const float thvk = thk * (1.0f + EPS_V_F * qvk);
-        const float thvkp = thkp * (1.0f + EPS_V_F * qvkp);
+        if (k + 1 < nz) {
+            const size_t idx_kp = static_cast<size_t>(k + 1) * n2 + col;
+            eval_cell_thermo(cfg, g, k + 1, col, hs, pi_sfc_f, thp, pip, qv, qc, nullptr, qi, nullptr, nullptr,
+                             zkp, dzkp, thbkp, pibkp, thkp, pikp, tkp, pkp, rhokp);
 
-        float kh_val = 0.01f;
-        if (z_if < hpbl) {
-            const float s = z_if / hpbl;
-            const float km = KARMAN_F * wscale * z_if * (1.0f - s) * (1.0f - s);
-            const float pr = (wtv0 > 0.0f)
-                ? 0.85f
-                : fminf(3.0f, fmaxf(1.0f, 1.0f + 2.1f * (0.1f * hpbl / fmaxf(obukhov_l, 5.0f))));
-            kh_val = fminf(1000.0f, fmaxf(0.01f, km / pr));
-        } else {
-            const float uk = 0.5f * (read_u_f(u, k, j, i, nz, cfg.ny, cfg.nx, cfg.bc_x, cfg.bc_y)
-                                   + read_u_f(u, k, j, i + 1, nz, cfg.ny, cfg.nx, cfg.bc_x, cfg.bc_y));
-            const float ukp = 0.5f * (read_u_f(u, k + 1, j, i, nz, cfg.ny, cfg.nx, cfg.bc_x, cfg.bc_y)
-                                    + read_u_f(u, k + 1, j, i + 1, nz, cfg.ny, cfg.nx, cfg.bc_x, cfg.bc_y));
-            const float vk = 0.5f * (read_v_f(v, k, j, i, nz, cfg.ny, cfg.nx, cfg.bc_x, cfg.bc_y)
-                                   + read_v_f(v, k, j + 1, i, nz, cfg.ny, cfg.nx, cfg.bc_x, cfg.bc_y));
-            const float vkp = 0.5f * (read_v_f(v, k + 1, j, i, nz, cfg.ny, cfg.nx, cfg.bc_x, cfg.bc_y)
-                                    + read_v_f(v, k + 1, j + 1, i, nz, cfg.ny, cfg.nx, cfg.bc_x, cfg.bc_y));
-            const float dudz = (ukp - uk) / dz_mid;
-            const float dvdz = (vkp - vk) / dz_mid;
-            const float s2 = dudz * dudz + dvdz * dvdz + 1e-8f;
-            const float n2 = (GRAVITY_F / (0.5f * (thvk + thvkp))) * ((thvkp - thvk) / dz_mid);
-            const float ri_loc = n2 / s2;
-            const float ell = (KARMAN_F * z_if) / (1.0f + KARMAN_F * z_if / 30.0f);
-            float fh = 1.0f;
-            if (ri_loc >= 0.0f) {
-                fh = 1.0f / ((1.0f + 5.0f * ri_loc) * (1.0f + 5.0f * ri_loc));
-            } else {
-                fh = 1.0f - (15.0f * ri_loc) / (1.0f + 75.0f * ell * ell * sqrtf(-ri_loc) / (dz_mid * dz_mid));
-            }
-            kh_val = fminf(50.0f, fmaxf(0.01f, ell * ell * sqrtf(s2) * fh));
-        }
-        if (wtv0 > 0.0f && fabsf(z_if - hpbl) < 0.15f * hpbl) {
-            const float wm3 = wstar3 + 5.0f * us3_i;
-            const float k_ent = 0.15f * dz_mid * cbrtf(wm3) * 0.25f;
-            kh_val = fminf(100.0f, kh_val + k_ent);
-        }
-        kh_scratch[idx_k] = kh_val;
-
-        float mu_val = 0.0f;
-        if (updraft_alive && z_if < 4000.0f) {
-            const float qck = (cfg.has_moist && qc) ? fmaxf(0.0f, qc[idx_k]) : 0.0f;
-            const float thl_env = thk - (LV0_F / (CP_D_F * pik)) * qck;
-            const float qt_env = qvk + qck;
-            const float eps_u = 1.8f / fmaxf(z_if + 100.0f, 100.0f);
-            thl_u = (thl_u + eps_u * dz_mid * thl_env) / (1.0f + eps_u * dz_mid);
-            qt_u = (qt_u + eps_u * dz_mid * qt_env) / (1.0f + eps_u * dz_mid);
-
-            const float pi_if = 0.5f * (pik + pikp);
+            const float z_if = (static_cast<float>(g.zeta_w[k + 1]) + static_cast<float>(g.b_w[k + 1]) * hs) - hs;
+            const float dz_mid = fmaxf(1.0f, zkp - zk);
+            const float rho_if = 0.5f * (rhok + rhokp);
             const float p_if = 0.5f * (pk + pkp);
-            float t_u = thl_u * pi_if;
-            const float qc_u = fmaxf(0.0f, qt_u - qsat_water(t_u, p_if));
-            t_u = fminf(350.0f, fmaxf(160.0f, (thl_u + (LV0_F / (CP_D_F * pi_if)) * qc_u) * pi_if));
-            const float qv_u = fmaxf(0.0f, qt_u - qc_u);
-            const float thv_u = (t_u / pi_if) * (1.0f + EPS_V_F * qv_u - qc_u);
-            const float thv_env = 0.5f * (thvk + thvkp);
-            const float buoy = GRAVITY_F * (thv_u - thv_env) / fmaxf(thv_env, 150.0f);
-            w_u2 = (w_u2 + 2.0f * dz_mid * buoy) / (1.0f + 2.0f * eps_u * dz_mid);
-            if (w_u2 > 0.01f) {
-                mu_val = AU_EDMF * rho_if * sqrtf(w_u2);
+
+            const float qvk = (cfg.has_moist && qv) ? fmaxf(0.0f, qv[idx_k]) : 0.0f;
+            const float qvkp = (cfg.has_moist && qv) ? fmaxf(0.0f, qv[idx_kp]) : 0.0f;
+            const float thvk = thk * (1.0f + EPS_V_F * qvk);
+            const float thvkp = thkp * (1.0f + EPS_V_F * qvkp);
+
+            uk_nxt = 0.5f * (read_u_f(u, k + 1, j, i, nz, cfg.ny, cfg.nx, cfg.bc_x, cfg.bc_y)
+                           + read_u_f(u, k + 1, j, i + 1, nz, cfg.ny, cfg.nx, cfg.bc_x, cfg.bc_y));
+            vk_nxt = 0.5f * (read_v_f(v, k + 1, j, i, nz, cfg.ny, cfg.nx, cfg.bc_x, cfg.bc_y)
+                           + read_v_f(v, k + 1, j + 1, i, nz, cfg.ny, cfg.nx, cfg.bc_x, cfg.bc_y));
+
+            float mu_val = 0.0f;
+            float w_u2_if = 0.0f;
+            if (updraft_alive && z_if < 4000.0f) {
+                const float qck = (cfg.has_moist && qc) ? fmaxf(0.0f, qc[idx_k]) : 0.0f;
+                const float thl_env = thk - (LV0_F / (CP_D_F * pik)) * qck;
+                const float qt_env = qvk + qck;
+                const float eps_u = 1.8f / fmaxf(z_if + 100.0f, 100.0f);
+                thl_u = (thl_u + eps_u * dz_mid * thl_env) / (1.0f + eps_u * dz_mid);
+                qt_u = (qt_u + eps_u * dz_mid * qt_env) / (1.0f + eps_u * dz_mid);
+
+                const float pi_if = 0.5f * (pik + pikp);
+                float t_u = thl_u * pi_if;
+                const float qc_u = fmaxf(0.0f, qt_u - qsat_water(t_u, p_if));
+                t_u = fminf(350.0f, fmaxf(160.0f, (thl_u + (LV0_F / (CP_D_F * pi_if)) * qc_u) * pi_if));
+                const float qv_u = fmaxf(0.0f, qt_u - qc_u);
+                const float thv_u = (t_u / pi_if) * (1.0f + EPS_V_F * qv_u - qc_u);
+                const float thv_env = 0.5f * (thvk + thvkp);
+                const float buoy = GRAVITY_F * (thv_u - thv_env) / fmaxf(thv_env, 150.0f);
+                w_u2 = (w_u2 + 2.0f * dz_mid * buoy) / (1.0f + 2.0f * eps_u * dz_mid);
+                if (w_u2 > 0.01f) {
+                    mu_val = AU_EDMF * rho_if * sqrtf(w_u2);
+                    w_u2_if = w_u2;
+                } else {
+                    updraft_alive = false;
+                }
+            }
+            mu_scratch[idx_k] = mu_val;
+
+            if (use_haratu) {
+                const float dudz = (uk_nxt - uk_cur) / dz_mid;
+                const float dvdz = (vk_nxt - vk_cur) / dz_mid;
+                s2_up_e = dudz * dudz + dvdz * dvdz;
+                n2_up_e = (GRAVITY_F / fmaxf(0.5f * (thvk + thvkp), 150.0f)) * ((thvkp - thvk) / dz_mid);
+                const float e_if = 0.5f * (fmaxf(1.0e-4f, tke[idx_k]) + fmaxf(1.0e-4f, tke[idx_kp]));
+                float lh_tmp = 1.0f;
+                eval_haratu_lengths_k(z_if, hpbl, p_if, e_if, n2_up_e, wtv0, ustar_v, wstar,
+                                      lm_up_e, lh_tmp, km_up_e, kh_up_e);
+                rho_up_e = rho_if;
+                dz_up_e = dz_mid;
+                // Subcloud-cloud TKE energy cascade (de Rooy et al. 2022 Eqs. 18-19: c=0.5, E_l=0.002, Z_wl=200 m)
+                if (mu_val > 0.0f && w_u2_if > 0.0f) {
+                    const float m_vel = mu_val / fmaxf(rho_if, 0.05f);
+                    const float dz_zi = (hpbl - z_if) / 200.0f;
+                    const float f_casc = 0.002f * fminf(1.2f, z_if / fmaxf(hpbl, 50.0f)) / (1.0f + dz_zi * dz_zi);
+                    wcasc_up_e = fminf(0.05f, 0.5f * f_casc * w_u2_if * m_vel);
+                }
+                kh_scratch[idx_k] = kh_up_e;
             } else {
-                updraft_alive = false;
+                float kh_val = 0.01f;
+                if (z_if < hpbl) {
+                    const float s = z_if / hpbl;
+                    const float km = KARMAN_F * wscale * z_if * (1.0f - s) * (1.0f - s);
+                    const float pr = (wtv0 > 0.0f)
+                        ? 0.85f
+                        : fminf(3.0f, fmaxf(1.0f, 1.0f + 2.1f * (0.1f * hpbl / fmaxf(obukhov_l, 5.0f))));
+                    kh_val = fminf(1000.0f, fmaxf(0.01f, km / pr));
+                } else {
+                    const float dudz = (uk_nxt - uk_cur) / dz_mid;
+                    const float dvdz = (vk_nxt - vk_cur) / dz_mid;
+                    const float s2 = dudz * dudz + dvdz * dvdz + 1e-8f;
+                    const float n2 = (GRAVITY_F / (0.5f * (thvk + thvkp))) * ((thvkp - thvk) / dz_mid);
+                    const float ri_loc = n2 / s2;
+                    const float ell = (KARMAN_F * z_if) / (1.0f + KARMAN_F * z_if / 30.0f);
+                    float fh = 1.0f;
+                    if (ri_loc >= 0.0f) {
+                        fh = 1.0f / ((1.0f + 5.0f * ri_loc) * (1.0f + 5.0f * ri_loc));
+                    } else {
+                        fh = 1.0f - (15.0f * ri_loc) / (1.0f + 75.0f * ell * ell * sqrtf(-ri_loc) / (dz_mid * dz_mid));
+                    }
+                    kh_val = fminf(50.0f, fmaxf(0.01f, ell * ell * sqrtf(s2) * fh));
+                }
+                if (wtv0 > 0.0f && fabsf(z_if - hpbl) < 0.15f * hpbl) {
+                    const float wm3 = wstar3 + 5.0f * us3_i;
+                    const float k_ent = 0.15f * dz_mid * cbrtf(wm3) * 0.25f;
+                    kh_val = fminf(100.0f, kh_val + k_ent);
+                }
+                kh_scratch[idx_k] = kh_val;
             }
         }
-        mu_scratch[idx_k] = mu_val;
+
+        if (use_haratu) {
+            const float e_cur = fmaxf(1.0e-4f, tke[idx_k]);
+            const double mass_k = static_cast<double>(rhok * dzk);
+            double a_e = 0.0, c_e = 0.0;
+            if (k > 0) {
+                a_e = -static_cast<double>(rho_dn_e * (2.0f * km_dn_e) / dz_dn_e);
+            }
+            if (k + 1 < nz) {
+                c_e = -static_cast<double>(rho_up_e * (2.0f * km_up_e) / dz_up_e);
+            }
+            float p_shear = 0.0f, p_buoy = 0.0f, lm_cell = 2.0f, w_casc_cell = 0.0f;
+            if (k == 0) {
+                const float z0_agl = fmaxf(2.0f, z_0 - hs);
+                p_shear = 0.5f * ((us3_i / (KARMAN_F * z0_agl)) + km_up_e * s2_up_e);
+                const float pb_sfc = (wtv0 > 0.0f) ? ((GRAVITY_F / fmaxf(thv0_raw, 150.0f)) * wtv0) : 0.0f;
+                p_buoy = 0.5f * (pb_sfc - kh_up_e * n2_up_e);
+                lm_cell = fmaxf(1.0f, lm_up_e);
+                w_casc_cell = 0.5f * wcasc_up_e;
+            } else if (k + 1 == nz) {
+                p_shear = km_dn_e * s2_dn_e;
+                p_buoy = -kh_dn_e * n2_dn_e;
+                lm_cell = fmaxf(1.0f, lm_dn_e);
+                w_casc_cell = wcasc_dn_e;
+            } else {
+                p_shear = 0.5f * (km_dn_e * s2_dn_e + km_up_e * s2_up_e);
+                p_buoy = -0.5f * (kh_dn_e * n2_dn_e + kh_up_e * n2_up_e);
+                lm_cell = fmaxf(1.0f, 0.5f * (lm_dn_e + lm_up_e));
+                w_casc_cell = 0.5f * (wcasc_dn_e + wcasc_up_e);
+            }
+            const float prod_pos = fminf(2.0f, fmaxf(0.0f, p_shear) + fmaxf(0.0f, p_buoy) + w_casc_cell);
+            const float sink_buoy = fmaxf(0.0f, -p_buoy);
+            // Dissipation l_eps = c_0^2 * l_m (de Rooy et al. 2022 Eq. 27, c_0 = 3.75)
+            const float l_eps = C0_SQ_HARATU * lm_cell;
+            const double impl_sink_rate = static_cast<double>(sqrtf(e_cur) / l_eps + sink_buoy / e_cur);
+
+            double sfc_anchor_g = 0.0, sfc_anchor_rhs = 0.0;
+            if (k == 0) {
+                const float e_sfc = fminf(25.0f, fmaxf(1.0e-3f, C0_HARATU * ustar_v * ustar_v + 0.2f * wstar * wstar));
+                const float z0_agl = fmaxf(2.0f, z_0 - hs);
+                sfc_anchor_g = static_cast<double>(rhok * fmaxf(km_up_e, 0.05f) / z0_agl);
+                sfc_anchor_rhs = sfc_anchor_g * static_cast<double>(e_sfc);
+            }
+
+            const double b_e = mass_k / dt_s + mass_k * impl_sink_rate + sfc_anchor_g - a_e - c_e;
+            const double rhs_e = (mass_k / dt_s) * static_cast<double>(e_cur) + mass_k * static_cast<double>(prod_pos) + sfc_anchor_rhs;
+            const double denom_e = b_e - a_e * c_prev_e;
+            c_prev_e = (k + 1 < nz) ? (c_e / denom_e) : 0.0;
+            const double d_prev_e = (k > 0) ? tri_d[static_cast<size_t>(k - 1) * n2 + col] : 0.0;
+            tri_c[idx_k] = c_prev_e;
+            tri_d[idx_k] = (rhs_e - a_e * d_prev_e) / denom_e;
+
+            km_dn_e = km_up_e; kh_dn_e = kh_up_e; lm_dn_e = lm_up_e;
+            s2_dn_e = s2_up_e; n2_dn_e = n2_up_e;
+            rho_dn_e = rho_up_e; dz_dn_e = dz_up_e; wcasc_dn_e = wcasc_up_e;
+        }
 
         zk = zkp; dzk = dzkp; thbk = thbkp; pibk = pibkp;
         thk = thkp; pik = pikp; tk = tkp; pk = pkp; rhok = rhokp;
+        uk_cur = uk_nxt; vk_cur = vk_nxt;
+    }
+
+    if (use_haratu) {
+        double e_nxt = tri_d[static_cast<size_t>(nz - 1) * n2 + col];
+        tke[static_cast<size_t>(nz - 1) * n2 + col] = static_cast<float>(fmin(50.0, fmax(1.0e-4, e_nxt)));
+        for (int32_t k = nz - 2; k >= 0; --k) {
+            const size_t idx = static_cast<size_t>(k) * n2 + col;
+            e_nxt = tri_d[idx] - tri_c[idx] * e_nxt;
+            tke[idx] = static_cast<float>(fmin(50.0, fmax(1.0e-4, e_nxt)));
+        }
+        // Refresh K_h[0..nz-2] using the newly advanced prognostic TKE^{n+1}
+        float z_a = z_0, dz_a = dz_0, thb_a = thb0, pib_a = pib0, th_a_l = th0, pi_a_l = pi0, t_a_l = t0, p_a_l = p0, rho_a_l = rho0;
+        for (int32_t k = 0; k < nz - 1; ++k) {
+            const size_t idx_k = static_cast<size_t>(k) * n2 + col;
+            const size_t idx_kp = static_cast<size_t>(k + 1) * n2 + col;
+            float z_b, dz_b, thb_b, pib_b, th_b, pi_b, t_b, p_b, rho_b;
+            eval_cell_thermo(cfg, g, k + 1, col, hs, pi_sfc_f, thp, pip, qv, nullptr, nullptr, nullptr, nullptr, nullptr,
+                             z_b, dz_b, thb_b, pib_b, th_b, pi_b, t_b, p_b, rho_b);
+            const float z_if = (static_cast<float>(g.zeta_w[k + 1]) + static_cast<float>(g.b_w[k + 1]) * hs) - hs;
+            const float dz_mid = fmaxf(1.0f, z_b - z_a);
+            const float qvk = (cfg.has_moist && qv) ? fmaxf(0.0f, qv[idx_k]) : 0.0f;
+            const float qvkp = (cfg.has_moist && qv) ? fmaxf(0.0f, qv[idx_kp]) : 0.0f;
+            const float thvk = th_a_l * (1.0f + EPS_V_F * qvk);
+            const float thvkp = th_b * (1.0f + EPS_V_F * qvkp);
+            const float n2_if = (GRAVITY_F / fmaxf(0.5f * (thvk + thvkp), 150.0f)) * ((thvkp - thvk) / dz_mid);
+            const float e_if = 0.5f * (tke[idx_k] + tke[idx_kp]);
+            float lm_t, lh_t, km_t, kh_t;
+            eval_haratu_lengths_k(z_if, hpbl, 0.5f * (p_a_l + p_b), e_if, n2_if, wtv0, ustar_v, wstar,
+                                  lm_t, lh_t, km_t, kh_t);
+            kh_scratch[idx_k] = kh_t;
+            z_a = z_b; dz_a = dz_b; thb_a = thb_b; pib_a = pib_b;
+            th_a_l = th_b; pi_a_l = pi_b; t_a_l = t_b; p_a_l = p_b; rho_a_l = rho_b;
+        }
     }
 
     // 3. Implicit double Thomas vertical solver for [thp, qv, qc, qi] with sliding column thermo
@@ -1455,6 +1628,34 @@ __global__ void nh_pbl_scalar_kernel(
             fptr[idx] = static_cast<float>((sp > 0) ? fmax(0.0, x_nxt) : x_nxt);
         }
     }
+
+    // 4. For HARATU mode, overwrite kh_scratch with exact K_m = l_m * sqrt(TKE) for momentum kernels
+    if (use_haratu) {
+        float z_a = z_0, dz_a = dz_0, thb_a = thb0, pib_a = pib0, th_a_l = th0, pi_a_l = pi0, t_a_l = t0, p_a_l = p0, rho_a_l = rho0;
+        eval_cell_thermo(cfg, g, 0, col, hs, pi_sfc_f, thp, pip, qv, nullptr, nullptr, nullptr, nullptr, nullptr,
+                         z_a, dz_a, thb_a, pib_a, th_a_l, pi_a_l, t_a_l, p_a_l, rho_a_l);
+        for (int32_t k = 0; k < nz - 1; ++k) {
+            const size_t idx_k = static_cast<size_t>(k) * n2 + col;
+            const size_t idx_kp = static_cast<size_t>(k + 1) * n2 + col;
+            float z_b, dz_b, thb_b, pib_b, th_b, pi_b, t_b, p_b, rho_b;
+            eval_cell_thermo(cfg, g, k + 1, col, hs, pi_sfc_f, thp, pip, qv, nullptr, nullptr, nullptr, nullptr, nullptr,
+                             z_b, dz_b, thb_b, pib_b, th_b, pi_b, t_b, p_b, rho_b);
+            const float z_if = (static_cast<float>(g.zeta_w[k + 1]) + static_cast<float>(g.b_w[k + 1]) * hs) - hs;
+            const float dz_mid = fmaxf(1.0f, z_b - z_a);
+            const float qvk = (cfg.has_moist && qv) ? fmaxf(0.0f, qv[idx_k]) : 0.0f;
+            const float qvkp = (cfg.has_moist && qv) ? fmaxf(0.0f, qv[idx_kp]) : 0.0f;
+            const float thvk = th_a_l * (1.0f + EPS_V_F * qvk);
+            const float thvkp = th_b * (1.0f + EPS_V_F * qvkp);
+            const float n2_if = (GRAVITY_F / fmaxf(0.5f * (thvk + thvkp), 150.0f)) * ((thvkp - thvk) / dz_mid);
+            const float e_if = 0.5f * (tke[idx_k] + tke[idx_kp]);
+            float lm_t, lh_t, km_t, kh_t;
+            eval_haratu_lengths_k(z_if, hpbl, 0.5f * (p_a_l + p_b), e_if, n2_if, wtv0, ustar_v, wstar,
+                                  lm_t, lh_t, km_t, kh_t);
+            kh_scratch[idx_k] = km_t;
+            z_a = z_b; dz_a = dz_b; thb_a = thb_b; pib_a = pib_b;
+            th_a_l = th_b; pi_a_l = pi_b; t_a_l = t_b; p_a_l = p_b; rho_a_l = rho_b;
+        }
+    }
 }
 
 __device__ inline float eval_km_face(
@@ -1472,6 +1673,7 @@ __global__ void nh_pbl_momentum_u_kernel(
     DeviceStaticGrid g,
     double dt_s,
     int32_t pass_edge,
+    int32_t km_is_direct,
     const float* pblh, const float* ustar, const float* sfc_drag_coeff,
     const float* shf, const float* kh_scratch,
     float* u, double* tri_c, double* tri_d
@@ -1499,7 +1701,7 @@ __global__ void nh_pbl_momentum_u_kernel(
     const float nref_f = static_cast<float>(cfg.n_ref_s);
     const float hs = 0.5f * (static_cast<float>(g.hs[col_l]) + static_cast<float>(g.hs[col_r]));
     const float shf_face = shf ? 0.5f * (shf[col_l] + shf[col_r]) : 0.0f;
-    const float pr_m = (shf_face < 0.0f) ? 1.5f : 1.0f;
+    const float pr_m = (km_is_direct != 0) ? 1.0f : ((shf_face < 0.0f) ? 1.5f : 1.0f);
     const float c_drag = sfc_drag_coeff ? 0.5f * (sfc_drag_coeff[col_l] + sfc_drag_coeff[col_r]) : 0.0f;
 
     float z_km = 0.0f, rhob_km = 0.0f;
@@ -1554,6 +1756,7 @@ __global__ void nh_pbl_momentum_v_kernel(
     DeviceStaticGrid g,
     double dt_s,
     int32_t pass_edge,
+    int32_t km_is_direct,
     const float* pblh, const float* ustar, const float* sfc_drag_coeff,
     const float* shf, const float* kh_scratch,
     float* v, double* tri_c, double* tri_d
@@ -1581,7 +1784,7 @@ __global__ void nh_pbl_momentum_v_kernel(
     const float nref_f = static_cast<float>(cfg.n_ref_s);
     const float hs = 0.5f * (static_cast<float>(g.hs[col_s]) + static_cast<float>(g.hs[col_n]));
     const float shf_face = shf ? 0.5f * (shf[col_s] + shf[col_n]) : 0.0f;
-    const float pr_m = (shf_face < 0.0f) ? 1.5f : 1.0f;
+    const float pr_m = (km_is_direct != 0) ? 1.0f : ((shf_face < 0.0f) ? 1.5f : 1.0f);
     const float c_drag = sfc_drag_coeff ? 0.5f * (sfc_drag_coeff[col_s] + sfc_drag_coeff[col_n]) : 0.0f;
 
     float z_km = 0.0f, rhob_km = 0.0f;
@@ -1635,8 +1838,8 @@ __global__ void nh_pbl_momentum_v_kernel(
 // PILLAR 1 (6-Class Mixed-Phase Microphysics + SLW + ICON compute_sink + Fallout)
 // ===========================================================================
 
-__device__ inline float mp_fall_speed(int sp_idx, float rho, float t_k, float q, float n_drop_m3 = 1.0e8f) {
-    // sp_idx: 1=cloud (HARMONIE Stokes), 2=rain, 3=ice, 4=snow, 5=graupel (WSM6 Gamma-weighted terminal velocities)
+__device__ inline float mp_fall_speed(int sp_idx, float rho, float t_k, float q, float n_drop_m3 = 1.0e8f, float n0_rain = 8.0e6f) {
+    // sp_idx: 1=cloud (HARMONIE Stokes), 2=rain (variable N0r in ICE-T), 3=ice, 4=snow, 5=graupel
     if (q <= 1e-12f) return 0.0f;
     const float rho_corr = sqrtf(1.225f / fmaxf(rho, 0.05f));
     const float rq = rho * q;
@@ -1647,7 +1850,7 @@ __device__ inline float mp_fall_speed(int sp_idx, float rho, float t_k, float q,
         return fminf(0.15f, 1.35f * 1.19e8f * rv * rv * rho_corr);
     }
     if (sp_idx == 2) {
-        const float lam_r = powf(PI_CONST_F * 1000.0f * 8.0e6f / rq, 0.25f);
+        const float lam_r = powf(PI_CONST_F * 1000.0f * fmaxf(n0_rain, 1.0e5f) / rq, 0.25f);
         return fminf(12.0f, 2502.8f * rho_corr * powf(lam_r, -0.8f));
     }
     if (sp_idx == 3) {
@@ -1770,11 +1973,14 @@ __global__ void nh_microphysics_kernel(
                               * (1.0f + phi_au / (om_tau * om_tau)) * (1.225f / rho);
             sx2x[1][2] += au_sb / rho;
 
-            constexpr float RC0_CUBE = 9.0e-6f * 9.0e-6f * 9.0e-6f;
-            const float qc0 = (4.0f / 3.0f) * PI_CONST_F * RC0_CUBE * 1000.0f * nc / rho;
-            if (q[1] > qc0) {
-                const float qck1 = (0.104f * GRAVITY_F * 0.55f * powf(rho, 4.0f / 3.0f)) / (1.71e-5f * cbrtf(nc * 1000.0f));
-                sx2x[1][2] += qck1 * powf(q[1], 7.0f / 3.0f);
+            // Avoid double-counting autoconversion in Cy46/ICE-T mode (Seifert-Beheng alone uses cy46_cdnc_m3)
+            if (pcfg.cy46_physics == 0) {
+                constexpr float RC0_CUBE = 9.0e-6f * 9.0e-6f * 9.0e-6f;
+                const float qc0 = (4.0f / 3.0f) * PI_CONST_F * RC0_CUBE * 1000.0f * nc / rho;
+                if (q[1] > qc0) {
+                    const float qck1 = (0.104f * GRAVITY_F * 0.55f * powf(rho, 4.0f / 3.0f)) / (1.71e-5f * cbrtf(nc * 1000.0f));
+                    sx2x[1][2] += qck1 * powf(q[1], 7.0f / 3.0f);
+                }
             }
 
             if (q[2] > 1e-8f) {
@@ -1799,9 +2005,14 @@ __global__ void nh_microphysics_kernel(
         if (t_k < T_FREEZE_F) {
             const float qsi = qsat_ice(t_k, p_k);
             const float dtemp = T_FREEZE_F - t_k;
+            const bool use_ice_t = (pcfg.cy46_physics != 0);
+            const float t_nuc_thresh = use_ice_t ? (T_FREEZE_F - 10.0f) : (T_FREEZE_F - 6.0f);
 
-            if ((t_k < T_FREEZE_F - 6.0f && q[1] > 1e-6f) || (t_k < T_FREEZE_F - 25.0f && q[0] > qsi)) {
-                const float ni = fminf(2.5e5f, 5.0f * expf(0.304f * dtemp)) / rho;
+            // HARMONIE OCND2 / ICE-T (Engdahl et al. 2020; Gleeson et al. 2024): stricter ice nucleation
+            // & reduced INP between -10C and -25C preserves realistic supercooled liquid water (SLW)
+            if ((t_k < t_nuc_thresh && q[1] > 1e-6f) || (t_k < T_FREEZE_F - 25.0f && q[0] > qsi)) {
+                const float inp_fac = use_ice_t ? fminf(1.0f, fmaxf(0.35f, (dtemp - 10.0f) / 20.0f)) : 1.0f;
+                const float ni = fminf(2.5e5f, inp_fac * 5.0f * expf(0.304f * dtemp)) / rho;
                 const float qi_tgt = ni * 1.0e-12f;
                 if (qi_tgt > q[3]) {
                     sx2x[0][3] += (qi_tgt - q[3]) / dt_f;
@@ -1817,7 +2028,10 @@ __global__ void nh_microphysics_kernel(
                 sx2x[3][4] += 1.0e-3f * eff_stick * rho * q[3];
             }
             if (q[4] > 1e-8f) {
-                if (q[1] > 1e-6f) sx2x[1][4] += 2.2f * rho * q[4] * q[1] * rho_corr;
+                if (q[1] > 1e-6f) {
+                    const float e_sc = use_ice_t ? (0.45f * expf(-0.04f * dtemp)) : 1.0f;
+                    sx2x[1][4] += 2.2f * e_sc * rho * q[4] * q[1] * rho_corr;
+                }
                 const float f_sdep = 4.0e-3f * (q[0] - qsi) / fmaxf(qsi, 1e-6f) * powf(rho * q[4], 0.6f);
                 if (q[0] > qsi) sx2x[0][4] += fmaxf(0.0f, fminf(f_sdep, (q[0] - qsi) / dt_f));
                 else sx2x[4][0] += fmaxf(0.0f, fminf(-f_sdep, (qsi - q[0]) / dt_f));
@@ -1832,14 +2046,18 @@ __global__ void nh_microphysics_kernel(
             if (q[2] > 1e-7f && dtemp > 4.0f) {
                 sx2x[2][5] += 0.1f * (expf(0.66f * dtemp) - 1.0f) * (rho * q[2] * q[2]);
                 if (q[4] > 1e-6f || q[3] > 1e-6f) {
-                    sx2x[2][5] += 4.0f * rho * q[2] * (q[4] + q[3]);
+                    sx2x[2][5] += (use_ice_t ? 2.0f : 4.0f) * rho * q[2] * (q[4] + q[3]);
                 }
             }
-            if (q[5] > 1e-8f && q[1] > 1e-6f) {
-                sx2x[1][5] += 5.0f * rho * q[5] * q[1] * rho_corr;
+            // July-Wormit et al. (2025 QJRMS) / ICE-T: avoid overconsumption of SLW by tiny graupel seeds
+            const float qg_rime_min = use_ice_t ? 5.0e-6f : 1.0e-8f;
+            if (q[5] > qg_rime_min && q[1] > 1e-6f) {
+                const float e_gc = use_ice_t ? 0.55f : 1.0f;
+                sx2x[1][5] += 5.0f * e_gc * rho * q[5] * q[1] * rho_corr;
             }
-            if (q[4] > 1e-5f && q[1] > 2e-4f) {
-                sx2x[4][5] += 1.5e-2f * q[4] * (rho * q[1]);
+            const float qc_sg_thresh = use_ice_t ? 5.0e-4f : 2.0e-4f;
+            if (q[4] > 1e-5f && q[1] > qc_sg_thresh) {
+                sx2x[4][5] += (use_ice_t ? 5.0e-3f : 1.5e-2f) * q[4] * (rho * q[1]);
             }
         } else {
             const float dtemp = t_k - T_FREEZE_F;
@@ -1895,6 +2113,19 @@ __global__ void nh_microphysics_kernel(
     }
 
     // Pass 2: Subcycled Conservative Float64 Budget Column Fallout (qc, qr, qi, qs, qg)
+    // Variable rain intercept N0r for ICE-T (warm coalescence -> smaller drops 1.2e7, melted ice/snow -> larger drops 2.5e6)
+    bool has_cold_ice_col = false;
+    if (pcfg.cy46_physics != 0) {
+        for (int32_t k = 0; k < nz; ++k) {
+            const size_t idx = static_cast<size_t>(k) * n2 + col;
+            if (qs[idx] > 1e-5f || qg[idx] > 1e-5f) {
+                has_cold_ice_col = true;
+                break;
+            }
+        }
+    }
+    const float n0_rain_col = (pcfg.cy46_physics != 0) ? (has_cold_ice_col ? 2.5e6f : 1.2e7f) : 8.0e6f;
+
     float* fall_ptrs[5] = {qc, qr, qi, qs, qg};
     const int fall_ids[5] = {1, 2, 3, 4, 5};
     double acc_col[5] = {0.0, 0.0, 0.0, 0.0, 0.0};
@@ -1921,7 +2152,7 @@ __global__ void nh_microphysics_kernel(
                 const float p_k = P0_PA_F * powf(pi_k, 1.0f / KAPPA_F);
                 const float rho_act = fmaxf(1e-5f, p_k / (R_D_F * t_k));
                 const float n_drop_k = (pcfg.cy46_physics != 0) ? cy46_cdnc_m3(p_k, k) : n_drop;
-                const float vt = mp_fall_speed(sp_id, rho_act, t_k, static_cast<float>(q_k), n_drop_k);
+                const float vt = mp_fall_speed(sp_id, rho_act, t_k, static_cast<float>(q_k), n_drop_k, n0_rain_col);
                 max_cfl = fmax(max_cfl, static_cast<double>(vt) * dt_s / dz_k);
             }
         }
@@ -1948,7 +2179,7 @@ __global__ void nh_microphysics_kernel(
                     const float p_k = P0_PA_F * powf(pi_k, 1.0f / KAPPA_F);
                     const float rho_act = fmaxf(1e-5f, p_k / (R_D_F * t_k));
                     const float n_drop_k = (pcfg.cy46_physics != 0) ? cy46_cdnc_m3(p_k, k) : n_drop;
-                    const float vt = mp_fall_speed(sp_id, rho_act, t_k, static_cast<float>(q_k), n_drop_k);
+                    const float vt = mp_fall_speed(sp_id, rho_act, t_k, static_cast<float>(q_k), n_drop_k, n0_rain_col);
                     const double cfl = fmin(0.95, static_cast<double>(vt) * dt_sub / dz_k);
                     flux_out = mk * cfl;
                 }
@@ -2017,12 +2248,30 @@ __global__ void nh_init_default_surface_kernel(
     if (sea_ice_albedo) sea_ice_albedo[col] = 0.64f;
 }
 
+__global__ void nh_fill_const_f32_kernel(size_t n, float* dst, float val) {
+    const size_t idx = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+    if (idx < n) dst[idx] = val;
+}
+
 int32_t ensure_physics_buffers(NhCudaHandle* h) {
     if (!h) {
         nh_internal_set_error("Null NhCudaHandle in ensure_physics_buffers");
         return -1;
     }
-    if (h->has_physics_alloc) return 0;
+    if (h->has_physics_alloc) {
+        if (!h->d_tke) {
+            NH_CUDA_CHECK(cudaMalloc(&h->d_tke, h->n_s * sizeof(float)));
+            h->tke_initialized = 0;
+        }
+        if (!h->tke_initialized) {
+            const uint32_t blk_t = 256;
+            const uint32_t grd_t = static_cast<uint32_t>((h->n_s + blk_t - 1) / blk_t);
+            nh_fill_const_f32_kernel<<<grd_t, blk_t>>>(h->n_s, h->d_tke, 0.01f);
+            NH_CUDA_CHECK(cudaGetLastError());
+            h->tke_initialized = 1;
+        }
+        return 0;
+    }
 
     const size_t n2 = static_cast<size_t>(h->cfg.ny) * static_cast<size_t>(h->cfg.nx);
     auto alloc_z = [&](float** p, size_t count) -> cudaError_t {
@@ -2032,6 +2281,17 @@ int32_t ensure_physics_buffers(NhCudaHandle* h) {
     };
 
     NH_CUDA_CHECK(alloc_z(&h->d_rad_dth_dt, h->n_s));
+    if (!h->d_tke) {
+        NH_CUDA_CHECK(cudaMalloc(&h->d_tke, h->n_s * sizeof(float)));
+        h->tke_initialized = 0;
+    }
+    if (!h->tke_initialized) {
+        const uint32_t blk_t = 256;
+        const uint32_t grd_t = static_cast<uint32_t>((h->n_s + blk_t - 1) / blk_t);
+        nh_fill_const_f32_kernel<<<grd_t, blk_t>>>(h->n_s, h->d_tke, 0.01f);
+        NH_CUDA_CHECK(cudaGetLastError());
+        h->tke_initialized = 1;
+    }
     NH_CUDA_CHECK(alloc_z(&h->d_lat_deg, n2));
     NH_CUDA_CHECK(alloc_z(&h->d_lon_deg, n2));
     NH_CUDA_CHECK(alloc_z(&h->d_lsm, n2));
@@ -2102,6 +2362,8 @@ void nh_physics_free_buffers(NhCudaHandle* h) {
     if (!h) return;
     auto cf = [](float*& p) { if (p) { cudaFree(p); p = nullptr; } };
     cf(h->d_rad_dth_dt);
+    cf(h->d_tke);
+    h->tke_initialized = 0;
     cf(h->d_lat_deg); cf(h->d_lon_deg); cf(h->d_lsm); cf(h->d_lake_mask);
     cf(h->d_soil_type); cf(h->d_bathy_depth_m); cf(h->d_z0m_base);
     cf(h->d_albedo_base); cf(h->d_veg_frac);
@@ -2319,31 +2581,32 @@ int32_t nh_cuda_step_physics(NhCudaHandle* h, double dt_s) {
     }
 
     auto run_pbl = [&]() -> int32_t {
-        // 3. YSU Nonlocal PBL + Shallow EDMFm Mass-Flux + Implicit Vertical Diffusion
+        // 3. YSU Nonlocal / HARATU 1.5-Order TKE PBL + Shallow EDMF + Implicit Vertical Diffusion
         if (h->pcfg.enable_pbl) {
+            const int32_t km_direct = (h->pcfg.cy46_physics != 0 && h->d_tke != nullptr) ? 1 : 0;
             nh_pbl_scalar_kernel<<<grid, block>>>(
-                h->cfg, g, dt_s,
+                h->cfg, h->pcfg, g, dt_s,
                 h->d_u, h->d_v, h->d_pip,
                 h->d_lsm, h->d_shf, h->d_lhf, h->d_ustar,
-                h->d_thp, h->d_qv, h->d_qc, h->d_qi, h->d_pblh,
+                h->d_thp, h->d_qv, h->d_qc, h->d_qi, h->d_tke, h->d_pblh,
                 h->d_div, h->d_q_tmp, h->d_tri_c, h->d_tri_d
             );
             NH_CUDA_CHECK(cudaGetLastError());
 
             nh_pbl_momentum_u_kernel<<<grid, block>>>(
-                h->cfg, g, dt_s, 0, h->d_pblh, h->d_ustar, h->d_sfc_drag_coeff,
+                h->cfg, g, dt_s, 0, km_direct, h->d_pblh, h->d_ustar, h->d_sfc_drag_coeff,
                 h->d_shf, h->d_q_tmp, h->d_u, h->d_tri_c, h->d_tri_d
             );
             nh_pbl_momentum_u_kernel<<<dim3(1, (h->cfg.ny + 15) / 16), dim3(1, 16)>>>(
-                h->cfg, g, dt_s, 1, h->d_pblh, h->d_ustar, h->d_sfc_drag_coeff,
+                h->cfg, g, dt_s, 1, km_direct, h->d_pblh, h->d_ustar, h->d_sfc_drag_coeff,
                 h->d_shf, h->d_q_tmp, h->d_u, h->d_tri_c, h->d_tri_d
             );
             nh_pbl_momentum_v_kernel<<<grid, block>>>(
-                h->cfg, g, dt_s, 0, h->d_pblh, h->d_ustar, h->d_sfc_drag_coeff,
+                h->cfg, g, dt_s, 0, km_direct, h->d_pblh, h->d_ustar, h->d_sfc_drag_coeff,
                 h->d_shf, h->d_q_tmp, h->d_v, h->d_tri_c, h->d_tri_d
             );
             nh_pbl_momentum_v_kernel<<<dim3((h->cfg.nx + 15) / 16, 1), dim3(16, 1)>>>(
-                h->cfg, g, dt_s, 1, h->d_pblh, h->d_ustar, h->d_sfc_drag_coeff,
+                h->cfg, g, dt_s, 1, km_direct, h->d_pblh, h->d_ustar, h->d_sfc_drag_coeff,
                 h->d_shf, h->d_q_tmp, h->d_v, h->d_tri_c, h->d_tri_d
             );
             NH_CUDA_CHECK(cudaGetLastError());

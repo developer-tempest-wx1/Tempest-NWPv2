@@ -57,6 +57,11 @@ def main() -> None:
         default=None,
         help="Explicit directory containing ECMWF IFS *_sfc_*.grib2 files for side-by-side comparison",
     )
+    parser.add_argument(
+        "--verify-radar-fss",
+        action="store_true",
+        help="Fetch 12x5-min live gauge-adjusted KNMI radar QPE per hour and score Roberts & Lean (2008) FSS",
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(name)s: %(message)s")
@@ -75,6 +80,7 @@ def main() -> None:
         make_maps=not args.no_maps,
         ifs_grib_dir=args.compare_ifs_dir,
         compare_ifs=args.compare_ifs,
+        verify_radar_fss=args.verify_radar_fss,
     )
 
     print(
@@ -185,6 +191,24 @@ def main() -> None:
                     f"IFS MAE={_fmt(ifs_s['wdir']['mae_deg'], '.1f')}° | "
                     f"SS={_fmt(sk['wdir']['skill_score'], '+.3f')}"
                 )
+
+    if summary.get("radar_fss") and summary["radar_fss"].get("overall"):
+        rf = summary["radar_fss"]["overall"]
+        print(
+            f"\n=== KNMI 1 km Radar QPE — Fractions Skill Score (Roberts & Lean 2008 | {rf['n_hours']} uren, dx={rf['dx_km']:.1f} km) ==="
+        )
+        print("Drempel | f_obs   f_mod   Bias  | FSS_unif |   2.5km    10km    25km    50km")
+        print("-" * 80)
+        for th_k, th_v in rf["thresholds"].items():
+            sc = th_v["scales"]
+            print(
+                f"{th_k:<7s} | {th_v['f_obs']:6.4f}  {th_v['f_mod']:6.4f}  {_fmt(th_v['freq_bias'], '.2f')} | "
+                f"  {th_v['fss_uniform']:5.3f}  | "
+                f"{_fmt(sc.get('2.5km', {}).get('fss', float('nan')), '.3f'):>7s} "
+                f"{_fmt(sc.get('10km', {}).get('fss', float('nan')), '.3f'):>7s} "
+                f"{_fmt(sc.get('25km', {}).get('fss', float('nan')), '.3f'):>7s} "
+                f"{_fmt(sc.get('50km', {}).get('fss', float('nan')), '.3f'):>7s}"
+            )
 
     art = summary["artifacts"]
     print(f"\n[Output] Overzicht PNG : {art['timeseries_png']}")

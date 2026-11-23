@@ -657,6 +657,114 @@ def compute_fog_contingency(
     }
 
 
+def compute_fractions_skill_score(
+    mod_mm: np.ndarray,
+    obs_mm: np.ndarray,
+    *,
+    dx_km: float = 2.5,
+    thresholds_mm: Sequence[float] = (0.1, 0.5, 1.0, 2.0, 5.0),
+    scales_km: Sequence[float] = (2.5, 10.0, 25.0, 50.0),
+) -> Dict[str, Any]:
+    """Roberts & Lean (2008, MWR 136, 78-97) Fractions Skill Score (FSS) across thresholds & scales.
+
+    Uses exact O(N) 2D summed-area tables restricted to valid finite `(mod_mm, obs_mm)` pixels so
+    out-of-radar-coverage NaNs never bias neighbourhood fractions.
+    """
+    m = np.asarray(mod_mm, dtype=np.float64)
+    o = np.asarray(obs_mm, dtype=np.float64)
+    if m.shape != o.shape or m.ndim != 2:
+        raise ValueError(f"Expected matching 2D grids for FSS, got {m.shape} vs {o.shape}")
+
+    valid = np.isfinite(m) & np.isfinite(o)
+    n_valid = int(np.sum(valid))
+    if n_valid == 0:
+        return {"n_valid": 0, "dx_km": float(dx_km), "thresholds": {}}
+
+    ny, nx = m.shape
+
+    def _box_sum(arr2d: np.ndarray, rad: int) -> np.ndarray:
+        if rad <= 0:
+            return arr2d
+        sat = np.zeros((ny + 1, nx + 1), dtype=np.float64)
+        sat[1:, 1:] = np.cumsum(np.cumsum(arr2d, axis=0), axis=1)
+        j0 = np.clip(np.arange(ny) - rad, 0, ny)
+        j1 = np.clip(np.arange(ny) + rad + 1, 0, ny)
+        i0 = np.clip(np.arange(nx) - rad, 0, nx)
+        i1 = np.clip(np.arange(nx) + rad + 1, 0, nx)
+        return sat[j1[:, None], i1[None, :]] - sat[j0[:, None], i1[None, :]] - sat[j1[:, None], i0[None, :]] + sat[j0[:, None], i0[None, :]]
+
+    v_f = valid.astype(np.float64)
+    scale_rads = [(float(sc), max(0, int(round(0.5 * (max(1.0, float(sc) / max(float(dx_km), 1e-3)) - 1.0))))) for sc in scales_km]
+    v_counts = {sc: _box_sum(v_f, rad) for sc, rad in scale_rads}
+
+    out_th: Dict[str, Any] = {}
+    for thr in thresholds_mm:
+        thr_f = float(thr)
+        obs_bin = np.where(valid & (o >= thr_f), 1.0, 0.0)
+        mod_bin = np.where(valid & (m >= thr_f), 1.0, 0.0)
+        f_obs = float(np.sum(obs_bin) / n_valid)
+        f_mod = float(np.sum(mod_bin) / n_valid)
+        fss_uniform = 0.5 + 0.5 * f_obs
+        sc_dict: Dict[str, Any] = {}
+        for sc, rad in scale_rads:
+            vc = v_counts[sc]
+            ok = valid & (vc > 0.0)
+            o_frac = np.where(ok, _box_sum(obs_bin, rad) / np.maximum(vc, 1.0), 0.0)
+            m_frac = np.where(ok, _box_sum(mod_bin, rad) / np.maximum(vc, 1.0), 0.0)
+            diff = o_frac[ok] - m_frac[ok]
+            fbs = float(np.sum(diff * diff))
+            fbs_ref = float(np.sum(o_frac[ok] ** 2 + m_frac[ok] ** 2))
+            fss = (1.0 - fbs / fbs_ref) if fbs_ref > 1e-12 else float("nan")
+            sc_dict[f"{sc:g}km"] = {
+                "scale_km": sc,
+                "window_cells": 2 * rad + 1,
+                "fbs": fbs,
+                "fbs_ref": fbs_ref,
+                "fss": fss,
+            }
+        out_th[f"{thr_f:g}mm"] = {
+            "threshold_mm": thr_f,
+            "f_obs": f_obs,
+            "f_mod": f_mod,
+            "freq_bias": (f_mod / f_obs) if f_obs > 1e-12 else float("nan"),
+            "fss_uniform": fss_uniform,
+            "scales": sc_dict,
+        }
+    return {"n_valid": n_valid, "dx_km": float(dx_km), "thresholds": out_th}
+
+
+def _aggregate_fss_records(records: Sequence[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
+    valid_recs = [r for r in records if isinstance(r, dict) and r.get("n_valid", 0) > 0 and r.get("thresholds")]
+    if not valid_recs:
+        return None
+    first_th = valid_recs[0]["thresholds"]
+    agg_th: Dict[str, Any] = {}
+    for th_k, th_v in first_th.items():
+        n_tot = sum(int(r["n_valid"]) for r in valid_recs)
+        f_obs_avg = sum(float(r["thresholds"][th_k]["f_obs"]) * int(r["n_valid"]) for r in valid_recs) / max(n_tot, 1)
+        f_mod_avg = sum(float(r["thresholds"][th_k]["f_mod"]) * int(r["n_valid"]) for r in valid_recs) / max(n_tot, 1)
+        sc_agg: Dict[str, Any] = {}
+        for sc_k, sc_v in th_v["scales"].items():
+            fbs_sum = sum(float(r["thresholds"][th_k]["scales"][sc_k]["fbs"]) for r in valid_recs)
+            ref_sum = sum(float(r["thresholds"][th_k]["scales"][sc_k]["fbs_ref"]) for r in valid_recs)
+            sc_agg[sc_k] = {
+                "scale_km": sc_v["scale_km"],
+                "window_cells": sc_v["window_cells"],
+                "fbs": fbs_sum,
+                "fbs_ref": ref_sum,
+                "fss": (1.0 - fbs_sum / ref_sum) if ref_sum > 1e-12 else float("nan"),
+            }
+        agg_th[th_k] = {
+            "threshold_mm": th_v["threshold_mm"],
+            "f_obs": f_obs_avg,
+            "f_mod": f_mod_avg,
+            "freq_bias": (f_mod_avg / f_obs_avg) if f_obs_avg > 1e-12 else float("nan"),
+            "fss_uniform": 0.5 + 0.5 * f_obs_avg,
+            "scales": sc_agg,
+        }
+    return {"n_hours": len(valid_recs), "dx_km": valid_recs[0]["dx_km"], "thresholds": agg_th}
+
+
 def _summarize_matched_rows(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     t2m = compute_continuous_stats([r["mod_t2m_c"] for r in rows], [r["t2m_c"] for r in rows])
     td2m = compute_continuous_stats([r["mod_td2m_c"] for r in rows], [r["td2m_c"] for r in rows])
@@ -1270,6 +1378,9 @@ def verify_run_against_knmi(
     ifs_grib_dir: Optional[Path | str] = None,
     compare_ifs: bool = False,
     ifs_sampler: Optional[Callable[[Path | str, Sequence[Dict[str, Any]]], List[Dict[str, Any]]]] = None,
+    verify_radar_fss: bool = False,
+    radar_cache_dir: Optional[Path | str] = None,
+    radar_hourly_fetcher: Optional[Callable[[datetime.datetime, Any], Optional[np.ndarray]]] = None,
 ) -> Dict[str, Any]:
     """Verify every available forecast `.wx1` step of a run against KNMI 10-minute observations."""
     items, manifest = discover_forecast_wx1(input_path)
@@ -1293,6 +1404,10 @@ def verify_run_against_knmi(
     eff_ifs_dir = Path(ifs_grib_dir) if ifs_grib_dir is not None else (_auto_discover_ifs_dir(run_base, manifest) if compare_ifs else None)
     ifs_by_time = discover_ifs_grib_by_valid_time(eff_ifs_dir) if eff_ifs_dir is not None else {}
     ifs_sample_fn = ifs_sampler if ifs_sampler is not None else sample_ifs_grib_at_stations
+    eff_radar_cache = Path(radar_cache_dir) if radar_cache_dir is not None else (eff_outdir / "radar_cache")
+    fss_all_recs: List[Dict[str, Any]] = []
+    fss_indep_recs: List[Dict[str, Any]] = []
+    radar_spec_cache: Dict[str, Any] = {}
     if (compare_ifs or ifs_grib_dir is not None) and not ifs_by_time:
         logger.warning("IFS comparison requested, but no *_sfc_*.grib2 files found (dir=%s).", eff_ifs_dir)
 
@@ -1416,6 +1531,32 @@ def verify_run_against_knmi(
                 ifs_indep_t_land.extend(t_land_a)
                 ifs_indep_i_land.extend(i_land_a)
             ifs_matched_leads.append(lead_h)
+
+        if verify_radar_fss and lead_h > 0.0 and abs(dt_h - 1.0) < 0.25:
+            try:
+                if domain_name not in radar_spec_cache:
+                    radar_spec_cache[domain_name] = get_domain_spec(domain_name, nz=16)
+                r_spec = radar_spec_cache[domain_name]
+                if radar_hourly_fetcher is not None:
+                    obs_rad_1h = radar_hourly_fetcher(valid_dt, r_spec)
+                else:
+                    from tempest_v2.ingest_radar_qpe import fetch_knmi_radar_hourly_mm
+
+                    obs_rad_1h = fetch_knmi_radar_hourly_mm(
+                        valid_dt, r_spec, api_key=api_key, cache_dir=eff_radar_cache
+                    )
+                if obs_rad_1h is not None and obs_rad_1h.shape == grid["precip_step_mm"].shape:
+                    fss_rec = compute_fractions_skill_score(
+                        grid["precip_step_mm"],
+                        obs_rad_1h,
+                        dx_km=float(r_spec.dx_m) / 1000.0,
+                    )
+                    rec["radar_fss"] = fss_rec
+                    fss_all_recs.append(fss_rec)
+                    if is_indep:
+                        fss_indep_recs.append(fss_rec)
+            except Exception as exc:
+                logger.warning("Radar FSS verification failed at T+%.1fh (%s): %s", lead_h, valid_dt.isoformat(), exc)
 
         hourly_records.append(rec)
 
@@ -1555,6 +1696,14 @@ def verify_run_against_knmi(
         "independent_all": _summarize_matched_rows(indep_pairs_all),
         "independent_land": _summarize_matched_rows(indep_pairs_land),
         "ifs_comparison": ifs_comparison,
+        "radar_fss": (
+            {
+                "overall": _aggregate_fss_records(fss_all_recs),
+                "independent": _aggregate_fss_records(fss_indep_recs),
+            }
+            if fss_all_recs
+            else None
+        ),
         "hourly": hourly_json,
         "worst_t2m_land_stations": [r for r in stn_rows_out if not r["is_offshore"]][:10],
         "artifacts": {

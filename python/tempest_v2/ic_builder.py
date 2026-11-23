@@ -820,6 +820,8 @@ def save_tempest_restart_wx1(
     for sp in NonHydrostaticGPUSolver.SPECIES:
         if sp in state_3d:
             data_vars[sp] = (("z", "y", "x"), np.asarray(state_3d[sp], dtype=np.float32), {"units": "kg kg-1"})
+    if "tke" in state_3d:
+        data_vars["tke"] = (("z", "y", "x"), np.asarray(state_3d["tke"], dtype=np.float32), {"units": "m2 s-2"})
 
     for k in NonHydrostaticGPUSolver.SURFACE_STATE_STRUCT_ORDER:
         if k not in surf_state:
@@ -872,7 +874,7 @@ def load_tempest_restart_wx1(
     path: Path | str,
 ) -> Tuple[Dict[str, np.ndarray], Dict[str, np.ndarray], Dict[str, Any]]:
     """Load lossless WX-1 restart checkpoint returning `(state_3d, surf_state, metadata)`."""
-    state_keys = ("u", "v", "w", "theta_p", "pi_p") + NonHydrostaticGPUSolver.SPECIES
+    state_keys = ("u", "v", "w", "theta_p", "pi_p") + NonHydrostaticGPUSolver.SPECIES + ("tke",)
     surf_keys = set(NonHydrostaticGPUSolver.SURFACE_STATE_STRUCT_ORDER)
     state_3d: Dict[str, np.ndarray] = {}
     surf_state: Dict[str, np.ndarray] = {}

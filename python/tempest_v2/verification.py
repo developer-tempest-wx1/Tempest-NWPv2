@@ -639,6 +639,88 @@ def load_station_obs_wx1(
     return obs_list, stn_rows
 
 
+def apply_land_surface_oi_from_increments(
+    surf_state: Dict[str, np.ndarray],
+    dt0: np.ndarray,
+    dqv0: np.ndarray,
+    t0_bg: np.ndarray,
+    qv0_bg: np.ndarray,
+    p0_bg: np.ndarray,
+    lsm: np.ndarray,
+) -> Dict[str, np.ndarray]:
+    """Mahfouf (1991) / HARMONIE CANARI / ECMWF Cy50r1-style 2D-OI soil temperature & moisture update.
+
+    Propagates 3D-Var 2m/lowest-level temperature (`dt0`) and humidity (`dqv0`) increments consistently
+    into `t2m`, `q2m`, `t_skin`, top two soil temperature layers (`soil_t[0..1]`, 0-28 cm), and
+    snow-free unfrozen soil moisture layers (`soil_m[0..2]`, 0-100 cm) over land (`lsm >= 0.5`).
+    """
+    ana_surf = {k: v.copy() for k, v in surf_state.items()}
+    dt_c = np.clip(np.asarray(dt0, dtype=np.float64), -6.0, 6.0)
+    dq_c = np.clip(np.asarray(dqv0, dtype=np.float64), -5.0e-3, 5.0e-3)
+    is_land = np.asarray(lsm, dtype=np.float64) >= 0.5
+
+    if "t2m" in ana_surf:
+        t2_cur = np.asarray(ana_surf["t2m"], dtype=np.float64)
+        if float(np.mean(np.abs(t2_cur))) > 150.0:
+            ana_surf["t2m"] = np.clip(t2_cur + dt_c, 200.0, 340.0).astype(np.float32)
+        else:
+            ana_surf["t2m"] = np.clip(np.asarray(t0_bg, dtype=np.float64) + dt_c, 200.0, 340.0).astype(np.float32)
+    if "q2m" in ana_surf:
+        q2_cur = np.asarray(ana_surf["q2m"], dtype=np.float64)
+        if float(np.mean(np.abs(q2_cur))) > 1e-6:
+            ana_surf["q2m"] = np.clip(q2_cur + dq_c, 1e-7, 0.04).astype(np.float32)
+        else:
+            ana_surf["q2m"] = np.clip(np.asarray(qv0_bg, dtype=np.float64) + dq_c, 1e-7, 0.04).astype(np.float32)
+
+    swe = np.asarray(ana_surf.get("snow_swe", np.zeros_like(dt_c)), dtype=np.float64)
+    has_snow = swe > 0.1
+
+    if "t_skin" in ana_surf:
+        tsk_cur = np.asarray(ana_surf["t_skin"], dtype=np.float64)
+        tsk_new = np.where(is_land, np.clip(tsk_cur + 0.85 * dt_c, 200.0, 340.0), tsk_cur)
+        tsk_new = np.where(is_land & has_snow, np.minimum(tsk_new, 273.15), tsk_new)
+        ana_surf["t_skin"] = tsk_new.astype(np.float32)
+
+    if "soil_t" in ana_surf and np.asarray(ana_surf["soil_t"]).ndim == 3 and ana_surf["soil_t"].shape[0] >= 2:
+        st_arr = np.asarray(ana_surf["soil_t"], dtype=np.float64).copy()
+        for layer_idx, alpha_t in ((0, 0.65), (1, 0.25)):
+            st_arr[layer_idx] = np.where(
+                is_land,
+                np.clip(st_arr[layer_idx] + alpha_t * dt_c, 210.0, 340.0),
+                st_arr[layer_idx],
+            )
+        ana_surf["soil_t"] = st_arr.astype(np.float32)
+
+    if "soil_m" in ana_surf and np.asarray(ana_surf["soil_m"]).ndim == 3 and ana_surf["soil_m"].shape[0] >= 3:
+        t_bg = np.clip(np.asarray(t0_bg, dtype=np.float64), 173.15, 340.0)
+        p_bg = np.maximum(np.asarray(p0_bg, dtype=np.float64), 1000.0)
+        q_bg = np.clip(np.asarray(qv0_bg, dtype=np.float64), 1e-7, 0.05)
+
+        def _qsat_vec(tk: np.ndarray, pk: np.ndarray) -> np.ndarray:
+            tc = np.clip(tk - 273.15, -90.0, 60.0)
+            es = np.minimum(611.21 * np.exp((17.502 * tc) / (tk - 32.19)), 0.90 * pk)
+            return 0.62198 * es / np.maximum(pk - 0.37802 * es, 100.0)
+
+        rh_bg = np.clip(q_bg / np.maximum(_qsat_vec(t_bg, p_bg), 1e-6), 0.0, 1.05)
+        rh_ana = np.clip((q_bg + dq_c) / np.maximum(_qsat_vec(t_bg + dt_c, p_bg), 1e-6), 0.0, 1.05)
+        drh = np.clip(rh_ana - rh_bg, -0.30, 0.30)
+
+        tsk_ref = np.asarray(ana_surf.get("t_skin", t_bg), dtype=np.float64)
+        active_sm = is_land & (~has_snow) & (tsk_ref > 274.15)
+        sm_arr = np.asarray(ana_surf["soil_m"], dtype=np.float64).copy()
+        # Mahfouf (1991) OI soil moisture gain coefficients (K_T < 0, K_RH > 0) for 0-7, 7-28, 28-100 cm
+        for layer_idx, k_t, k_rh in ((0, -0.008, 0.08), (1, -0.005, 0.05), (2, -0.002, 0.02)):
+            dw = np.clip(k_t * dt_c + k_rh * drh, -0.03, 0.03)
+            sm_arr[layer_idx] = np.where(
+                active_sm,
+                np.clip(sm_arr[layer_idx] + dw, 0.05, 0.45),
+                sm_arr[layer_idx],
+            )
+        ana_surf["soil_m"] = sm_arr.astype(np.float32)
+
+    return ana_surf
+
+
 def run_domain_3dvar(
     spec: DomainSpec,
     state_3d: Dict[str, np.ndarray],
@@ -953,17 +1035,23 @@ def run_domain_3dvar(
         else:
             iau_forcing = None
 
-    # Adjust 2m temperature, skin temperature, and SST consistently with 3D-Var increments
+    # Adjust 2m temperature/moisture, skin temperature, soil_t/soil_m (Mahfouf 1991 / Cy50r1 OI), and SST
     th0_ana = ref0["theta_bar"][0] + np.asarray(ana_state["theta_p"][0], dtype=np.float64)
     pi0_ana = np.maximum(1e-4, ref0["pi_bar"][0] + np.asarray(ana_state["pi_p"][0], dtype=np.float64))
+    t0_bg_2d = th0 * pi0
     t0_ana = th0_ana * pi0_ana
-    dt0 = (t0_ana - th0 * pi0).astype(np.float32)
-    ana_surf = {k: v.copy() for k, v in surf_state.items()}
-    if "t2m" in ana_surf and float(np.mean(np.abs(ana_surf["t2m"]))) > 150.0:
-        ana_surf["t2m"] = t0_ana.astype(np.float32)
-    if "t_skin" in ana_surf:
-        is_land = np.asarray(lsm) >= 0.5
-        ana_surf["t_skin"] = np.where(is_land, ana_surf["t_skin"] + 0.5 * dt0, ana_surf["t_skin"]).astype(np.float32)
+    dt0 = (t0_ana - t0_bg_2d).astype(np.float64)
+    qv0_bg_2d = np.asarray(state_3d.get("qv", np.zeros_like(t0_bg_2d)), dtype=np.float64)
+    if qv0_bg_2d.ndim == 3:
+        qv0_bg_2d = qv0_bg_2d[0]
+    qv0_ana_2d = np.asarray(ana_state.get("qv", np.zeros_like(t0_bg_2d)), dtype=np.float64)
+    if qv0_ana_2d.ndim == 3:
+        qv0_ana_2d = qv0_ana_2d[0]
+    dqv0 = qv0_ana_2d - qv0_bg_2d
+    p0_bg_2d = P0_PA * np.power(np.maximum(1e-4, pi0), 1.0 / KAPPA)
+    ana_surf = apply_land_surface_oi_from_increments(
+        surf_state, dt0, dqv0, t0_bg_2d, qv0_bg_2d, p0_bg_2d, lsm
+    )
     if sst_updated is not None and "sst_bulk" in ana_surf:
         ana_surf["sst_bulk"] = sst_updated.astype(np.float32)
 

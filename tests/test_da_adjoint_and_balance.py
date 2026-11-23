@@ -235,3 +235,44 @@ def test_balanced_single_obs_3dvar_and_lhn_radar():
     assert float(dth_dt.max()) > 1e-4  # positive convective latent heating spinup
     assert float(dqv_dt.min()) >= -1e-9  # moisture strictly non-negative forcing
     assert np.all(bg["qv"] + 60.0 * dqv_dt >= 0.0)
+
+
+def test_land_surface_oi_soil_temp_and_moisture_update() -> None:
+    """Verify Mahfouf (1991) / Cy50r1 2D-OI updates t2m, q2m, t_skin, soil_t[0..1], and snow-free soil_m[0..2]."""
+    from tempest_v2.verification import apply_land_surface_oi_from_increments
+
+    # 3 grid cells: [0]=snow-free land, [1]=snow-covered land, [2]=ocean
+    lsm = np.array([[1.0, 1.0, 0.0]], dtype=np.float32)
+    surf = {
+        "t2m": np.array([[280.0, 272.0, 283.0]], dtype=np.float32),
+        "q2m": np.array([[0.0050, 0.0030, 0.0070]], dtype=np.float32),
+        "t_skin": np.array([[279.0, 272.5, 284.0]], dtype=np.float32),
+        "soil_t": np.broadcast_to(np.array([[[280.0, 272.0, 284.0]]], dtype=np.float32), (4, 1, 3)).copy(),
+        "soil_m": np.full((4, 1, 3), 0.25, dtype=np.float32),
+        "snow_swe": np.array([[0.0, 10.0, 0.0]], dtype=np.float32),
+    }
+    t0_bg = np.array([[282.0, 273.0, 283.5]], dtype=np.float64)  # 2 K warmer at k=0 (nocturnal inversion preserved!)
+    qv0_bg = np.array([[0.0050, 0.0030, 0.0070]], dtype=np.float64)
+    p0_bg = np.full((1, 3), 101_325.0, dtype=np.float64)
+    # Model was too warm (-2.0 K increment) and too dry (+0.0005 kg/kg) -> soil should cool & moisten
+    dt0 = np.array([[-2.0, +2.0, -2.0]], dtype=np.float64)
+    dqv0 = np.array([[+0.0005, 0.0, +0.0005]], dtype=np.float64)
+
+    out = apply_land_surface_oi_from_increments(surf, dt0, dqv0, t0_bg, qv0_bg, p0_bg, lsm)
+    # Inversion preserved: t2m shifted incrementally from 280 -> 278, NOT overwritten with t0_ana (280)
+    assert out["t2m"][0, 0] == pytest.approx(278.0, abs=1e-4)
+    assert out["q2m"][0, 0] == pytest.approx(0.0055, abs=1e-6)
+    # Snow-free land: t_skin & soil_t[0..1] cooled, deeper soil_t[2..3] untouched, soil_m[0..2] moistened
+    assert out["t_skin"][0, 0] == pytest.approx(279.0 - 1.7, abs=1e-4)
+    assert out["soil_t"][0, 0, 0] == pytest.approx(280.0 - 1.3, abs=1e-4)
+    assert out["soil_t"][1, 0, 0] == pytest.approx(280.0 - 0.5, abs=1e-4)
+    assert out["soil_t"][2, 0, 0] == pytest.approx(280.0, abs=1e-4)
+    assert out["soil_m"][0, 0, 0] > 0.25 and out["soil_m"][1, 0, 0] > 0.25 and out["soil_m"][2, 0, 0] > 0.25
+    assert out["soil_m"][3, 0, 0] == pytest.approx(0.25, abs=1e-6)
+    # Snow-covered land: t_skin capped at freezing 273.15 K, soil_m untouched
+    assert out["t_skin"][0, 1] <= 273.15 + 1e-4
+    assert out["soil_m"][0, 0, 1] == pytest.approx(0.25, abs=1e-6)
+    # Ocean: t_skin, soil_t, soil_m completely untouched
+    assert out["t_skin"][0, 2] == pytest.approx(284.0, abs=1e-4)
+    assert out["soil_t"][0, 0, 2] == pytest.approx(284.0, abs=1e-4)
+    assert out["soil_m"][0, 0, 2] == pytest.approx(0.25, abs=1e-6)

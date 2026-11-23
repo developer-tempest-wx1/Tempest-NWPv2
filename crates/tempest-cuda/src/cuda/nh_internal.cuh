@@ -376,10 +376,12 @@ struct NhCudaHandle {
     // Phase B2 GPU physics state & buffers (allocated lazily when physics enabled/uploaded)
     NhPhysicsConfig pcfg{};
     int32_t has_physics_alloc = 0;
+    int32_t tke_initialized = 0;
     int32_t rad_initialized = 0;
     double rad_timer_s = 0.0;
 
     float *d_rad_dth_dt = nullptr; // [nz, ny, nx] cached SW+LW theta tendency [K/s]
+    float *d_tke = nullptr;        // [nz, ny, nx] prognostic 1.5-order HARATU TKE [m^2/s^2]
 
     // 2D static surface descriptors [ny, nx]
     float *d_lat_deg = nullptr, *d_lon_deg = nullptr, *d_lsm = nullptr, *d_lake_mask = nullptr;

@@ -810,3 +810,150 @@ def test_snow_deposition_cap_and_cloud_droplet_sedimentation() -> None:
     finally:
         solver.close()
 
+
+def test_haratu_prognostic_tke_pbl_diurnal_advection_and_multitile(tmp_path) -> None:
+    """Verify HARATU 1.5-order prognostic TKE (de Rooy et al. 2022), HEVI dt=12s multi-tile parity, and WX-1 restart."""
+    import datetime
+    from tempest_v2.cuda_bridge import estimate_vram_bytes
+    from tempest_v2.ic_builder import load_tempest_restart_wx1, save_tempest_restart_wx1
+    from tempest_v2.projection import LCCProjection, _make_lcc_domain
+
+    # Part A: Diurnal convective vs stable nocturnal TKE evolution under cy46_physics=1
+    vgrid = VerticalGrid(nz=32, z_top_m=18_000.0, stretch_power=1.35)
+    hs = np.zeros((4, 4), dtype=np.float64)
+    solver = NonHydrostaticGPUSolver(
+        vgrid, dx_m=2500.0, dy_m=2500.0, hs_m=hs, has_moist=True, has_physics=True
+    )
+    try:
+        sstatic = solver.default_surface_static(lat_deg=52.1, lon_deg=5.2, lsm=1.0, z0m_base=0.15)
+        solver.set_surface_static(sstatic)
+
+        # Noon convective case
+        solver.set_physics_config(
+            enable_microphysics=0, enable_pbl=1, enable_radiation=1, enable_surface=1,
+            rad_interval_s=0.0, julian_day=172.0, utc_seconds=12 * 3600.0, cy46_physics=1, pbl_last=1,
+        )
+        st = solver.empty_state()
+        st["u"][:] = 6.0
+        st["qv"][:] = 0.006
+        sf = solver.empty_surface_state()
+        sf["t_skin"][:] = 295.0
+        sf["soil_t"][:] = 293.0
+        solver.upload_state(st)
+        solver.upload_surface(sf)
+        solver.step_physics(dt_s=60.0, n_steps=30)
+        out_day = solver.download_state()
+        tke_day = float(out_day["tke"][0:2].mean())
+        assert np.all(np.isfinite(out_day["tke"])) and float(out_day["tke"].min()) >= 1e-4 - 1e-7
+        assert tke_day > 0.30, f"Expected convective HARATU TKE > 0.30 m2/s2 at noon, got {tke_day:.4f}"
+
+        # Clear calm nocturnal inversion case
+        solver.set_physics_config(
+            enable_microphysics=0, enable_pbl=1, enable_radiation=1, enable_surface=1,
+            rad_interval_s=0.0, julian_day=326.0, utc_seconds=2 * 3600.0, cy46_physics=1, pbl_last=1,
+        )
+        st_n = solver.empty_state()
+        st_n["u"][:] = 2.0
+        st_n["qv"][:] = 0.004
+        st_n["tke"][:] = 1.5  # Start elevated to verify realistic dissipation in stable SBL
+        sf_n = solver.empty_surface_state()
+        sf_n["t_skin"][:] = 274.0
+        sf_n["soil_t"][:] = 276.0
+        solver.upload_state(st_n)
+        solver.upload_surface(sf_n)
+        solver.step_physics(dt_s=60.0, n_steps=30)
+        out_night = solver.download_state()
+        tke_night = float(out_night["tke"][1:5].mean())
+        assert float(out_night["tke"].min()) >= 1e-4 - 1e-7
+        assert tke_night < 0.25 * 1.5 and tke_night < tke_day, (
+            f"Expected nocturnal HARATU TKE dissipation: night={tke_night:.4f}, day={tke_day:.4f}"
+        )
+    finally:
+        solver.close()
+
+    # Part B: Full HEVI dt=12s + HARATU TKE advection 2x2 tiled vs untiled parity + WX-1 restart round-trip
+    nz, ny, nx = 16, 48, 48
+    vg2 = VerticalGrid(nz=nz, z_top_m=15_000.0, stretch_power=1.25)
+    spec = _make_lcc_domain("test_haratu_tile", ny=ny, nx=nx, dx_m=2500.0, projection=LCCProjection(), vertical=vg2)
+    hs2 = np.zeros((ny, nx), dtype=np.float64)
+    vram_2x2 = estimate_vram_bytes(nz, ny // 2 + 16, nx // 2 + 16, moist=True, has_lbc=True, has_iau=False, has_physics=True)
+
+    def _run_tiled_or_untiled(max_vram: int):
+        s = NonHydrostaticGPUSolver(
+            vg2, dx_m=2500.0, dy_m=2500.0, hs_m=hs2,
+            has_moist=True, has_physics=True, bc_x=2, bc_y=2, use_coriolis=False,
+            lbc_rim_width=6, lbc_tau_max_s=0.015, max_vram_bytes=max_vram, halo=16,
+        )
+        try:
+            s.set_physics_config(cy46_physics=1, pbl_last=1, julian_day=326.0, utc_seconds=18 * 3600.0)
+            s.set_surface_static(s.default_surface_static(lat_deg=52.1, lon_deg=5.2, lsm=1.0, z0m_base=0.15))
+            st0 = s.empty_state()
+            st0["u"][:] = 10.0
+            st0["qv"][:] = 0.005
+            st0["tke"][:] = 0.25
+            sf0 = s.empty_surface_state()
+            sf0["t_skin"][:] = 278.0
+            sf0["soil_t"][:] = 279.0
+            s.upload_state(st0)
+            s.upload_surface(sf0)
+            s.set_lbc_target({k: st0[k].copy() for k in ("u", "v", "w", "theta_p", "pi_p", "qv")})
+            s.step_full(dt_s=12.0, n_steps=3, physics_every=1)
+            return s.num_tiles, s.download_state(), s.download_surface()
+        finally:
+            s.close()
+
+    n_u, out_u, sf_u = _run_tiled_or_untiled(DEFAULT_MAX_VRAM_BYTES)
+    n_t, out_t, _ = _run_tiled_or_untiled(vram_2x2)
+    assert n_u == 1 and n_t == 4
+    for key in ("u", "v", "theta_p", "qv", "tke"):
+        diff = float(np.max(np.abs(out_t[key] - out_u[key])))
+        assert diff < 1e-4, f"Tiled HARATU field '{key}' diverged at dt=12s: max_diff={diff:.3e}"
+
+    rst_p = tmp_path / "haratu_restart.wx1"
+    save_tempest_restart_wx1(
+        rst_p, datetime.datetime(2026, 11, 22, 18, 0, tzinfo=datetime.timezone.utc), spec, hs2, out_u, sf_u
+    )
+    st_r, _, _ = load_tempest_restart_wx1(rst_p)
+    assert "tke" in st_r
+    np.testing.assert_array_equal(st_r["tke"], out_u["tke"])
+
+
+def test_icet_microphysics_slw_preservation_and_no_double_autoconversion() -> None:
+    """Verify HARMONIE ICE-T (cy46_physics=1) preserves more SLW, reduces graupel overproduction, and conserves water."""
+    vgrid = VerticalGrid(nz=32, z_top_m=15_000.0, stretch_power=1.2)
+    hs = np.zeros((4, 4), dtype=np.float64)
+    _, z_s, _ = vgrid.heights_3d(hs)
+    ref = VerticalGrid.reference_state(z_s, theta_sfc_k=288.15, p_sfc_pa=101_325.0, brunt_vaisala_hz=0.01)
+
+    def _run_mp(cy46: int):
+        s = NonHydrostaticGPUSolver(vgrid, dx_m=2500.0, dy_m=2500.0, hs_m=hs, has_moist=True, has_physics=True)
+        try:
+            s.set_surface_static(s.default_surface_static(lsm=1.0))
+            s.set_physics_config(enable_microphysics=1, enable_pbl=0, enable_radiation=0, enable_surface=0, cy46_physics=cy46)
+            st = s.empty_state()
+            sl = slice(8, 16)
+            # -12C mixed-phase cloud with realistic SLW (qc=1.2e-3) and snow (qs=3e-4)
+            t_tgt = 261.15
+            st["theta_p"][sl] = (t_tgt / ref["pi_bar"][sl] - ref["theta_bar"][sl]).astype(np.float32)
+            st["qv"][sl] = _qsat_water_np(np.full_like(ref["p_bar"][sl], t_tgt), ref["p_bar"][sl]).astype(np.float32)
+            st["qc"][sl] = 1.2e-3
+            st["qs"][sl] = 3.0e-4
+            q_before = sum(st[k].astype(np.float64) for k in s.SPECIES)
+            m0 = s.tracer_mass(q_before)
+            s.upload_state(st)
+            s.upload_surface(s.empty_surface_state())
+            s.step_physics(dt_s=20.0, n_steps=5)
+            out = s.download_state()
+            sf = s.download_surface()
+            q_after = sum(out[k].astype(np.float64) for k in s.SPECIES)
+            m1 = s.tracer_mass(q_after) + float(np.sum((sf["rain_acc"] + sf["snow_acc"] + sf["graupel_acc"]) * (2500.0**2)))
+            assert abs(m1 - m0) / max(m0, 1e-12) < 1e-4
+            return out
+        finally:
+            s.close()
+
+    out_legacy = _run_mp(0)
+    out_icet = _run_mp(1)
+    assert float(out_icet["qc"].sum()) > float(out_legacy["qc"].sum()), "Expected ICE-T to preserve more SLW at -12C"
+    assert float(out_icet["qg"].sum()) <= float(out_legacy["qg"].sum()) + 1e-9, "Expected ICE-T to curb graupel overproduction"
+
