@@ -33,8 +33,14 @@ if str(SCRIPTS_ROOT) not in sys.path:
     sys.path.insert(0, str(SCRIPTS_ROOT))
 
 from select_era5_cases import DEFAULT_CASES_DIR, rank_knmi_cases  # noqa: E402
-from tempest_v2.knmi_verify import verify_run_against_knmi  # noqa: E402
+from tempest_v2.ingest_era5 import _extract_lon_wrapped_subset, open_arco_era5_dataset  # noqa: E402
+from tempest_v2.knmi_verify import (  # noqa: E402
+    _ERA5_VERIFY_2D_PAIRS,
+    _sanitize_era5_slice_for_wx1,
+    verify_run_against_knmi,
+)
 from tempest_v2.runner import run_era5_hindcast_lam_pipeline  # noqa: E402
+import wx1  # noqa: E402
 
 logger = logging.getLogger("tempest_v2.benchmark_suite")
 
@@ -89,21 +95,30 @@ _EVENT_KEYS: Tuple[str, ...] = (
     "snow",
     "hail_graupel",
     "thunder",
+    "thunder_25km",
     "ice_freezing_rain",
 )
 
 _METRIC_KEYS: Tuple[str, ...] = (
     "t2m_rmse",
     "t2m_bias",
+    "t2m_day_bias",
+    "t2m_ngt_bias",
     "td2m_rmse",
+    "td2m_bias",
     "rh_bias",
     "mslp_rmse",
+    "mslp_bias",
     "ws10_rmse",
     "ws10_bias",
     "gust10_rmse",
+    "gust10_bias",
     "sw_down_rmse",
+    "sw_down_bias",
     "tcc_rmse",
+    "tcc_bias",
     "precip_rmse",
+    "precip_bias",
     "ss_t2m_era5",
     "ss_mslp_era5",
     "ss_ws10_era5",
@@ -127,7 +142,50 @@ def _safe_float(d: Any, *keys: str) -> float:
         return float("nan")
 
 
-def _extract_case_metrics(case_meta: Dict[str, str], summary: Dict[str, Any]) -> Dict[str, Any]:
+def _extract_t2m_day_night_bias(summary: Dict[str, Any]) -> Tuple[float, float, int, int]:
+    """Compute sample-weighted daytime (09-17Z) and nighttime (21-05Z) land T2m bias."""
+    from datetime import datetime, timezone
+
+    hourly = summary.get("hourly") or []
+    has_indep = any(bool(h.get("independent")) for h in hourly if isinstance(h, dict))
+    day_sum = ngt_sum = 0.0
+    day_n = ngt_n = 0
+    for h in hourly:
+        if not isinstance(h, dict):
+            continue
+        if has_indep and not bool(h.get("independent")):
+            continue
+        v_str = str(h.get("valid_time_utc", "")).strip()
+        if not v_str:
+            continue
+        try:
+            dt = datetime.fromisoformat(v_str.replace("Z", "+00:00"))
+            if dt.tzinfo is None:
+                dt = dt.replace(tzinfo=timezone.utc)
+            hr = dt.astimezone(timezone.utc).hour
+        except Exception:
+            continue
+        t2m_b = ((h.get("land") or {}).get("t2m") or {})
+        b = _safe_float(t2m_b, "bias")
+        n = int(t2m_b.get("n", 0) or 0)
+        if not math.isfinite(b):
+            continue
+        w = n if n > 0 else 1
+        if 9 <= hr <= 17:
+            day_sum += b * w
+            day_n += w
+        elif hr >= 21 or hr <= 5:
+            ngt_sum += b * w
+            ngt_n += w
+    return (
+        (day_sum / day_n) if day_n > 0 else float("nan"),
+        (ngt_sum / ngt_n) if ngt_n > 0 else float("nan"),
+        day_n,
+        ngt_n,
+    )
+
+
+def _extract_case_with_pool(case_meta: Dict[str, str], summary: Dict[str, Any]) -> Tuple[Dict[str, Any], Dict[str, Any]]:
     blk = summary.get("independent_land") or {}
     if not blk or int(_safe_float(blk, "t2m", "n") or 0) == 0:
         blk = summary.get("overall_land") or {}
@@ -157,6 +215,9 @@ def _extract_case_metrics(case_meta: Dict[str, str], summary: Dict[str, Any]) ->
             "n": int(eb.get("n", 0) or 0),
         }
 
+    t2m_day_bias, t2m_ngt_bias, day_n, ngt_n = _extract_t2m_day_night_bias(summary)
+    n_obs_t2m = int(_safe_float(blk, "t2m", "n") if math.isfinite(_safe_float(blk, "t2m", "n")) else 0)
+
     row: Dict[str, Any] = {
         "id": case_meta["id"],
         "date": case_meta["date"],
@@ -164,18 +225,26 @@ def _extract_case_metrics(case_meta: Dict[str, str], summary: Dict[str, Any]) ->
         "regime": case_meta["regime"],
         "description": case_meta.get("description", ""),
         "verified_hours": int(summary.get("verified_hours", 0) or 0),
-        "n_obs_t2m": int(_safe_float(blk, "t2m", "n") if math.isfinite(_safe_float(blk, "t2m", "n")) else 0),
+        "n_obs_t2m": n_obs_t2m,
         "t2m_rmse": _safe_float(blk, "t2m", "rmse"),
         "t2m_bias": _safe_float(blk, "t2m", "bias"),
+        "t2m_day_bias": t2m_day_bias,
+        "t2m_ngt_bias": t2m_ngt_bias,
         "td2m_rmse": _safe_float(blk, "td2m", "rmse"),
+        "td2m_bias": _safe_float(blk, "td2m", "bias"),
         "rh_bias": _safe_float(blk, "rh", "bias"),
         "mslp_rmse": _safe_float(blk, "mslp", "rmse"),
+        "mslp_bias": _safe_float(blk, "mslp", "bias"),
         "ws10_rmse": _safe_float(blk, "ws10", "rmse"),
         "ws10_bias": _safe_float(blk, "ws10", "bias"),
         "gust10_rmse": _safe_float(blk, "gust10", "rmse"),
+        "gust10_bias": _safe_float(blk, "gust10", "bias"),
         "sw_down_rmse": _safe_float(blk, "sw_down", "rmse"),
+        "sw_down_bias": _safe_float(blk, "sw_down", "bias"),
         "tcc_rmse": _safe_float(blk, "tcc", "rmse"),
+        "tcc_bias": _safe_float(blk, "tcc", "bias"),
         "precip_rmse": _safe_float(blk, "precip", "rmse"),
+        "precip_bias": _safe_float(blk, "precip", "bias"),
         "ss_t2m_era5": _safe_float(esk, "t2m", "skill_score"),
         "ss_mslp_era5": _safe_float(esk, "mslp", "skill_score"),
         "ss_ws10_era5": _safe_float(esk, "ws10", "skill_score"),
@@ -185,14 +254,124 @@ def _extract_case_metrics(case_meta: Dict[str, str], summary: Dict[str, Any]) ->
         "wspd850_rmse": _safe_float(eua, "wspd850_ms", "rmse"),
         "events": ev_counts,
     }
+
+    def _n_for(block: Dict[str, Any], key: str) -> int:
+        nv = block.get(key, {}).get("n", 0) if isinstance(block.get(key), dict) else 0
+        try:
+            return max(0, int(nv or 0))
+        except Exception:
+            return 0
+
+    weights: Dict[str, int] = {
+        "t2m_rmse": _n_for(blk, "t2m"),
+        "t2m_bias": _n_for(blk, "t2m"),
+        "t2m_day_bias": day_n,
+        "t2m_ngt_bias": ngt_n,
+        "td2m_rmse": _n_for(blk, "td2m"),
+        "td2m_bias": _n_for(blk, "td2m"),
+        "rh_bias": _n_for(blk, "rh"),
+        "mslp_rmse": _n_for(blk, "mslp"),
+        "mslp_bias": _n_for(blk, "mslp"),
+        "ws10_rmse": _n_for(blk, "ws10"),
+        "ws10_bias": _n_for(blk, "ws10"),
+        "gust10_rmse": _n_for(blk, "gust10"),
+        "gust10_bias": _n_for(blk, "gust10"),
+        "sw_down_rmse": _n_for(blk, "sw_down"),
+        "sw_down_bias": _n_for(blk, "sw_down"),
+        "tcc_rmse": _n_for(blk, "tcc"),
+        "tcc_bias": _n_for(blk, "tcc"),
+        "precip_rmse": _n_for(blk, "precip"),
+        "precip_bias": _n_for(blk, "precip"),
+        "t850_rmse": _n_for(eua, "t850_k"),
+        "gh500_rmse": _n_for(eua, "gh500_m"),
+        "wspd850_rmse": _n_for(eua, "wspd850_ms"),
+    }
+    era5_pairs: Dict[str, Tuple[int, float, float]] = {}
+    eblk_t = eblk.get("tempest") or {}
+    eblk_e = eblk.get("era5") or {}
+    for mk, vk in (
+        ("ss_t2m_era5", "t2m"),
+        ("ss_mslp_era5", "mslp"),
+        ("ss_ws10_era5", "ws10"),
+        ("ss_precip_era5", "precip"),
+    ):
+        tb = eblk_t.get(vk) or {}
+        eb = eblk_e.get(vk) or {}
+        rt = _safe_float(tb, "rmse")
+        re = _safe_float(eb, "rmse")
+        nt = int(tb.get("n", 0) or 0)
+        ne = int(eb.get("n", 0) or 0)
+        npair = min(nt, ne) if (nt > 0 and ne > 0) else 0
+        era5_pairs[mk] = (npair, rt, re)
+    return row, {"weights": weights, "era5_pairs": era5_pairs}
+
+
+def _extract_case_metrics(case_meta: Dict[str, str], summary: Dict[str, Any]) -> Dict[str, Any]:
+    row, _ = _extract_case_with_pool(case_meta, summary)
     return row
 
 
-def _aggregate_group(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
+def _compute_pooled_metrics(rows: Sequence[Dict[str, Any]], pools: Optional[Sequence[Dict[str, Any]]]) -> Dict[str, float]:
     metrics: Dict[str, float] = {}
     for mk in _METRIC_KEYS:
-        vals = [float(r[mk]) for r in rows if math.isfinite(float(r.get(mk, float("nan"))))]
-        metrics[mk] = float(np.mean(vals)) if vals else float("nan")
+        if mk.startswith("ss_") and pools is not None:
+            mse_t_sum = mse_e_sum = 0.0
+            n_sum = 0
+            for p in pools:
+                npair, rt, re = p.get("era5_pairs", {}).get(mk, (0, float("nan"), float("nan")))
+                if npair > 0 and math.isfinite(rt) and math.isfinite(re):
+                    mse_t_sum += npair * rt * rt
+                    mse_e_sum += npair * re * re
+                    n_sum += npair
+            if n_sum > 0 and mse_e_sum > 1e-24:
+                metrics[mk] = 1.0 - math.sqrt(mse_t_sum / n_sum) / math.sqrt(mse_e_sum / n_sum)
+                continue
+
+        pairs: List[Tuple[float, float]] = []
+        for idx, r in enumerate(rows):
+            v = float(r.get(mk, float("nan")))
+            if not math.isfinite(v):
+                continue
+            w = float(pools[idx].get("weights", {}).get(mk, 0)) if pools is not None else 0.0
+            pairs.append((v, w))
+        if not pairs:
+            metrics[mk] = float("nan")
+            continue
+        has_weights = all(w > 0.0 for _, w in pairs) or any(w > 0.0 for _, w in pairs)
+        ws = [w if (has_weights and w > 0.0) else (0.0 if has_weights else 1.0) for _, w in pairs]
+        wtot = sum(ws)
+        if wtot <= 0.0:
+            ws = [1.0 for _ in pairs]
+            wtot = float(len(pairs))
+        if mk.endswith("_rmse"):
+            metrics[mk] = math.sqrt(sum(w * v * v for (v, _), w in zip(pairs, ws)) / wtot)
+        else:
+            metrics[mk] = sum(w * v for (v, _), w in zip(pairs, ws)) / wtot
+    return metrics
+
+
+def _aggregate_group(rows: Sequence[Dict[str, Any]], pools: Optional[Sequence[Dict[str, Any]]] = None) -> Dict[str, Any]:
+    metrics = _compute_pooled_metrics(rows, pools)
+
+    bootstrap_ci95: Dict[str, List[float]] = {}
+    if len(rows) >= 3:
+        rng = np.random.default_rng(42)
+        idx_mat = rng.integers(0, len(rows), size=(1000, len(rows)))
+        boot_buckets: Dict[str, List[float]] = {mk: [] for mk in _METRIC_KEYS}
+        for b_idx in idx_mat:
+            sub_rows = [rows[int(i)] for i in b_idx]
+            sub_pools = [pools[int(i)] for i in b_idx] if pools is not None else None
+            bm = _compute_pooled_metrics(sub_rows, sub_pools)
+            for mk in _METRIC_KEYS:
+                if math.isfinite(bm[mk]):
+                    boot_buckets[mk].append(bm[mk])
+        for mk in _METRIC_KEYS:
+            vals = boot_buckets[mk]
+            if len(vals) >= 10:
+                lo, hi = np.percentile(vals, [2.5, 97.5])
+                bootstrap_ci95[mk] = [float(lo), float(hi)]
+            else:
+                bootstrap_ci95[mk] = [float("nan"), float("nan")]
 
     ev_agg: Dict[str, Dict[str, Any]] = {}
     for ek in _EVENT_KEYS:
@@ -204,6 +383,9 @@ def _aggregate_group(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         far = float(fa / (h + fa)) if (h + fa) > 0 else float("nan")
         csi = float(h / (h + m + fa)) if (h + m + fa) > 0 else float("nan")
         fb = float((h + fa) / (h + m)) if (h + m) > 0 else float("nan")
+        hits_rand = ((h + m) * (h + fa)) / float(n) if n > 0 else float("nan")
+        denom = float(h + m + fa) - hits_rand if n > 0 else float("nan")
+        ets = float((h - hits_rand) / denom) if (n > 0 and math.isfinite(denom) and denom > 1e-12) else float("nan")
         ev_agg[ek] = {
             "n": n,
             "obs_yes": h + m,
@@ -214,27 +396,39 @@ def _aggregate_group(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
             "pod": pod,
             "far": far,
             "csi": csi,
+            "ets": ets,
             "freq_bias": fb,
         }
-    return {"n_cases": len(rows), "metrics": metrics, "events": ev_agg}
+    out: Dict[str, Any] = {"n_cases": len(rows), "metrics": metrics, "events": ev_agg}
+    if bootstrap_ci95:
+        out["bootstrap_ci95"] = bootstrap_ci95
+    return out
 
 
 def aggregate_benchmark_scorecard(case_records: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
     """Aggregate case-level KNMI + ERA5 verification summaries by case, season, regime, and overall."""
-    rows = [_extract_case_metrics(rec["case"], rec["summary"]) for rec in case_records]
+    extracted = [_extract_case_with_pool(rec["case"], rec["summary"]) for rec in case_records]
+    rows = [r for r, _ in extracted]
+    pools = [p for _, p in extracted]
 
-    seasons_seen: Dict[str, List[Dict[str, Any]]] = {}
-    regimes_seen: Dict[str, List[Dict[str, Any]]] = {}
-    for r in rows:
-        seasons_seen.setdefault(r["season"], []).append(r)
-        regimes_seen.setdefault(r["regime"], []).append(r)
+    seasons_seen: Dict[str, List[Tuple[Dict[str, Any], Dict[str, Any]]]] = {}
+    regimes_seen: Dict[str, List[Tuple[Dict[str, Any], Dict[str, Any]]]] = {}
+    for r, p in extracted:
+        seasons_seen.setdefault(r["season"], []).append((r, p))
+        regimes_seen.setdefault(r["regime"], []).append((r, p))
 
     return {
         "n_cases": len(rows),
         "cases": rows,
-        "by_season": {k: _aggregate_group(v) for k, v in sorted(seasons_seen.items())},
-        "by_regime": {k: _aggregate_group(v) for k, v in sorted(regimes_seen.items())},
-        "overall": _aggregate_group(rows),
+        "by_season": {
+            k: _aggregate_group([r for r, _ in pairs], [p for _, p in pairs])
+            for k, pairs in sorted(seasons_seen.items())
+        },
+        "by_regime": {
+            k: _aggregate_group([r for r, _ in pairs], [p for _, p in pairs])
+            for k, pairs in sorted(regimes_seen.items())
+        },
+        "overall": _aggregate_group(rows, pools),
     }
 
 
@@ -300,10 +494,13 @@ def _plot_scorecard_png(scorecard: Dict[str, Any], out_png: Path) -> Path:
     active_ev = [(k, v) for k, v in ev_all.items() if v.get("obs_yes", 0) > 0 or v.get("mod_yes", 0) > 0]
     if active_ev:
         xe = np.arange(len(active_ev))
-        pods = [100.0 * v["pod"] if math.isfinite(v["pod"]) else 0.0 for _, v in active_ev]
-        csis = [100.0 * v["csi"] if math.isfinite(v["csi"]) else 0.0 for _, v in active_ev]
+        pods = [100.0 * v["pod"] if (v.get("obs_yes", 0) > 0 and math.isfinite(v["pod"])) else 0.0 for _, v in active_ev]
+        csis = [100.0 * v["csi"] if (v.get("obs_yes", 0) > 0 and math.isfinite(v["csi"])) else 0.0 for _, v in active_ev]
         ax4.bar(xe - 0.18, pods, width=0.36, label="POD (%)")
         ax4.bar(xe + 0.18, csis, width=0.36, label="CSI (%)")
+        for idx_ev, (_k, v_ev) in enumerate(active_ev):
+            if int(v_ev.get("obs_yes", 0) or 0) == 0:
+                ax4.text(idx_ev, 3.0, "n/a", ha="center", va="bottom", fontsize=7.5, color="dimgray", fontweight="bold")
         ax4.set_xticks(xe)
         ax4.set_xticklabels([k for k, _ in active_ev], rotation=28, ha="right", fontsize=8)
         ax4.set_ylim(0.0, 105.0)
@@ -339,6 +536,65 @@ def _write_scorecard_artifacts(scorecard: Dict[str, Any], runs_root: Path) -> No
     json_path.write_text(json.dumps(scorecard, indent=2, default=str), encoding="utf-8")
     if rows:
         _plot_scorecard_png(scorecard, png_path)
+
+
+def _prefetch_era5_surface_cache(
+    era5_ds: Any,
+    valid_dts: Sequence[datetime.datetime],
+    cache_dir: Path,
+) -> Any:
+    """Batch-fetch missing 2D ARCO-ERA5 verification slices and persist clean `.wx1` caches."""
+    cdir = Path(cache_dir)
+    cdir.mkdir(parents=True, exist_ok=True)
+    missing: List[Tuple[datetime.datetime, Path]] = []
+    for dt in valid_dts:
+        u_dt = dt.astimezone(datetime.timezone.utc) if dt.tzinfo is not None else dt.replace(tzinfo=datetime.timezone.utc)
+        full_p = cdir / f"era5_verify_0p25_{u_dt:%Y%m%d_%H}Z.wx1"
+        sfc_p = cdir / f"era5_verify_sfc_0p25_{u_dt:%Y%m%d_%H}Z.wx1"
+        if (full_p.is_file() and full_p.stat().st_size > 1024) or (sfc_p.is_file() and sfc_p.stat().st_size > 1024):
+            continue
+        missing.append((u_dt, sfc_p))
+    if not missing:
+        return era5_ds
+
+    if era5_ds is None:
+        era5_ds = open_arco_era5_dataset()
+
+    pairs = [
+        (long_k, short_k)
+        for long_k, short_k in _ERA5_VERIFY_2D_PAIRS
+        if long_k in era5_ds.data_vars or short_k in era5_ds.data_vars
+    ]
+    if not pairs:
+        return era5_ds
+
+    src_names = [(long_k if long_k in era5_ds.data_vars else short_k) for long_k, _ in pairs]
+    targets = [np.datetime64(dt.replace(tzinfo=None), "s") for dt, _ in missing]
+    ds_sel = era5_ds[src_names].sel(time=targets, method="nearest")
+    ds_sub = _extract_lon_wrapped_subset(ds_sel, 47.5, 57.5, -1.5, 12.0).load()
+    rename_map = {
+        (long_k if long_k in ds_sub.data_vars else short_k): short_k
+        for long_k, short_k in pairs
+        if (long_k if long_k in ds_sub.data_vars else short_k) != short_k
+    }
+
+    for idx_t, (u_dt, sfc_p) in enumerate(missing):
+        ds_one = ds_sub.isel(time=idx_t) if "time" in ds_sub.dims else ds_sub
+        if "time" in ds_one.coords:
+            sel_sec = int(np.datetime64(ds_one["time"].values, "ns").astype("datetime64[s]").astype(np.int64))
+            if abs(sel_sec - int(u_dt.timestamp())) > 1800:
+                raise ValueError(f"ERA5 archive does not contain {u_dt.isoformat()}")
+        if rename_map:
+            ds_one = ds_one.rename(rename_map)
+        ds_clean = _sanitize_era5_slice_for_wx1(ds_one, u_dt)
+        wx1.write_dataset(
+            sfc_p,
+            ds_clean,
+            dataset_id=f"era5_verify_sfc_{u_dt:%Y%m%d_%H}Z",
+            codec="zstd_shuffle",
+            workers=2,
+        )
+    return era5_ds
 
 
 def _find_final_forecast_wx1(case_dir: Path, lam_domain: str, hours: float) -> Optional[Path]:
@@ -477,59 +733,81 @@ def main() -> None:
         return
 
     case_records: List[Dict[str, Any]] = []
-    for idx, c in enumerate(cases, start=1):
-        ymd = c["date"].replace("-", "")
-        case_dir = args.runs_root / f"{c['id']}_{ymd}_00Z"
-        init_dt = datetime.datetime.fromisoformat(f"{c['date']}T00:00:00+00:00")
-        final_wx1 = _find_final_forecast_wx1(case_dir, args.lam_domain, args.hours)
+    shared_era5_ds: Any = None
+    try:
+        for idx, c in enumerate(cases, start=1):
+            ymd = c["date"].replace("-", "")
+            case_dir = args.runs_root / f"{c['id']}_{ymd}_00Z"
+            init_dt = datetime.datetime.fromisoformat(f"{c['date']}T00:00:00+00:00")
+            final_wx1 = _find_final_forecast_wx1(case_dir, args.lam_domain, args.hours)
 
-        if final_wx1 is None:
-            if args.verify_only:
-                logger.info("[%d/%d] Skipping %s (not run yet and --verify-only active).", idx, len(cases), c["id"])
-                continue
-            logger.info("[%d/%d] Running 24h ERA5 hindcast: %s (%s)...", idx, len(cases), c["id"], c["date"])
-            run_era5_hindcast_lam_pipeline(
-                init_dt,
-                lam_domain=args.lam_domain,
-                forecast_hours=args.hours,
-                nz=args.nz,
-                run_dir=case_dir,
-                lbc_interval_hours=args.lbc_interval_hours,
-                era5_cache_dir=args.era5_cache_dir,
-                stream_lbc=not args.no_stream_era5_lbc,
-                cy46_physics=not args.no_cy46_physics,
-                pbl_last=not args.no_pbl_last,
-                show_progress=True,
-                log_steps=False,
-            )
+            if final_wx1 is None:
+                if args.verify_only:
+                    logger.info("[%d/%d] Skipping %s (not run yet and --verify-only active).", idx, len(cases), c["id"])
+                    continue
+                logger.info("[%d/%d] Running 24h ERA5 hindcast: %s (%s)...", idx, len(cases), c["id"], c["date"])
+                run_era5_hindcast_lam_pipeline(
+                    init_dt,
+                    lam_domain=args.lam_domain,
+                    forecast_hours=args.hours,
+                    nz=args.nz,
+                    run_dir=case_dir,
+                    lbc_interval_hours=args.lbc_interval_hours,
+                    era5_cache_dir=args.era5_cache_dir,
+                    stream_lbc=not args.no_stream_era5_lbc,
+                    cy46_physics=not args.no_cy46_physics,
+                    pbl_last=not args.no_pbl_last,
+                    show_progress=True,
+                    log_steps=False,
+                )
 
-        sum_p = case_dir / "verification" / "knmi_hourly" / "knmi_verification_summary.json"
-        summary: Optional[Dict[str, Any]] = None
-        if sum_p.is_file() and not args.reverify:
+            sum_p = case_dir / "verification" / "knmi_hourly" / "knmi_verification_summary.json"
+            summary: Optional[Dict[str, Any]] = None
+            prior_upper_air: Optional[Dict[str, Any]] = None
+            if sum_p.is_file():
+                try:
+                    loaded = json.loads(sum_p.read_text(encoding="utf-8"))
+                    prior_upper_air = loaded.get("era5_upper_air")
+                    if not args.reverify and ((not use_era5_cmp) or (loaded.get("era5_comparison") is not None)):
+                        summary = loaded
+                        logger.info("[%d/%d] Reusing cached verification %s", idx, len(cases), sum_p)
+                except Exception:
+                    summary = None
+
+            if summary is None:
+                include_upper_air = True
+                if use_era5_cmp and args.reverify and prior_upper_air is not None:
+                    include_upper_air = False
+                    step_h = max(1.0, float(args.era5_step_hours))
+                    n_era5 = int(round(float(args.hours) / step_h)) + 1
+                    era5_dts = [init_dt + datetime.timedelta(hours=k * step_h) for k in range(n_era5)]
+                    try:
+                        shared_era5_ds = _prefetch_era5_surface_cache(shared_era5_ds, era5_dts, args.era5_cache_dir)
+                    except Exception as exc:
+                        logger.warning("[%d/%d] ERA5 2D surface prefetch failed (%s): %s", idx, len(cases), c["id"], exc)
+                logger.info("[%d/%d] Verifying %s against KNMI%s...", idx, len(cases), c["id"], " + ARCO-ERA5" if use_era5_cmp else "")
+                summary = verify_run_against_knmi(
+                    case_dir,
+                    knmi_cache_dir=args.knmi_cache_dir,
+                    obs_source="auto",
+                    make_maps=not args.no_maps,
+                    compare_era5=use_era5_cmp,
+                    era5_cache_dir=args.era5_cache_dir,
+                    era5_step_hours=args.era5_step_hours,
+                    era5_include_upper_air=include_upper_air,
+                    existing_era5_upper_air=prior_upper_air if not include_upper_air else None,
+                    verify_radar_fss=args.verify_radar_fss,
+                )
+
+            case_records.append({"case": c, "summary": summary})
+            scorecard = aggregate_benchmark_scorecard(case_records)
+            _write_scorecard_artifacts(scorecard, args.runs_root)
+    finally:
+        if shared_era5_ds is not None:
             try:
-                loaded = json.loads(sum_p.read_text(encoding="utf-8"))
-                if (not use_era5_cmp) or (loaded.get("era5_comparison") is not None):
-                    summary = loaded
-                    logger.info("[%d/%d] Reusing cached verification %s", idx, len(cases), sum_p)
+                shared_era5_ds.close()
             except Exception:
-                summary = None
-
-        if summary is None:
-            logger.info("[%d/%d] Verifying %s against KNMI%s...", idx, len(cases), c["id"], " + ARCO-ERA5" if use_era5_cmp else "")
-            summary = verify_run_against_knmi(
-                case_dir,
-                knmi_cache_dir=args.knmi_cache_dir,
-                obs_source="auto",
-                make_maps=not args.no_maps,
-                compare_era5=use_era5_cmp,
-                era5_cache_dir=args.era5_cache_dir,
-                era5_step_hours=args.era5_step_hours,
-                verify_radar_fss=args.verify_radar_fss,
-            )
-
-        case_records.append({"case": c, "summary": summary})
-        scorecard = aggregate_benchmark_scorecard(case_records)
-        _write_scorecard_artifacts(scorecard, args.runs_root)
+                pass
 
     if case_records:
         sc = aggregate_benchmark_scorecard(case_records)

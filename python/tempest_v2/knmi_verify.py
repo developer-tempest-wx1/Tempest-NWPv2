@@ -28,6 +28,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple
 
 import netCDF4 as nc
 import numpy as np
+from scipy.ndimage import maximum_filter
 from scipy.spatial import cKDTree
 import xarray as xr
 import wx1
@@ -113,6 +114,15 @@ def _snap_hourly_utc(dt: datetime.datetime, tolerance_s: float = 300.0) -> Optio
     if abs((u - nearest).total_seconds()) <= float(tolerance_s):
         return nearest
     return None
+
+
+def _hourly_validated_filename(valid_time_utc: datetime.datetime) -> Optional[str]:
+    """Return KNMI hourly-validated NetCDF filename covering `[HH:00, HH+1:00]` ending at `valid_time_utc`."""
+    snap = _snap_hourly_utc(valid_time_utc)
+    if snap is None:
+        return None
+    interval_start = snap - datetime.timedelta(hours=1)
+    return f"hourly-observations-validated-{interval_start:%Y%m%d-%H}.nc"
 
 
 def _normalize_knmi_station_id(raw_id: str) -> str:
@@ -237,10 +247,9 @@ def fetch_knmi_hourly_validated_netcdf(
     api_key: Optional[str] = None,
 ) -> Optional[Path]:
     """Download (or reuse cached) official KNMI hourly-validated NetCDF (1951-present)."""
-    snap = _snap_hourly_utc(valid_time_utc)
-    if snap is None:
+    fname = _hourly_validated_filename(valid_time_utc)
+    if fname is None:
         return None
-    fname = f"hourly-observations-validated-{snap:%Y%m%d-%H}.nc"
     return _download_knmi_dataset_file(
         HOURLY_VALIDATED_DATASET, HOURLY_VALIDATED_VERSION, fname, cache_dir, api_key=api_key
     )
@@ -653,6 +662,8 @@ def sample_wx1_at_stations(
     *,
     prev_total_precip: Optional[np.ndarray] = None,
     prev_precip_parts: Optional[Dict[str, np.ndarray]] = None,
+    prev_sw_down: Optional[np.ndarray] = None,
+    average_sw_down: bool = False,
     interval_h: float = 1.0,
 ) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
     """Sample a forecast `.wx1` at KNMI station coordinates via exact projected bilinear interpolation."""
@@ -672,7 +683,19 @@ def sample_wx1_at_stations(
         )
         gust10 = np.asarray(ds["gust10m"].values, dtype=np.float64) if "gust10m" in ds else np.full_like(t2m_c, np.nan)
         vis_m = np.asarray(ds["vis_m"].values, dtype=np.float64) if "vis_m" in ds else np.full_like(t2m_c, np.nan)
-        sw_down = np.asarray(ds["sw_down"].values, dtype=np.float64) if "sw_down" in ds else np.full_like(t2m_c, np.nan)
+        has_vis_fog = "vis_fog_m" in ds
+        vis_fog_m = np.asarray(ds["vis_fog_m"].values, dtype=np.float64) if has_vis_fog else np.full_like(t2m_c, np.nan)
+        sw_down_inst = (
+            np.asarray(ds["sw_down"].values, dtype=np.float64) if "sw_down" in ds else np.full_like(t2m_c, np.nan)
+        )
+        if average_sw_down and prev_sw_down is not None and prev_sw_down.shape == sw_down_inst.shape:
+            sw_down = np.where(
+                np.isfinite(prev_sw_down) & np.isfinite(sw_down_inst),
+                0.5 * (prev_sw_down + sw_down_inst),
+                sw_down_inst,
+            )
+        else:
+            sw_down = sw_down_inst
         tcc = np.asarray(ds["tcc"].values, dtype=np.float64) if "tcc" in ds else np.full_like(t2m_c, np.nan)
         cape_mu = np.asarray(ds["cape_mu"].values, dtype=np.float64) if "cape_mu" in ds else np.full_like(t2m_c, np.nan)
         cin_sb = np.asarray(ds["cin_sb"].values, dtype=np.float64) if "cin_sb" in ds else np.full_like(t2m_c, np.nan)
@@ -746,6 +769,23 @@ def sample_wx1_at_stations(
         except Exception:
             use_proj = False
 
+    dx_m = 2500.0
+    if x_coords is not None and len(x_coords) > 1 and abs(float(x_coords[1] - x_coords[0])) > 10.0:
+        dx_m = abs(float(x_coords[1] - x_coords[0]))
+    elif nx > 1:
+        dlon = abs(float(lon2d[ny // 2, 1] - lon2d[ny // 2, 0]))
+        if dlon > 1e-6:
+            dx_m = max(500.0, dlon * 111_320.0 * max(0.2, math.cos(math.radians(float(np.nanmean(lat2d))))))
+
+    size_nb25 = 2 * max(1, int(round(25_000.0 / max(dx_m, 500.0)))) + 1
+
+    def _nb25_max(arr2d: np.ndarray) -> np.ndarray:
+        if not np.any(np.isfinite(arr2d)):
+            return np.full_like(arr2d, np.nan)
+        safe = np.where(np.isfinite(arr2d), arr2d, -np.inf)
+        mx = maximum_filter(safe, size=size_nb25, mode="nearest")
+        return np.where(mx > -1e30, mx, np.nan)
+
     fields_2d = {
         "mod_t2m_c": t2m_c,
         "mod_td2m_c": td2m_c,
@@ -756,6 +796,7 @@ def sample_wx1_at_stations(
         "mod_gust10_ms": gust10,
         "mod_vis_m": vis_m,
         "mod_sw_down_wm2": sw_down,
+        "mod_sw_down_inst_wm2": sw_down_inst,
         "mod_tcc": tcc,
         "mod_precip_mmh": precip_mmh,
         "mod_precip_step_mm": precip_step_mm,
@@ -766,7 +807,13 @@ def sample_wx1_at_stations(
         "mod_cin_sb": cin_sb,
         "mod_iwp": iwp,
         "mod_freezing_level_m": frzlvl_m,
+        "mod_nb25_graup_mm": _nb25_max(graup_step_mm),
+        "mod_nb25_cape_mu": _nb25_max(cape_mu),
+        "mod_nb25_iwp": _nb25_max(iwp),
+        "mod_nb25_precip_mm": _nb25_max(precip_step_mm),
     }
+    if has_vis_fog:
+        fields_2d["mod_vis_fog_m"] = vis_fog_m
 
     if use_proj:
         assert x_coords is not None and y_coords is not None
@@ -824,6 +871,7 @@ def sample_wx1_at_stations(
         "v10_geo": v10,
         "rh_pct": rh_pct,
         "vis_m": vis_m,
+        "sw_down": sw_down_inst,
         "precip_mmh": precip_mmh,
         "tot_precip_mm": tot_precip_mm,
         "precip_step_mm": precip_step_mm,
@@ -903,12 +951,22 @@ def compute_wind_dir_stats_deg(
     }
 
 
+def _compute_ets(hits: int, misses: int, fa: int, cn: int) -> float:
+    """Compute Equitable Threat Score (Gilbert Skill Score) for a 2x2 contingency table."""
+    total = hits + misses + fa + cn
+    if total <= 0:
+        return float("nan")
+    hits_rand = ((hits + misses) * (hits + fa)) / float(total)
+    denom = float(hits + misses + fa) - hits_rand
+    return float((hits - hits_rand) / denom) if denom > 1e-12 else float("nan")
+
+
 def compute_fog_contingency(
     mod_vis_m: Sequence[float],
     obs_vis_m: Sequence[float],
     threshold_m: float = 1000.0,
 ) -> Dict[str, Any]:
-    """Compute WMO 2x2 fog (< `threshold_m`) contingency counts, POD, FAR, and CSI."""
+    """Compute WMO 2x2 fog (< `threshold_m`) contingency counts, POD, FAR, CSI, and ETS."""
     m = np.asarray(mod_vis_m, dtype=np.float64)
     o = np.asarray(obs_vis_m, dtype=np.float64)
     valid = np.isfinite(m) & np.isfinite(o)
@@ -925,6 +983,7 @@ def compute_fog_contingency(
             "pod": float("nan"),
             "far": float("nan"),
             "csi": float("nan"),
+            "ets": float("nan"),
         }
     mf = m[valid] < float(threshold_m)
     of = o[valid] < float(threshold_m)
@@ -946,6 +1005,7 @@ def compute_fog_contingency(
         "pod": pod,
         "far": far,
         "csi": csi,
+        "ets": _compute_ets(hits, misses, fa, cn),
     }
 
 
@@ -953,7 +1013,7 @@ def compute_binary_contingency(
     mod_yes: Sequence[Optional[bool]],
     obs_yes: Sequence[Optional[bool]],
 ) -> Dict[str, Any]:
-    """Compute 2x2 dichotomous weather-event contingency counts, POD, FAR, CSI, and frequency bias."""
+    """Compute 2x2 dichotomous weather-event contingency counts, POD, FAR, CSI, ETS, and frequency bias."""
     hits = misses = fa = cn = n = 0
     for m, o in zip(mod_yes, obs_yes):
         if m is None or o is None:
@@ -984,16 +1044,23 @@ def compute_binary_contingency(
         "pod": pod,
         "far": far,
         "csi": csi,
+        "ets": _compute_ets(hits, misses, fa, cn),
         "freq_bias": fb,
     }
 
 
-def _mod_thunder_indicator(row: Dict[str, Any]) -> Optional[bool]:
+def _mod_thunder_indicator(row: Dict[str, Any], *, neighborhood_25km: bool = False) -> Optional[bool]:
     """Classical microphysics+instability thunder diagnostic (graupel+CAPE/precip or deep IWP+CAPE)."""
-    gr = float(row.get("mod_graupel_step_mm", float("nan")))
-    cape = float(row.get("mod_cape_mu", float("nan")))
-    iwp = float(row.get("mod_iwp", float("nan")))
-    pr = float(row.get("mod_precip_cmp", row.get("mod_precip_step_mm", float("nan"))))
+    if neighborhood_25km:
+        gr = float(row.get("mod_nb25_graup_mm", row.get("mod_graupel_step_mm", float("nan"))))
+        cape = float(row.get("mod_nb25_cape_mu", row.get("mod_cape_mu", float("nan"))))
+        iwp = float(row.get("mod_nb25_iwp", row.get("mod_iwp", float("nan"))))
+        pr = float(row.get("mod_nb25_precip_mm", row.get("mod_precip_cmp", row.get("mod_precip_step_mm", float("nan")))))
+    else:
+        gr = float(row.get("mod_graupel_step_mm", float("nan")))
+        cape = float(row.get("mod_cape_mu", float("nan")))
+        iwp = float(row.get("mod_iwp", float("nan")))
+        pr = float(row.get("mod_precip_cmp", row.get("mod_precip_step_mm", float("nan"))))
     if not math.isfinite(gr) and not math.isfinite(cape):
         return None
     if math.isfinite(gr) and gr >= 0.05 and ((math.isfinite(cape) and cape >= 50.0) or (math.isfinite(pr) and pr >= 0.5)):
@@ -1135,7 +1202,35 @@ def _summarize_matched_rows(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         [r["wd10_deg"] for r in rows],
         [r["ws10_ms"] for r in rows],
     )
-    fog = compute_fog_contingency([r["mod_vis_m"] for r in rows], [r["vis_m"] for r in rows])
+    fog_mod_vis: List[float] = []
+    fog_obs_vis: List[float] = []
+    for r in rows:
+        mv_fog = r.get("mod_vis_fog_m")
+        mv_fog_f = float(mv_fog) if mv_fog is not None else float("nan")
+        if math.isfinite(mv_fog_f):
+            eff_mv = mv_fog_f
+        else:
+            mv = float(r.get("mod_vis_m", float("nan")))
+            msnow = float(r.get("mod_snow_step_mm", float("nan")))
+            mrh = float(r.get("mod_rh_pct", float("nan")))
+            if (
+                math.isfinite(mv)
+                and mv < 1000.0
+                and math.isfinite(msnow)
+                and msnow >= 0.1
+                and (not math.isfinite(mrh) or mrh < 98.0)
+            ):
+                eff_mv = max(mv, 2000.0)
+            else:
+                eff_mv = mv
+        w1 = r.get("obs_fog_w1")
+        if w1 is not None:
+            eff_ov = 500.0 if int(w1) == 1 else 2000.0
+        else:
+            eff_ov = float(r.get("vis_m", float("nan")))
+        fog_mod_vis.append(eff_mv)
+        fog_obs_vis.append(eff_ov)
+    fog = compute_fog_contingency(fog_mod_vis, fog_obs_vis)
 
     def _ge(val: Any, thr: float) -> Optional[bool]:
         fv = float(val) if val is not None else float("nan")
@@ -1157,9 +1252,14 @@ def _summarize_matched_rows(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
             return None
         mt = float(r.get("mod_t2m_c", float("nan")))
         mr = float(r.get("mod_rain_step_mm", float("nan")))
+        ms = float(r.get("mod_snow_step_mm", float("nan")))
         if not (math.isfinite(mt) and math.isfinite(mr)):
             return None
-        return (mt <= 0.5) and (mr >= 0.05)
+        if mt > 0.0 or mr < 0.05:
+            return False
+        if math.isfinite(ms) and mr < ms:
+            return False
+        return True
 
     events = {
         "rain_0p1mm": compute_binary_contingency(
@@ -1188,6 +1288,13 @@ def _summarize_matched_rows(rows: Sequence[Dict[str, Any]]) -> Dict[str, Any]:
         ),
         "thunder": compute_binary_contingency(
             [(_mod_thunder_indicator(r) if float(r.get("lead_hours", 0.0)) > 0.0 else None) for r in rows],
+            [_obs_flag(r, "obs_thunder_w5", need_positive_lead=True) for r in rows],
+        ),
+        "thunder_25km": compute_binary_contingency(
+            [
+                (_mod_thunder_indicator(r, neighborhood_25km=True) if float(r.get("lead_hours", 0.0)) > 0.0 else None)
+                for r in rows
+            ],
             [_obs_flag(r, "obs_thunder_w5", need_positive_lead=True) for r in rows],
         ),
         "ice_freezing_rain": compute_binary_contingency(
@@ -1730,6 +1837,13 @@ _ERA5_VERIFY_2D_PAIRS: Tuple[Tuple[str, str], ...] = (
 )
 
 
+def _sanitize_era5_slice_for_wx1(ds_slice: xr.Dataset, valid_dt: datetime.datetime) -> xr.Dataset:
+    """Return a clean `.wx1`-writable Dataset free of 0D scalar coords and Zarr encodings."""
+    data_vars = {k: (v.dims, np.asarray(v.values)) for k, v in ds_slice.data_vars.items()}
+    coords = {k: (c.dims, np.asarray(c.values)) for k, c in ds_slice.coords.items() if c.ndim > 0}
+    return xr.Dataset(data_vars=data_vars, coords=coords, attrs={"valid_time_utc": _to_utc(valid_dt).isoformat()})
+
+
 def _load_era5_verify_slice(
     valid_dt: datetime.datetime,
     lat2d: np.ndarray,
@@ -1738,17 +1852,21 @@ def _load_era5_verify_slice(
     opened_era5_ds: Optional[xr.Dataset],
     *,
     allow_cache_write: bool = True,
+    include_upper_air: bool = True,
 ) -> Tuple[Optional[xr.Dataset], Optional[xr.Dataset]]:
-    """Load or lazily slice a lightweight ARCO-ERA5 verification subset (`sfc + 850/500 hPa`)."""
+    """Load or lazily slice a lightweight ARCO-ERA5 verification subset (`sfc + 850/500 hPa` or `sfc`)."""
     v_dt = _to_utc(valid_dt)
     cdir = Path(era5_cache_dir) if era5_cache_dir is not None else None
-    verify_cache = (cdir / f"era5_verify_0p25_{v_dt:%Y%m%d_%H}Z.wx1") if cdir is not None else None
-    if verify_cache is not None and verify_cache.is_file() and verify_cache.stat().st_size > 1024:
-        try:
-            with wx1.open_dataset(verify_cache) as ds_c:
-                return ds_c.load(), opened_era5_ds
-        except Exception:
-            pass
+    full_cache = (cdir / f"era5_verify_0p25_{v_dt:%Y%m%d_%H}Z.wx1") if cdir is not None else None
+    sfc_cache = (cdir / f"era5_verify_sfc_0p25_{v_dt:%Y%m%d_%H}Z.wx1") if cdir is not None else None
+    candidates = [full_cache] if include_upper_air else [full_cache, sfc_cache]
+    for cache_p in candidates:
+        if cache_p is not None and cache_p.is_file() and cache_p.stat().st_size > 1024:
+            try:
+                with wx1.open_dataset(cache_p) as ds_c:
+                    return ds_c.load(), opened_era5_ds
+            except Exception:
+                pass
 
     ds_src = opened_era5_ds
     if ds_src is None:
@@ -1758,8 +1876,9 @@ def _load_era5_verify_slice(
 
     from tempest_v2.ingest_era5 import _extract_lon_wrapped_subset
 
+    req_pairs = (_ERA5_VERIFY_3D_PAIRS + _ERA5_VERIFY_2D_PAIRS) if include_upper_air else _ERA5_VERIFY_2D_PAIRS
     pairs: List[Tuple[str, str]] = []
-    for long_k, short_k in _ERA5_VERIFY_3D_PAIRS + _ERA5_VERIFY_2D_PAIRS:
+    for long_k, short_k in req_pairs:
         if long_k in ds_src.data_vars:
             pairs.append((long_k, short_k))
         elif short_k in ds_src.data_vars:
@@ -1784,31 +1903,34 @@ def _load_era5_verify_slice(
     lon_max = min(180.0, float(np.max(lon_180)) + 2.0)
     ds_sub = _extract_lon_wrapped_subset(ds_t, lat_min, lat_max, lon_min, lon_max)
 
-    elvl_k = next((c for c in ("level", "plev") if c in ds_sub.coords), None)
-    if elvl_k is not None:
-        lvls = np.asarray(ds_sub[elvl_k].values, dtype=np.float64)
-        pick = [lvls[int(np.argmin(np.abs(lvls - tgt)))] for tgt in (850.0, 500.0) if np.min(np.abs(lvls - tgt)) <= 25.0]
-        if pick:
-            ds_sub = ds_sub.sel({elvl_k: sorted(set(pick), reverse=True)})
+    if include_upper_air:
+        elvl_k = next((c for c in ("level", "plev") if c in ds_sub.coords), None)
+        if elvl_k is not None:
+            lvls = np.asarray(ds_sub[elvl_k].values, dtype=np.float64)
+            pick = [lvls[int(np.argmin(np.abs(lvls - tgt)))] for tgt in (850.0, 500.0) if np.min(np.abs(lvls - tgt)) <= 25.0]
+            if pick:
+                ds_sub = ds_sub.sel({elvl_k: sorted(set(pick), reverse=True)})
 
     ds_loaded = ds_sub.load()
     rename_map = {src: short for src, short in pairs if src != short and src in ds_loaded.data_vars}
     if rename_map:
         ds_loaded = ds_loaded.rename(rename_map)
+    ds_clean = _sanitize_era5_slice_for_wx1(ds_loaded, v_dt)
 
-    if allow_cache_write and verify_cache is not None:
+    target_cache = full_cache if include_upper_air else sfc_cache
+    if allow_cache_write and target_cache is not None:
         try:
-            verify_cache.parent.mkdir(parents=True, exist_ok=True)
+            target_cache.parent.mkdir(parents=True, exist_ok=True)
             wx1.write_dataset(
-                verify_cache,
-                ds_loaded,
-                dataset_id=f"era5_verify_{v_dt:%Y%m%d_%H}Z",
+                target_cache,
+                ds_clean,
+                dataset_id=f"era5_verify_{'full' if include_upper_air else 'sfc'}_{v_dt:%Y%m%d_%H}Z",
                 codec="zstd_shuffle",
                 workers=2,
             )
         except Exception as exc:
-            logger.debug("Skipping ERA5 verify cache write (%s): %s", verify_cache, exc)
-    return ds_loaded, ds_src
+            logger.warning("Skipping ERA5 verify cache write (%s): %s", target_cache, exc)
+    return ds_clean, ds_src
 
 
 def _aggregate_upper_air_records(records: Sequence[Dict[str, Any]]) -> Optional[Dict[str, Any]]:
@@ -2188,6 +2310,8 @@ def verify_run_against_knmi(
     era5_cache_dir: Optional[Path | str] = None,
     era5_ds: Optional[xr.Dataset] = None,
     era5_step_hours: float = 3.0,
+    era5_include_upper_air: bool = True,
+    existing_era5_upper_air: Optional[Dict[str, Any]] = None,
     verify_radar_fss: bool = False,
     radar_cache_dir: Optional[Path | str] = None,
     radar_hourly_fetcher: Optional[Callable[[datetime.datetime, Any], Optional[np.ndarray]]] = None,
@@ -2222,9 +2346,9 @@ def verify_run_against_knmi(
             return fetch_knmi_10min_netcdf(valid_dt, cdir, api_key=api_key)
 
         u_dt = _to_utc(valid_dt)
-        hr_snap = _snap_hourly_utc(u_dt)
-        if hr_snap is not None:
-            hv_p = cdir / f"hourly-observations-validated-{hr_snap:%Y%m%d-%H}.nc"
+        hv_fname = _hourly_validated_filename(u_dt)
+        if hv_fname is not None:
+            hv_p = cdir / hv_fname
             if hv_p.is_file() and hv_p.stat().st_size > 1024:
                 return hv_p
         m10_p = cdir / f"KMDS__OPER_P___10M_OBS_L2_{_snap_10min_utc(u_dt):%Y%m%d%H%M}.nc"
@@ -2232,7 +2356,7 @@ def verify_run_against_knmi(
             return m10_p
 
         age_h = (datetime.datetime.now(datetime.timezone.utc) - u_dt).total_seconds() / 3600.0
-        if age_h >= 24.0 and hr_snap is not None:
+        if age_h >= 24.0 and hv_fname is not None:
             p = fetch_knmi_hourly_validated_netcdf(u_dt, cdir, api_key=api_key)
             if p is not None:
                 return p
@@ -2240,7 +2364,7 @@ def verify_run_against_knmi(
         p = fetch_knmi_10min_netcdf(u_dt, cdir, api_key=api_key)
         if p is not None:
             return p
-        if hr_snap is not None:
+        if hv_fname is not None:
             return fetch_knmi_hourly_validated_netcdf(u_dt, cdir, api_key=api_key)
         return None
 
@@ -2293,6 +2417,7 @@ def verify_run_against_knmi(
 
     prev_tot_precip: Optional[np.ndarray] = None
     prev_precip_parts: Optional[Dict[str, np.ndarray]] = None
+    prev_sw_down: Optional[np.ndarray] = None
     prev_lead_h: Optional[float] = None
     domain_name = "tempest_lam"
     first_wx1_attrs: Dict[str, str] = {}
@@ -2308,6 +2433,8 @@ def verify_run_against_knmi(
                 r = np.asarray(ds_p["rain_acc"].values, dtype=np.float64) if "rain_acc" in ds_p else None
                 s = np.asarray(ds_p["snow_acc"].values, dtype=np.float64) if "snow_acc" in ds_p else None
                 g = np.asarray(ds_p["graupel_acc"].values, dtype=np.float64) if "graupel_acc" in ds_p else None
+                if "sw_down" in ds_p:
+                    prev_sw_down = np.asarray(ds_p["sw_down"].values, dtype=np.float64)
                 if r is not None:
                     prev_tot_precip = np.maximum(0.0, r + (s if s is not None else 0.0) + (g if g is not None else 0.0))
                     prev_precip_parts = {
@@ -2315,10 +2442,25 @@ def verify_run_against_knmi(
                         "snow_acc": s if s is not None else np.zeros_like(r),
                         "graupel_acc": g if g is not None else np.zeros_like(r),
                     }
-                    prev_lead_h = lead_h
+                prev_lead_h = lead_h
             continue
 
         stations = load_knmi_stations(nc_path)
+        obs_time_str = stations[0].get("obs_time_utc", "") if stations else ""
+        if obs_time_str:
+            try:
+                obs_dt_chk = _to_utc(datetime.datetime.fromisoformat(obs_time_str.replace("Z", "+00:00")))
+                dt_err_s = abs((obs_dt_chk - _to_utc(valid_dt)).total_seconds())
+                if dt_err_s > 600.0:
+                    logger.warning(
+                        "KNMI obs timestamp %s in %s differs from valid_dt %s by %.0fs!",
+                        obs_dt_chk.isoformat(),
+                        nc_path.name,
+                        valid_dt.isoformat(),
+                        dt_err_s,
+                    )
+            except Exception:
+                pass
         src_kind = (
             stations[0].get("obs_source", "10min")
             if stations
@@ -2332,17 +2474,21 @@ def verify_run_against_knmi(
             obs_1h_map = load_knmi_hourly_precip_mm(valid_dt, eff_cache, api_key=api_key, fetcher=fetcher)
 
         dt_h = (lead_h - prev_lead_h) if (prev_lead_h is not None and lead_h > prev_lead_h) else 1.0
+        avg_sw = src_kind == "hourly-validated" and lead_h > 0.0 and prev_sw_down is not None and abs(dt_h - 1.0) < 0.25
         matched, grid = sample_wx1_at_stations(
             wx1_path,
             stations,
             prev_total_precip=prev_tot_precip,
             prev_precip_parts=prev_precip_parts,
+            prev_sw_down=prev_sw_down,
+            average_sw_down=avg_sw,
             interval_h=dt_h,
         )
         domain_name = grid["domain_name"]
         if not first_wx1_attrs and isinstance(grid.get("wx1_attrs"), dict):
             first_wx1_attrs = dict(grid["wx1_attrs"])
         prev_tot_precip = grid["tot_precip_mm"]
+        prev_sw_down = grid.get("sw_down")
         prev_precip_parts = {
             "rain_acc": grid["rain_acc"],
             "snow_acc": grid["snow_acc"],
@@ -2441,6 +2587,7 @@ def verify_run_against_knmi(
                     eff_era5_cache,
                     opened_era5_ds,
                     allow_cache_write=allow_era5_cache_write,
+                    include_upper_air=era5_include_upper_air,
                 )
                 if ds_e_slice is not None:
                     try:
@@ -2468,11 +2615,12 @@ def verify_run_against_knmi(
                             era5_indep_e_land.extend(e_land_a)
                         era5_matched_leads.append(lead_h)
 
-                        ua_rec = compute_upper_air_vs_era5(wx1_path, ds_e_slice, valid_dt=valid_dt)
-                        rec["era5_upper_air"] = ua_rec
-                        era5_upper_all.append(ua_rec)
-                        if is_indep:
-                            era5_upper_indep.append(ua_rec)
+                        if era5_include_upper_air:
+                            ua_rec = compute_upper_air_vs_era5(wx1_path, ds_e_slice, valid_dt=valid_dt)
+                            rec["era5_upper_air"] = ua_rec
+                            era5_upper_all.append(ua_rec)
+                            if is_indep:
+                                era5_upper_indep.append(ua_rec)
                     finally:
                         if era5_ds is None:
                             ds_e_slice.close()
@@ -2702,7 +2850,7 @@ def verify_run_against_knmi(
             "independent": _aggregate_upper_air_records(era5_upper_indep),
         }
         if era5_upper_all
-        else None
+        else existing_era5_upper_air
     )
 
     run_metadata: Dict[str, Any] = {}

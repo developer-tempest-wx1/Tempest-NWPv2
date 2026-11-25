@@ -410,7 +410,7 @@ def test_expanded_regimes_season_filter_and_benchmark_scorecard(tmp_path: Path) 
         ]
     )
     assert sc["n_cases"] == 2
-    assert sc["overall"]["metrics"]["t2m_rmse"] == pytest.approx(1.2)
+    assert sc["overall"]["metrics"]["t2m_rmse"] == pytest.approx((0.5 * (1.0**2 + 1.4**2)) ** 0.5)
     assert sc["overall"]["metrics"]["ss_t2m_era5"] == pytest.approx(0.3)
     assert sc["overall"]["events"]["snow"]["pod"] == pytest.approx(3.0 / 4.0)
     assert set(sc["by_season"].keys()) == {"winter", "summer"}

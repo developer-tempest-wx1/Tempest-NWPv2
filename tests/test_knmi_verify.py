@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import datetime
+import math
 from pathlib import Path
 
 import netCDF4 as nc
@@ -13,13 +14,18 @@ import wx1
 
 from tempest_v2.knmi_verify import (
     _bilinear_sample_latlon_2d,
+    _hourly_validated_filename,
     _knmi_vv_code_to_meters,
+    _load_era5_verify_slice,
     _normalize_knmi_station_id,
+    _summarize_matched_rows,
+    compute_binary_contingency,
     compute_continuous_stats,
     compute_fog_contingency,
     compute_fractions_skill_score,
     compute_skill_score_vs_ifs,
     compute_wind_dir_stats_deg,
+    fetch_knmi_hourly_validated_netcdf,
     load_knmi_stations,
     sample_ifs_grib_at_stations,
     verify_run_against_knmi,
@@ -479,11 +485,12 @@ def test_knmi_hourly_validated_loader_tcc_and_auto_source(tmp_path: Path) -> Non
 
     cache_dir = tmp_path / "knmi_cache"
     nc0 = _write_synthetic_knmi_hourly_validated_nc(
-        cache_dir / f"hourly-observations-validated-{t0:%Y%m%d-%H}.nc", t0, fog_step=False
+        cache_dir / f"hourly-observations-validated-{(t0 - datetime.timedelta(hours=1)):%Y%m%d-%H}.nc", t0, fog_step=False
     )
     nc1 = _write_synthetic_knmi_hourly_validated_nc(
-        cache_dir / f"hourly-observations-validated-{t1:%Y%m%d-%H}.nc", t1, fog_step=True
+        cache_dir / f"hourly-observations-validated-{(t1 - datetime.timedelta(hours=1)):%Y%m%d-%H}.nc", t1, fog_step=True
     )
+    assert fetch_knmi_hourly_validated_netcdf(t1, cache_dir) == nc1
 
     stns = {r["station_id"]: r for r in load_knmi_stations(nc1)}
     assert set(stns.keys()) == {"06260", "06203", "06290", "06280"}
@@ -537,7 +544,8 @@ def test_weather_type_events_and_era5_dual_validation(tmp_path: Path) -> None:
         ("0-20000-0-06370", "EINDHOVEN", 51.450, 5.377, 22.6),
     ]
     for dt_x, is_event in ((t0, False), (t1, True)):
-        p_nc = cache_dir / f"hourly-observations-validated-{dt_x:%Y%m%d-%H}.nc"
+        nc_dt = dt_x - datetime.timedelta(hours=1)
+        p_nc = cache_dir / f"hourly-observations-validated-{nc_dt:%Y%m%d-%H}.nc"
         p_nc.parent.mkdir(parents=True, exist_ok=True)
         with nc.Dataset(p_nc, "w") as ds:
             ds.createDimension("station", len(stns))
@@ -578,7 +586,7 @@ def test_weather_type_events_and_era5_dual_validation(tmp_path: Path) -> None:
     for lead_h, dt_x in ((0.0, t0), (1.0, t1)):
         t2m_k = np.full((ny, nx), 273.15 + (20.0 if lead_h > 0 else 24.0), dtype=np.float32)
         if lead_h > 0:
-            t2m_k[spec.lat2d < 51.8] = 273.15 + 0.2  # sub-0.5C over south (Eindhoven) for ice/ijzel
+            t2m_k[spec.lat2d < 51.8] = 273.15 - 0.3  # strictly sub-zero over south (Eindhoven) for ice/ijzel
         ds_m = xr.Dataset(
             data_vars={
                 "t2m": (("y", "x"), t2m_k),
@@ -655,6 +663,8 @@ def test_weather_type_events_and_era5_dual_validation(tmp_path: Path) -> None:
     assert ev["hail_graupel"]["hits"] == 1
     assert ev["snow"]["hits"] == 1
     assert ev["thunder"]["hits"] == 1
+    assert ev["thunder_25km"]["hits"] == 1
+    assert "ets" in ev["thunder"] and math.isfinite(ev["thunder"]["ets"])
     assert ev["ice_freezing_rain"]["hits"] == 1
     assert ev["ice_freezing_rain"]["false_alarms"] == 0
     assert ev["gust_20ms"]["hits"] == 2
@@ -672,5 +682,198 @@ def test_weather_type_events_and_era5_dual_validation(tmp_path: Path) -> None:
     assert eua["gh500_m"]["bias"] == pytest.approx(-20.0, abs=0.5)
     assert eua["wspd850_ms"]["bias"] == pytest.approx(2.0, abs=0.05)
     assert eua["q850_gkg"]["bias"] == pytest.approx(1.0, abs=0.05)
+
+
+def test_hourly_alignment_sw_avg_fog_snow_ice_nb25_and_ets(tmp_path: Path) -> None:
+    import importlib.util
+
+    t_mid = datetime.datetime(2025, 3, 19, 0, 0, tzinfo=datetime.timezone.utc)
+    assert _hourly_validated_filename(t_mid) == "hourly-observations-validated-20250318-23.nc"
+    t0 = datetime.datetime(2025, 3, 19, 6, 0, tzinfo=datetime.timezone.utc)
+    t1 = datetime.datetime(2025, 3, 19, 7, 0, tzinfo=datetime.timezone.utc)
+    assert _hourly_validated_filename(t0) == "hourly-observations-validated-20250319-05.nc"
+
+    # SW_down averaging for hourly-validated (0 vs 200 -> 100 W/m^2 vs obs 100 W/m^2 -> 0 bias)
+    spec = get_domain_spec("d3_nl_2p5km", nz=16)
+    cache_dir = tmp_path / "knmi_sw"
+    epoch = datetime.datetime(1950, 1, 1, tzinfo=datetime.timezone.utc)
+    stns = [("0-20000-0-06260", "DE BILT", 52.100, 5.183, 1.9)]
+    for dt_x, q_jcm2 in ((t0, 0.0), (t1, 36.0)):  # 36 J/cm^2 == 100 W/m^2 mean over [06, 07]
+        nc_dt = dt_x - datetime.timedelta(hours=1)
+        p_nc = cache_dir / f"hourly-observations-validated-{nc_dt:%Y%m%d-%H}.nc"
+        p_nc.parent.mkdir(parents=True, exist_ok=True)
+        with nc.Dataset(p_nc, "w") as ds:
+            ds.createDimension("station", 1)
+            ds.createDimension("time", 1)
+            ds.createVariable("station", "S15", ("station",))[:] = np.array([stns[0][0].encode()], dtype="S15")
+            ds.createVariable("stationname", "S15", ("station",))[:] = np.array([stns[0][1].ljust(15)[:15].encode()], dtype="S15")
+            ds.createVariable("lat", "f8", ("station",))[:] = [stns[0][2]]
+            ds.createVariable("lon", "f8", ("station",))[:] = [stns[0][3]]
+            ds.createVariable("height", "f8", ("station",))[:] = [stns[0][4]]
+            ds.createVariable("time", "f8", ("time",))[:] = [(dt_x - epoch).total_seconds()]
+            for vn, val in (("T", 3.0), ("Q", q_jcm2), ("W1", 0.0), ("VV", 4.0), ("W5", 1.0)):
+                v = ds.createVariable(vn, "f8", ("station", "time"))
+                v[:, 0] = [val]
+
+    # Displaced thunderstorm core ~10 km east of De Bilt (radius <= 25 km -> nb25 hits, point misses)
+    ny, nx = spec.ny, spec.nx
+    dists_m = ((spec.lat2d - 52.100) * 111_320.0) ** 2 + ((spec.lon2d - 5.320) * 68_500.0) ** 2
+    cell_mask = dists_m <= (5_000.0 ** 2)
+    run_dir = tmp_path / "run_sw"
+    for lead_h, dt_x, sw_v in ((0.0, t0, 0.0), (1.0, t1, 200.0)):
+        gr = np.where(cell_mask, 0.3, 0.0).astype(np.float32) if lead_h > 0 else np.zeros((ny, nx), dtype=np.float32)
+        cape = np.where(cell_mask, 400.0, 0.0).astype(np.float32) if lead_h > 0 else np.zeros((ny, nx), dtype=np.float32)
+        pr = np.where(cell_mask, 2.0, 0.0).astype(np.float32) if lead_h > 0 else np.zeros((ny, nx), dtype=np.float32)
+        ds_m = xr.Dataset(
+            data_vars={
+                "t2m": (("y", "x"), np.full((ny, nx), 276.15, dtype=np.float32)),
+                "mslp": (("y", "x"), np.full((ny, nx), 101_500.0, dtype=np.float32)),
+                "u10m_geo": (("y", "x"), np.full((ny, nx), 4.0, dtype=np.float32)),
+                "v10m_geo": (("y", "x"), np.zeros((ny, nx), dtype=np.float32)),
+                "rh2m": (("y", "x"), np.full((ny, nx), 85.0, dtype=np.float32)),
+                "vis_m": (("y", "x"), np.full((ny, nx), 600.0 if lead_h > 0 else 5000.0, dtype=np.float32)),
+                "sw_down": (("y", "x"), np.full((ny, nx), sw_v, dtype=np.float32)),
+                "rain_acc": (("y", "x"), np.zeros((ny, nx), dtype=np.float32)),
+                "snow_acc": (("y", "x"), np.full((ny, nx), 0.4 if lead_h > 0 else 0.0, dtype=np.float32)),
+                "graupel_acc": (("y", "x"), gr),
+                "cape_mu": (("y", "x"), cape),
+                "iwp": (("y", "x"), np.where(cell_mask, 0.5, 0.0).astype(np.float32)),
+                "precip_rate": (("y", "x"), pr / 3600.0),
+                "lat": (("y", "x"), spec.lat2d.astype(np.float32)),
+                "lon": (("y", "x"), spec.lon2d.astype(np.float32)),
+            },
+            coords={"y": spec.y_m.astype(np.float64), "x": spec.x_m.astype(np.float64)},
+            attrs={"domain_name": spec.name, "lead_hours": f"{lead_h:.3f}", "valid_time_utc": dt_x.isoformat()},
+        )
+        p_wx = run_dir / "d3" / f"forecast_{spec.name}_T+{int(lead_h):03d}h.wx1"
+        p_wx.parent.mkdir(parents=True, exist_ok=True)
+        wx1.write_dataset(p_wx, ds_m, dataset_id=f"sw_{int(lead_h)}", codec="zstd_shuffle")
+
+    res = verify_run_against_knmi(
+        run_dir,
+        outdir=tmp_path / "out_sw",
+        knmi_cache_dir=cache_dir,
+        obs_source="auto",
+        independent_after_hour=1.0,
+        make_maps=False,
+    )
+    indep = res["independent_land"]
+    assert indep["sw_down"]["bias"] == pytest.approx(0.0, abs=1e-4)
+    # Obs VV=450m during W1=0 (not fog), model vis=600m during snow=0.4mm & rh=85% (excluded as snow)
+    assert indep["fog"]["hits"] == 0 and indep["fog"]["false_alarms"] == 0
+    # Point thunder misses displaced core, 25km neighborhood thunder hits!
+    assert indep["events"]["thunder"]["hits"] == 0
+    assert indep["events"]["thunder_25km"]["hits"] == 1
+
+    # Sub-0C freezing rain tightening & ETS check
+    fr_rows = [
+        {"lead_hours": 1.0, "station_id": "1", "mod_t2m_c": 0.2, "mod_rain_step_mm": 0.3, "mod_snow_step_mm": 0.0, "obs_ice_w6": 0, "mod_vis_m": 5000.0, "vis_m": 5000.0, "mod_u10_ms": 0.0, "mod_v10_ms": 0.0, "mod_ws10_ms": 0.0, "mod_wd10_deg": float("nan"), "ws10_ms": 0.0, "wd10_deg": float("nan"), "mod_t2m_c_x": 0.0, "t2m_c": 0.0, "mod_td2m_c": 0.0, "td2m_c": 0.0, "mod_rh_pct": 90.0, "rh_pct": 90.0, "mod_mslp_hpa": 1000.0, "mslp_hpa": 1000.0, "mod_gust10_ms": 5.0, "gust10_ms": 5.0},
+        {"lead_hours": 1.0, "station_id": "2", "mod_t2m_c": -0.2, "mod_rain_step_mm": 0.3, "mod_snow_step_mm": 0.1, "obs_ice_w6": 1, "mod_vis_m": 5000.0, "vis_m": 5000.0, "mod_u10_ms": 0.0, "mod_v10_ms": 0.0, "mod_ws10_ms": 0.0, "mod_wd10_deg": float("nan"), "ws10_ms": 0.0, "wd10_deg": float("nan"), "t2m_c": 0.0, "mod_td2m_c": 0.0, "td2m_c": 0.0, "mod_rh_pct": 90.0, "rh_pct": 90.0, "mod_mslp_hpa": 1000.0, "mslp_hpa": 1000.0, "mod_gust10_ms": 5.0, "gust10_ms": 5.0},
+        {"lead_hours": 1.0, "station_id": "3", "mod_t2m_c": -0.2, "mod_rain_step_mm": 0.2, "mod_snow_step_mm": 0.5, "obs_ice_w6": 0, "mod_vis_m": 5000.0, "vis_m": 5000.0, "mod_u10_ms": 0.0, "mod_v10_ms": 0.0, "mod_ws10_ms": 0.0, "mod_wd10_deg": float("nan"), "ws10_ms": 0.0, "wd10_deg": float("nan"), "t2m_c": 0.0, "mod_td2m_c": 0.0, "td2m_c": 0.0, "mod_rh_pct": 90.0, "rh_pct": 90.0, "mod_mslp_hpa": 1000.0, "mslp_hpa": 1000.0, "mod_gust10_ms": 5.0, "gust10_ms": 5.0},
+        {"lead_hours": 1.0, "station_id": "4", "mod_t2m_c": 1.0, "mod_rain_step_mm": 0.0, "mod_snow_step_mm": 0.0, "obs_ice_w6": 0, "mod_vis_m": 5000.0, "vis_m": 5000.0, "mod_u10_ms": 0.0, "mod_v10_ms": 0.0, "mod_ws10_ms": 0.0, "mod_wd10_deg": float("nan"), "ws10_ms": 0.0, "wd10_deg": float("nan"), "t2m_c": 0.0, "mod_td2m_c": 0.0, "td2m_c": 0.0, "mod_rh_pct": 90.0, "rh_pct": 90.0, "mod_mslp_hpa": 1000.0, "mslp_hpa": 1000.0, "mod_gust10_ms": 5.0, "gust10_ms": 5.0},
+    ]
+    fr_sum = _summarize_matched_rows(fr_rows)["events"]["ice_freezing_rain"]
+    assert fr_sum["hits"] == 1 and fr_sum["false_alarms"] == 0 and fr_sum["ets"] == pytest.approx(1.0)
+    bc = compute_binary_contingency([True, False, True, False], [True, True, False, False])
+    assert bc["ets"] == pytest.approx(0.0)
+
+    # Scorecard pooled aggregation, bootstrap CI, day/night bias & obs_yes=0 "n/a" plotting
+    bm_path = Path(__file__).resolve().parents[1] / "scripts" / "run_benchmark_suite.py"
+    bm_spec = importlib.util.spec_from_file_location("run_benchmark_suite", bm_path)
+    assert bm_spec is not None and bm_spec.loader is not None
+    bm = importlib.util.module_from_spec(bm_spec)
+    bm_spec.loader.exec_module(bm)
+
+    def _mk_rec(cid: str, season: str, regime: str, t_rmse: float, e_rmse: float, n_s: int, day_b: float, ngt_b: float) -> dict:
+        ss = 1.0 - t_rmse / e_rmse
+        return {
+            "case": {"id": cid, "date": "2024-01-01", "season": season, "regime": regime, "description": cid},
+            "summary": {
+                "verified_hours": 2,
+                "independent_land": {
+                    "t2m": {"n": n_s, "rmse": t_rmse, "bias": 0.5},
+                    "fog": {"hits": 0, "misses": 0, "false_alarms": 2, "n": n_s},
+                    "events": {"thunder_25km": {"hits": 1, "misses": 1, "false_alarms": 0, "n": n_s}},
+                },
+                "era5_comparison": {
+                    "independent_land": {
+                        "tempest": {"t2m": {"n": n_s, "rmse": t_rmse, "bias": 0.5}},
+                        "era5": {"t2m": {"n": n_s, "rmse": e_rmse, "bias": 0.1}},
+                        "skill": {"t2m": {"skill_score": ss}},
+                    }
+                },
+                "hourly": [
+                    {"valid_time_utc": "2024-01-01T12:00:00+00:00", "independent": True, "land": {"t2m": {"n": n_s, "bias": day_b}}},
+                    {"valid_time_utc": "2024-01-01T00:00:00+00:00", "independent": True, "land": {"t2m": {"n": n_s, "bias": ngt_b}}},
+                ],
+            },
+        }
+
+    sc = bm.aggregate_benchmark_scorecard(
+        [
+            _mk_rec("c1", "winter", "storm", 1.0, 2.0, 100, 1.0, -1.0),
+            _mk_rec("c2", "winter", "storm", 2.0, 2.0, 300, 2.0, -2.0),
+            _mk_rec("c3", "summer", "heat", 3.0, 2.0, 400, 3.0, -3.0),
+        ]
+    )
+    # Sample-weighted pooled RMSE = sqrt((100*1 + 300*4 + 400*9)/800) = sqrt(4900/800)
+    expected_rmse = float(np.sqrt(4900.0 / 800.0))
+    assert sc["overall"]["metrics"]["t2m_rmse"] == pytest.approx(expected_rmse, abs=1e-6)
+    assert sc["overall"]["metrics"]["ss_t2m_era5"] == pytest.approx(1.0 - expected_rmse / 2.0, abs=1e-6)
+    assert sc["overall"]["metrics"]["t2m_day_bias"] == pytest.approx((100 * 1 + 300 * 2 + 400 * 3) / 800.0, abs=1e-6)
+    assert sc["overall"]["metrics"]["t2m_ngt_bias"] == pytest.approx(-(100 * 1 + 300 * 2 + 400 * 3) / 800.0, abs=1e-6)
+    assert "bootstrap_ci95" in sc["overall"] and "t2m_rmse" in sc["overall"]["bootstrap_ci95"]
+    assert sc["overall"]["events"]["thunder_25km"]["hits"] == 3
+    png_p = bm._plot_scorecard_png(sc, tmp_path / "sc.png")
+    assert png_p.is_file() and png_p.stat().st_size > 1000
+
+
+def test_load_era5_verify_slice_wx1_cache_roundtrip(tmp_path: Path) -> None:
+    v_dt = datetime.datetime(2022, 2, 18, 12, 0, tzinfo=datetime.timezone.utc)
+    e_lats = np.linspace(55.5, 48.5, 29, dtype=np.float64)
+    e_lons = np.linspace(0.5, 9.5, 37, dtype=np.float64)
+    e_time = np.array([np.datetime64("2022-02-18T12:00:00", "s")], dtype="datetime64[ns]")
+    ds_raw = xr.Dataset(
+        data_vars={
+            "2m_temperature": (("time", "latitude", "longitude"), np.full((1, len(e_lats), len(e_lons)), 280.5, dtype=np.float32)),
+            "mean_sea_level_pressure": (("time", "latitude", "longitude"), np.full((1, len(e_lats), len(e_lons)), 100_500.0, dtype=np.float32)),
+        },
+        coords={"time": e_time, "latitude": e_lats, "longitude": e_lons},
+    )
+    ds_raw["2m_temperature"].encoding["chunks"] = (1, 721, 1440)
+    ds_raw["mean_sea_level_pressure"].encoding["chunks"] = (1, 721, 1440)
+
+    cache_dir = tmp_path / "era5_cache"
+    lat2d = np.array([[50.5, 50.5], [53.6, 53.6]], dtype=np.float64)
+    lon2d = np.array([[3.2, 7.3], [3.2, 7.3]], dtype=np.float64)
+
+    ds_first, _ = _load_era5_verify_slice(
+        v_dt,
+        lat2d,
+        lon2d,
+        cache_dir,
+        ds_raw,
+        allow_cache_write=True,
+        include_upper_air=False,
+    )
+    assert ds_first is not None and "t2m" in ds_first.data_vars and "msl" in ds_first.data_vars
+    expected_cache = cache_dir / "era5_verify_sfc_0p25_20220218_12Z.wx1"
+    assert expected_cache.is_file() and expected_cache.stat().st_size > 1024
+
+    class _ExplodingDataset:
+        def __getattr__(self, name: str) -> None:
+            raise AssertionError(f"Should reload from cache without touching opened_era5_ds ({name})")
+
+    ds_cached, _ = _load_era5_verify_slice(
+        v_dt,
+        lat2d,
+        lon2d,
+        cache_dir,
+        _ExplodingDataset(),  # type: ignore[arg-type]
+        allow_cache_write=False,
+        include_upper_air=False,
+    )
+    assert ds_cached is not None
+    assert float(np.nanmean(ds_cached["t2m"].values)) == pytest.approx(280.5, abs=1e-4)
 
 
