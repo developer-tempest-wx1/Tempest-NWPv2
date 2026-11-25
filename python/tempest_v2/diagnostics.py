@@ -589,7 +589,16 @@ def compute_synoptic_convective_2d(
         freezing_level_m = np.where(cross, z_0c, freezing_level_m)
 
     # WMO/ICAO 5% contrast (-ln 0.05 = 2.996) + Kunkel (1984) / Stoelinga-Warner (1999) + Clark (2008) Kohler haze
-    lwc_g_m3 = 1000.0 * rho[0] * np.maximum(qc[0], 0.0)
+    rh_frac = np.clip(rh2m / 100.0, 0.0, 0.999)
+    # Direct resolved condensate at k=0 (~10 m) plus downward-mixed shallow fog from k=1 (<55 m AGL) when 2m RH >= 95%
+    lwc_k0 = 1000.0 * rho[0] * np.maximum(qc[0], 0.0)
+    if spec.nz > 1:
+        z1_agl = z_s[1] - hs_m
+        lwc_k1 = 1000.0 * rho[1] * np.maximum(qc[1], 0.0)
+        mix_k1 = np.where(z1_agl <= 55.0, 0.35 * np.clip((rh_frac - 0.95) / 0.04, 0.0, 1.0), 0.0)
+        lwc_g_m3 = lwc_k0 + mix_k1 * lwc_k1
+    else:
+        lwc_g_m3 = lwc_k0
     rwc_g_m3 = 1000.0 * rho[0] * np.maximum(qr[0], 0.0)
     iwc_g_m3 = 1000.0 * rho[0] * np.maximum(qi[0], 0.0)
     swc_g_m3 = 1000.0 * rho[0] * np.maximum(qs[0], 0.0)
@@ -599,14 +608,16 @@ def compute_synoptic_convective_2d(
     beta_i = 163.9 * np.power(iwc_g_m3, 1.0)
     beta_s = 10.4 * np.power(swc_g_m3, 0.78)
     beta_g = 1.12 * np.power(gwc_g_m3, 0.75)
-    # Clark et al. (2008) / IFS Kohler hygroscopic aerosol swelling (clean background beta_dry=0.020 km^-1, exp=-2/3)
-    rh_frac = np.clip(rh2m / 100.0, 0.0, 0.999)
-    beta_haze = 0.020 * np.power(1.0 - np.minimum(rh_frac, 0.992), -2.0 / 3.0)
-    # Shallow 2m nocturnal radiation ground-fog (sub-grid condensate below k=0 when calm, inverted, and >= 98.8% RH)
-    inv_2m = np.clip(t_3d[0] - t2m, 0.0, 5.0)
-    calm_fac = np.clip((2.5 - wspd10) / 1.5, 0.0, 1.0)
-    s_excess = np.clip((rh_frac - 0.988) / 0.012, 0.0, 1.0)
-    lwc_2m_g_m3 = 0.045 * np.power(s_excess, 1.5) * calm_fac * np.clip(inv_2m / 0.5, 0.0, 1.0)
+    # Clark et al. (2008) continental European Kohler hygroscopic aerosol swelling (beta_dry=0.045 km^-1, exp=-2/3; haze alone stays > 2.6 km)
+    beta_haze = 0.045 * np.power(1.0 - np.minimum(rh_frac, 0.992), -2.0 / 3.0)
+    # Shallow 2m radiation / fog-top-capped subgrid fog below k=0 when calm (<3.0 m/s), capped/inverted, and >= 96.5% RH
+    inv_sfc = np.clip(t_3d[0] - t2m, 0.0, 5.0)
+    top_k = min(spec.nz, 5)
+    inv_cap = np.clip(np.max(t_3d[:top_k], axis=0) - t2m, 0.0, 5.0)
+    inv_eff = np.maximum(inv_sfc, 0.5 * inv_cap)
+    calm_fac = np.clip((3.0 - wspd10) / 1.8, 0.0, 1.0)
+    s_excess = np.clip((rh_frac - 0.965) / 0.035, 0.0, 1.0)
+    lwc_2m_g_m3 = 0.050 * np.power(s_excess, 1.4) * calm_fac * np.clip(inv_eff / 0.4, 0.0, 1.0)
     beta_fog2m = 144.7 * np.power(lwc_2m_g_m3, 0.88)
     beta_tot = np.maximum(beta_c + beta_fog2m + beta_r + beta_i + beta_s + beta_g + beta_haze + 0.015, 0.05992)
     vis_m = np.clip(2996.0 / beta_tot, 10.0, 50_000.0)

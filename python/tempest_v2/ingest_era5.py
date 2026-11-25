@@ -445,6 +445,9 @@ def _era5_dataset_to_thermo_grid(
         return arr
 
     t2m_raw = _arr2("t2m")
+    d2m_raw = _arr2("d2m")
+    u10_raw = _arr2("u10")
+    v10_raw = _arr2("v10")
     msl_raw = _arr2("msl")
     sp_raw = _arr2("sp")
     t2m_h = _regrid_latlon_field(t2m_raw, lats, lons, spec, fill_nan_value=285.0) if t2m_raw is not None else np.full((spec.ny, spec.nx), 285.0, dtype=np.float64)
@@ -456,6 +459,17 @@ def _era5_dataset_to_thermo_grid(
 
     hs = np.asarray(hs_m, dtype=np.float64)
     ps_child = msl_h * np.exp(-(GRAVITY_M_S2 * hs) / (R_D * np.maximum(t2m_h, 200.0)))
+    q2m_h = (
+        _q_from_dewpoint_pa(
+            _regrid_latlon_field(d2m_raw, lats, lons, spec, fill_nan_value=float(np.mean(t2m_h))),
+            ps_child,
+            t_k=t2m_h,
+        )
+        if d2m_raw is not None
+        else None
+    )
+    u10_geo_h = _regrid_latlon_field(u10_raw, lats, lons, spec, fill_nan_value=0.0) if u10_raw is not None else None
+    v10_geo_h = _regrid_latlon_field(v10_raw, lats, lons, spec, fill_nan_value=0.0) if v10_raw is not None else None
 
     state_3d = _vertical_map_isobaric_to_klemp(
         spec,
@@ -470,6 +484,10 @@ def _era5_dataset_to_thermo_grid(
         theta_sfc_ref=theta_sfc_ref,
         p_sfc_ref=p_sfc_ref,
         n_ref_hz=n_ref_hz,
+        t2m_h=t2m_h if t2m_raw is not None else None,
+        q2m_h=q2m_h,
+        u10_geo_h=u10_geo_h,
+        v10_geo_h=v10_geo_h,
     )
 
     sfc_raw_bundle: Dict[str, Any] = {

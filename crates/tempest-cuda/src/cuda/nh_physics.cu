@@ -1196,14 +1196,28 @@ __global__ void nh_surface_and_lsm_kernel(
         const float alb = (1.0f - snow_cov) * alb_base_v + snow_cov * 0.72f;
         const float emis = (1.0f - snow_cov) * 0.96f + snow_cov * 0.985f;
         z0m_v = fmaxf(1e-3f, (1.0f - snow_cov) * z0_base_v + snow_cov * 0.002f);
-        z0h_v = z0m_v * 0.1f;
+        const float f_tall = fminf(1.0f, fmaxf(0.0f, (z0_base_v - 0.5f) / 1.0f));
+        const float z0h_land = fmaxf(1e-5f, z0_base_v * (0.01f + 0.09f * f_tall));
+        z0h_v = fmaxf(1e-5f, (1.0f - snow_cov) * z0h_land + snow_cov * 2.0e-4f);
 
         const float r_abs = (1.0f - alb) * sw_in + emis * lw_in;
-        const float lambda_sk = (1.0f - snow_cov) * (15.0f * (1.0f - veg_v) + 10.0f * veg_v) + snow_cov * 7.0f;
+        const float lam_unstab = 15.0f * (1.0f - veg_v) + 10.0f * veg_v;
+        const float lam_stab = 10.0f * (1.0f - veg_v) + 5.5f * veg_v;
+        // Snowpack series thermal resistance (Douville et al. 1995 / ecLand FSNTCOND: rho_s=200 kg/m^3, k_s=0.12 W/(m K))
+        const float d_snow_m = swe / 200.0f;
+        const float lam_snow = fmaxf(0.6f, 1.0f / (1.0f / 7.0f + d_snow_m / 0.12f));
+        float lambda_sk = (1.0f - snow_cov) * lam_unstab + snow_cov * lam_snow;
+
         const float f_sm = fminf(1.0f, fmaxf(0.05f, (ms_soil[0] - th_wilt) / fmaxf(th_fc - th_wilt, 0.05f)));
         const float f_rad = (0.55f * sw_in * 2.0f / 100.0f + 0.02f) / (0.55f * sw_in * 2.0f / 100.0f + 1.0f);
-        const float r_canopy = 110.0f / fmaxf(f_sm * f_rad, 0.04f);
-        const float r_soil = 50.0f / fmaxf(f_sm, 0.05f);
+        // Soil-water freezing suppression (ecLand vsurf_mod.F90: frozen top soil restricts liquid capillary transport)
+        const float f_frz = (ts_soil[0] >= 274.15f) ? 1.0f
+                          : ((ts_soil[0] <= 271.15f) ? 0.10f : (0.10f + 0.90f * (ts_soil[0] - 271.15f) / 3.0f));
+        // Jarvis (1976) cold-season stomatal dormancy for T < 288.15 K (leaves warm/heatwave regimes >= 288 K untouched)
+        const float dt_cold = fmaxf(0.0f, 288.15f - fmaxf(t_a_at_sfc, 270.15f));
+        const float f_temp = fmaxf(0.20f, 1.0f - 0.0025f * dt_cold * dt_cold);
+        const float r_canopy = 110.0f / fmaxf(f_sm * f_rad * f_temp * f_frz, 0.02f);
+        const float r_soil = 80.0f / fmaxf(f_sm * f_frz, 0.04f);
         float beta_ev = snow_cov + (1.0f - snow_cov) * f_sm * (1.0f - 0.5f * veg_v);
 
         t_sk_new = t_skin ? fminf(340.0f, fmaxf(210.0f, t_skin[col])) : ts_soil[0];
@@ -1212,8 +1226,14 @@ __global__ void nh_surface_and_lsm_kernel(
         const float land_ri_max = (pcfg.cy46_physics != 0) ? 1.5f : 1.0e6f;
         // 2-outer coupled (M-O <-> Newton skin balance) closure with HTESSEL bare-soil resistance & dew deposition
         for (int outer = 0; outer < 2; ++outer) {
+            const float w_stab_sk = fminf(1.0f, fmaxf(0.0f, (ts_soil[0] - t_sk_new) / 1.5f));
+            const float lam_bare = lam_unstab * (1.0f - w_stab_sk) + lam_stab * w_stab_sk;
+            lambda_sk = (1.0f - snow_cov) * lam_bare + snow_cov * lam_snow;
             const float th_sk = t_sk_new / pi_s;
-            const float q_sat_sk = qsat_water(t_sk_new, p_s);
+            const bool use_snow_ice_outer = (snow_cov > 1e-4f) && (t_sk_new < T_FREEZE_F);
+            const float q_sat_sk = use_snow_ice_outer
+                ? ((1.0f - snow_cov) * qsat_water(t_sk_new, p_s) + snow_cov * qsat_ice(t_sk_new, p_s))
+                : qsat_water(t_sk_new, p_s);
             const float beta_outer = (q_sat_sk < qv_a) ? 1.0f : beta_ev;
             const float q_sk_est = qv_a + beta_outer * (q_sat_sk - qv_a);
             const float thv_a = th_a * (1.0f + EPS_V_F * qv_a);
@@ -1228,8 +1248,13 @@ __global__ void nh_surface_and_lsm_kernel(
             const float flhc = rho_a * CP_D_F * g_exch / pi_s;
 
             for (int it = 0; it < 6; ++it) {
-                const float qs_t = qsat_water(t_sk_new, p_s);
-                const float dqs_t = dqsat_water_dt(t_sk_new, p_s);
+                const bool use_snow_ice = (snow_cov > 1e-4f) && (t_sk_new < T_FREEZE_F);
+                const float qs_t = use_snow_ice
+                    ? ((1.0f - snow_cov) * qsat_water(t_sk_new, p_s) + snow_cov * qsat_ice(t_sk_new, p_s))
+                    : qsat_water(t_sk_new, p_s);
+                const float dqs_t = use_snow_ice
+                    ? ((1.0f - snow_cov) * dqsat_water_dt(t_sk_new, p_s) + snow_cov * dqsat_ice_dt(t_sk_new, p_s))
+                    : dqsat_water_dt(t_sk_new, p_s);
                 const float beta_iter = (qs_t < qv_a) ? 1.0f : beta_ev;
                 const float flqc_iter = rho_a * lat_sfc * g_exch * beta_iter;
                 const float t2 = t_sk_new * t_sk_new;
@@ -1245,7 +1270,10 @@ __global__ void nh_surface_and_lsm_kernel(
                 t_sk_new = T_FREEZE_F;
             }
             h_flux = flhc * (t_sk_new - t_a_at_sfc);
-            const float qs_fin = qsat_water(t_sk_new, p_s);
+            const bool use_snow_ice_fin = (snow_cov > 1e-4f) && (t_sk_new < T_FREEZE_F);
+            const float qs_fin = use_snow_ice_fin
+                ? ((1.0f - snow_cov) * qsat_water(t_sk_new, p_s) + snow_cov * qsat_ice(t_sk_new, p_s))
+                : qsat_water(t_sk_new, p_s);
             const float beta_fin = (qs_fin < qv_a) ? 1.0f : beta_ev;
             const float flqc_fin = rho_a * lat_sfc * g_exch * beta_fin;
             le_flux = flqc_fin * (qs_fin - qv_a);
@@ -1482,15 +1510,20 @@ __global__ void nh_surface_and_lsm_kernel(
     if (ustar) ustar[col] = ustar_v;
     if (sfc_drag_coeff) sfc_drag_coeff[col] = rho_a * cm_v * wspd_drag;
 
-    // M-O profile interpolation at 2m (T, q) and 10m (u, v)
+    // M-O profile interpolation at 2m (T, q) and 10m (u, v) with ECMWF IFS Cy49r1 / KNMI TR-302 stable limiter (sppcfl_mod.F90)
     const float z_2 = fminf(za, 2.0f);
     const float z_10 = fminf(za, 10.0f);
-    const float fh_num = fmaxf(0.1f, logf(z_2 / fmaxf(z0h_v, 1e-6f)) - psih_jimenez(zol_v * (z_2 / za)) + psih_jimenez(zol_v * z0h_v / za));
-    const float fh_den = fmaxf(0.5f, logf(za / fmaxf(z0h_v, 1e-6f)) - psih_jimenez(zol_v) + psih_jimenez(zol_v * z0h_v / za));
-    const float w_2m = fminf(1.0f, fmaxf(0.0f, fh_num / fh_den));
+    const float za_s = za + z0m_v;
+    const float z2_s = z_2 + z0m_v;
+    const float z10_s = z_10 + z0m_v;
+    const float fh_num = fmaxf(0.1f, logf(z2_s / fmaxf(z0h_v, 1e-6f)) - psih_jimenez(zol_v * (z2_s / za_s)) + psih_jimenez(zol_v * z0h_v / za_s));
+    const float fh_den = fmaxf(0.5f, logf(za_s / fmaxf(z0h_v, 1e-6f)) - psih_jimenez(zol_v) + psih_jimenez(zol_v * z0h_v / za_s));
+    const float w_2m_raw = fminf(1.0f, fmaxf(0.0f, fh_num / fh_den));
+    const float z_lim_tr302 = (zol_v > 0.0f) ? ((2.0f / PI_CONST_F) * atanf(0.3f * zol_v)) : 0.0f;
+    const float w_2m = fminf(1.0f, fmaxf(0.0f, w_2m_raw * (1.0f - z_lim_tr302) + 0.75f * z_lim_tr302));
 
-    const float fm_num = fmaxf(0.1f, logf(z_10 / fmaxf(z0m_v, 1e-5f)) - psim_jimenez(zol_v * (z_10 / za)) + psim_jimenez(zol_v * z0m_v / za));
-    const float fm_den = fmaxf(0.5f, logf(za / fmaxf(z0m_v, 1e-5f)) - psim_jimenez(zol_v) + psim_jimenez(zol_v * z0m_v / za));
+    const float fm_num = fmaxf(0.1f, logf(z10_s / fmaxf(z0m_v, 1e-5f)) - psim_jimenez(zol_v * (z10_s / za_s)) + psim_jimenez(zol_v * z0m_v / za_s));
+    const float fm_den = fmaxf(0.5f, logf(za_s / fmaxf(z0m_v, 1e-5f)) - psim_jimenez(zol_v) + psim_jimenez(zol_v * z0m_v / za_s));
     const float w_10m = fminf(1.0f, fmaxf(0.0f, fm_num / fm_den));
 
     const float th_sk = t_sk_new / pi_s;

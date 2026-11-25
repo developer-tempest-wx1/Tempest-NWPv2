@@ -24,6 +24,7 @@ import xarray as xr
 import wx1
 
 from tempest_v2.ic_builder import (
+    _q_from_dewpoint_pa,
     _read_cfgrib_var_map,
     _regrid_latlon_field,
     _vertical_map_isobaric_to_klemp,
@@ -324,11 +325,17 @@ def ecmwf_grib_to_lbc_wx1(
         return np.full((child_spec.ny, child_spec.nx), default_val, dtype=np.float64)
 
     msl_h = _get_sfc(("msl", "mslp"), 101_325.0)
+    has_t2m = any(k in sfc_vars for k in ("t2m", "2t"))
     t2m_h = _get_sfc(("t2m", "2t"), 285.0)
+    d2m_h = _get_sfc(("d2m", "2d"), float(np.mean(t2m_h))) if any(k in sfc_vars for k in ("d2m", "2d")) else None
+    has_u10 = any(k in sfc_vars for k in ("u10", "10u")) and any(k in sfc_vars for k in ("v10", "10v"))
+    u10_geo_h = _get_sfc(("u10", "10u"), 0.0) if has_u10 else None
+    v10_geo_h = _get_sfc(("v10", "10v"), 0.0) if has_u10 else None
     del sfc_vars
 
     hs = np.asarray(child_hs_m, dtype=np.float64)
     ps_child = msl_h * np.exp(-(GRAVITY_M_S2 * hs) / (R_D * np.maximum(t2m_h, 200.0)))
+    q2m_h = _q_from_dewpoint_pa(d2m_h, ps_child, t_k=t2m_h) if d2m_h is not None else None
 
     state_3d = _vertical_map_isobaric_to_klemp(
         child_spec,
@@ -343,6 +350,10 @@ def ecmwf_grib_to_lbc_wx1(
         theta_sfc_ref=theta_sfc_ref,
         p_sfc_ref=p_sfc_ref,
         n_ref_hz=n_ref_hz,
+        t2m_h=t2m_h if has_t2m else None,
+        q2m_h=q2m_h,
+        u10_geo_h=u10_geo_h,
+        v10_geo_h=v10_geo_h,
     )
 
     data_vars, extra_coords, rim_info = _extract_rim_packed_lbc(child_spec, state_3d, ps_child, rim_width)

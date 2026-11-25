@@ -510,6 +510,10 @@ def _vertical_map_isobaric_to_klemp(
     theta_sfc_ref: float,
     p_sfc_ref: float,
     n_ref_hz: float,
+    t2m_h: Optional[np.ndarray] = None,
+    q2m_h: Optional[np.ndarray] = None,
+    u10_geo_h: Optional[np.ndarray] = None,
+    v10_geo_h: Optional[np.ndarray] = None,
 ) -> Dict[str, np.ndarray]:
     """Interpolate isobaric fields onto Klemp coordinates with C-grid winds and hydrostatic Exner balance (row-batched float32)."""
     nz, ny, nx = spec.nz, spec.ny, spec.nx
@@ -525,6 +529,18 @@ def _vertical_map_isobaric_to_klemp(
         u_grid_h, v_grid_h = spec.projection.geo_to_grid_wind(u_geo_h, v_geo_h, spec.lon2d[None, :, :])
     else:
         u_grid_h, v_grid_h = u_geo_h, v_geo_h
+
+    if u10_geo_h is not None and v10_geo_h is not None:
+        u10_in = np.asarray(u10_geo_h, dtype=np.float64)
+        v10_in = np.asarray(v10_geo_h, dtype=np.float64)
+        if spec.is_projected and spec.projection is not None:
+            u10_grid_h, v10_grid_h = spec.projection.geo_to_grid_wind(u10_in, v10_in, spec.lon2d)
+        else:
+            u10_grid_h, v10_grid_h = u10_in, v10_in
+    else:
+        u10_grid_h, v10_grid_h = None, None
+    t2m_2d = None if t2m_h is None else np.asarray(t2m_h, dtype=np.float64)
+    q2m_2d = None if q2m_h is None else np.asarray(q2m_h, dtype=np.float64)
 
     eps_v = (461.5 / R_D) - 1.0  # Matches EPS_V in nh_internal.cuh (~0.60769)
     nlev = len(p_levels_pa)
@@ -647,6 +663,45 @@ def _vertical_map_isobaric_to_klemp(
             p_bel = p_levels_pa[0] * np.exp(GRAVITY_M_S2 * dz_down / (R_D * 0.5 * (tv_bot + tv_bel)))
             p_i = np.where(below, p_bel, p_i)
             t_i = np.where(below, t_bel, t_i)
+
+        if (t2m_2d is not None) or (q2m_2d is not None) or (u10_grid_h is not None and v10_grid_h is not None):
+            hs_flat_sbl = hs_c.reshape(1, n_col)
+            col_1d = np.arange(n_col)
+            k_top_sbl = np.clip(np.sum(zs_b <= (hs_flat_sbl + 15.0), axis=0), 0, nlev - 1)
+            z_top_sbl = zs_b[k_top_sbl, col_1d][None, :]
+            in_sbl = (zt_b < z_top_sbl) & (z_top_sbl > hs_flat_sbl + 15.0)
+            if np.any(in_sbl):
+                z_sfc_t = hs_flat_sbl + 2.0
+                wt_t = np.clip((zt_b - z_sfc_t) / np.maximum(z_top_sbl - z_sfc_t, 1.0), 0.0, 1.0)
+                if t2m_2d is not None:
+                    t2_f = t2m_2d[j0:j1, :].reshape(1, n_col)
+                    ok_t2 = in_sbl & np.isfinite(t2_f) & (t2_f > 180.0) & (t2_f < 350.0)
+                    t_top_sbl = t_b[k_top_sbl, col_1d][None, :]
+                    t_sbl = np.maximum(150.0, (1.0 - wt_t) * t2_f + wt_t * t_top_sbl)
+                    t_i = np.where(ok_t2, t_sbl, t_i)
+                if q2m_2d is not None:
+                    q2_f = q2m_2d[j0:j1, :].reshape(1, n_col)
+                    ok_q2 = in_sbl & np.isfinite(q2_f) & (q2_f > 0.0) & (q2_f < 0.05)
+                    q_top_sbl = q_b[k_top_sbl, col_1d][None, :]
+                    q_sbl = np.clip((1.0 - wt_t) * q2_f + wt_t * q_top_sbl, 1e-7, 0.04)
+                    q_i = np.where(ok_q2, q_sbl, q_i)
+                if u10_grid_h is not None and v10_grid_h is not None:
+                    u10_f = u10_grid_h[j0:j1, :].reshape(1, n_col)
+                    v10_f = v10_grid_h[j0:j1, :].reshape(1, n_col)
+                    ok_u10 = in_sbl & np.isfinite(u10_f) & np.isfinite(v10_f)
+                    z_sfc_u = hs_flat_sbl + 10.0
+                    wt_u = np.clip((zt_b - z_sfc_u) / np.maximum(z_top_sbl - z_sfc_u, 1.0), 0.0, 1.0)
+                    u_top_sbl = u_b[k_top_sbl, col_1d][None, :]
+                    v_top_sbl = v_b[k_top_sbl, col_1d][None, :]
+                    u_i = np.where(ok_u10, (1.0 - wt_u) * u10_f + wt_u * u_top_sbl, u_i)
+                    v_i = np.where(ok_u10, (1.0 - wt_u) * v10_f + wt_u * v_top_sbl, v_i)
+                # Recompute preliminary p_i below z_h[0] using the surface-anchored virtual temperature
+                if np.any(below):
+                    dz_down_sbl = np.maximum(0.0, zs_b[0:1, :] - zt_b)
+                    tv_bot_sbl = np.maximum(180.0, t_b[0:1, :]) * (1.0 + eps_v * np.clip(q_b[0:1, :], 0.0, 0.04))
+                    tv_bel_sbl = np.maximum(150.0, t_i) * (1.0 + eps_v * np.clip(q_i, 0.0, 0.04))
+                    p_bel_sbl = p_levels_pa[0] * np.exp(GRAVITY_M_S2 * dz_down_sbl / (R_D * 0.5 * (tv_bot_sbl + tv_bel_sbl)))
+                    p_i = np.where(below, p_bel_sbl, p_i)
 
         t_3d = t_i.reshape(nz, ny_c, nx)
         p_3d = p_i.reshape(nz, ny_c, nx)
@@ -813,11 +868,14 @@ def ecmwf_grib_to_domain_state(
         return np.full((spec.ny, spec.nx), default_val, dtype=np.float64)
 
     msl_h = _get_sfc(("msl", "mslp"), 101_325.0)
+    has_t2m = any(k in sfc_vars for k in ("t2m", "2t"))
     t2m_h = _get_sfc(("t2m", "2t"), 285.0)
     d2m_key = next((k for k in ("d2m", "2d") if k in sfc_vars), None)
     d2m_h = _get_sfc((d2m_key,), float(np.mean(t2m_h))) if d2m_key is not None else None
     u10_key = next((k for k in ("u10", "10u") if k in sfc_vars), None)
     v10_key = next((k for k in ("v10", "10v") if k in sfc_vars), None)
+    u10_geo_h: Optional[np.ndarray] = None
+    v10_geo_h: Optional[np.ndarray] = None
     u10_grid_h: Optional[np.ndarray] = None
     v10_grid_h: Optional[np.ndarray] = None
     if u10_key is not None and v10_key is not None:
@@ -854,6 +912,7 @@ def ecmwf_grib_to_domain_state(
 
     hs = np.asarray(hs_m, dtype=np.float64)
     ps_child = msl_h * np.exp(-(GRAVITY_M_S2 * hs) / (R_D * np.maximum(t2m_h, 200.0)))
+    q2m_ic = _q_from_dewpoint_pa(d2m_h, ps_child, t_k=t2m_h) if d2m_h is not None else None
 
     state_3d = _vertical_map_isobaric_to_klemp(
         spec,
@@ -868,6 +927,10 @@ def ecmwf_grib_to_domain_state(
         theta_sfc_ref=theta_sfc_ref,
         p_sfc_ref=p_sfc_ref,
         n_ref_hz=n_ref_hz,
+        t2m_h=t2m_h if has_t2m else None,
+        q2m_h=q2m_ic,
+        u10_geo_h=u10_geo_h,
+        v10_geo_h=v10_geo_h,
     )
 
     surf = _empty_surface_state_for_spec(spec)
