@@ -35,12 +35,13 @@ CP_ICE = 2090.0          # Specific heat of ice [J/(kg K)]
 LATENT_HEAT_FUSION = 3.34e5 # Latent heat of freezing/melting [J/kg]
 T_FREEZE = 273.15        # Freezing point of water [K]
 
-# USDA 13-Class Texture Physical Parameters (Noah LSM / Cosby et al. 1984 / Clapp & Hornberger 1978)
+# USDA 13-Class Mineral + Organic Peat (Class 14) Physical Parameters
+# (Noah LSM / Cosby et al. 1984 / Clapp & Hornberger 1978; Class 14: Balsamo et al. 2009 HTESSEL + Letts et al. 2000)
 # Indices:
 # 0: Water/Ocean (neutral dummy parameters)
 # 1: Clay (heavy), 2: Silty clay, 3: Clay (light), 4: Silty clay loam, 5: Clay loam,
 # 6: Silt, 7: Silt loam, 8: Sandy clay, 9: Loam, 10: Sandy clay loam, 11: Sandy loam,
-# 12: Loamy sand, 13: Sand
+# 12: Loamy sand, 13: Sand, 14: Organic / Peat
 #
 # Columns: [theta_sat, theta_fc, theta_wilt, b_param, psi_sat [m], ksat [m/s], kappa_dry [W/mK], kappa_sat [W/mK]]
 SOIL_PARAM_TABLE = np.array([
@@ -59,7 +60,21 @@ SOIL_PARAM_TABLE = np.array([
     [0.435,      0.215,    0.084,      4.74, 0.141,  1.41e-5,   0.27,  1.80],  # 11: Sandy loam
     [0.410,      0.174,    0.068,      4.26, 0.090,  4.79e-5,   0.28,  2.00],  # 12: Loamy sand
     [0.395,      0.135,    0.045,      4.05, 0.121,  1.76e-4,   0.30,  2.20],  # 13: Sand
+    [0.766,      0.663,    0.267,      6.10, 0.103,  2.00e-6,   0.05,  0.55],  # 14: Organic / Peat
 ], dtype=np.float32)
+
+# ECMWF IFS / ERA5 HTESSEL 7-class soil hydrology [theta_wilt, theta_fc, theta_sat]
+# (sussoil_mod.F90 & susdp_deriv_ctl_mod.F90; class 0 = water, 7 = tropical organic fallback)
+ECMWF_HTESSEL_SOIL_HYDRO = np.array([
+    [0.000, 0.000, 0.000],  # 0: Water
+    [0.059, 0.244, 0.403],  # 1: Coarse
+    [0.151, 0.347, 0.439],  # 2: Medium (ECMWF default reference)
+    [0.133, 0.383, 0.430],  # 3: Medium fine
+    [0.279, 0.448, 0.520],  # 4: Fine
+    [0.335, 0.541, 0.614],  # 5: Very fine
+    [0.267, 0.663, 0.766],  # 6: Organic / Peat
+    [0.151, 0.347, 0.439],  # 7: Tropical organic / medium fallback
+], dtype=np.float64)
 
 
 class NoahLandSurfaceState:
@@ -79,7 +94,7 @@ class NoahLandSurfaceState:
 
         self.lsm = np.array(lsm, dtype=np.float32, copy=True) if lsm is not None else np.where(self.soil_type > 0, 1.0, 0.0).astype(np.float32)
 
-        # Ensure any land cell (lsm >= 0.5) has a valid physical soil texture class (1..13).
+        # Ensure any land cell (lsm >= 0.5) has a valid physical soil texture class (1..14).
         # Water/unclassified cells (0) on land are assigned regional default Loam (class 9).
         land_cells = self.lsm >= 0.5
         st_clean = np.where(land_cells & (self.soil_type <= 0), 9, self.soil_type)
@@ -98,7 +113,7 @@ class NoahLandSurfaceState:
         self.surface_runoff = np.zeros((ny, nx), dtype=np.float32)
 
         # Broadcast texture parameters to (ny, nx)
-        st_clamped = np.clip(self.soil_type, 0, 13)
+        st_clamped = np.clip(self.soil_type, 0, 14)
         self.theta_sat = SOIL_PARAM_TABLE[st_clamped, 0]
         self.theta_fc = SOIL_PARAM_TABLE[st_clamped, 1]
         self.theta_wilt = SOIL_PARAM_TABLE[st_clamped, 2]
@@ -143,6 +158,62 @@ def remap_ecmwf_soil_moisture(vsw: np.ndarray) -> np.ndarray:
             if ov > 0.0:
                 out[l] += (ov / (b - a)) * vsw[k]
     return out
+
+
+def remap_ecmwf_swvl_via_smi(
+    swvl: np.ndarray,
+    target_soil_type: np.ndarray,
+    src_soil_type: Optional[np.ndarray] = None,
+) -> np.ndarray:
+    """Remap ECMWF HTESSEL volumetric soil water [m3/m3] to Tempest soil classes via Soil Moisture Index (SMI).
+
+    Uses continuous 3-segment piecewise-linear scaling across `(0..theta_wilt, theta_wilt..theta_fc, theta_fc..theta_sat)`
+    following Koster et al. (2009) so plant-available moisture fraction is preserved across mineral & peat transitions.
+    """
+    arr = np.asarray(swvl, dtype=np.float64)
+    is_2d = arr.ndim == 2
+    w_in = arr[None, :, :] if is_2d else arr
+    if w_in.ndim != 3:
+        raise ValueError(f"Expected 2D or 3D swvl array, got shape {arr.shape}")
+
+    st_dst = np.clip(np.rint(np.asarray(target_soil_type, dtype=np.float64)).astype(np.int32), 0, 14)
+    if w_in.shape[1:] != st_dst.shape:
+        raise ValueError(f"swvl spatial shape {w_in.shape[1:]} does not match target_soil_type {st_dst.shape}")
+
+    if src_soil_type is not None:
+        st_src_raw = np.rint(np.asarray(src_soil_type, dtype=np.float64)).astype(np.int32)
+        st_src = np.where((st_src_raw >= 1) & (st_src_raw <= 7), st_src_raw, 2)
+    else:
+        with np.errstate(all="ignore"):
+            col_max = np.nanmax(w_in, axis=0)
+        # All HTESSEL mineral soils 1..4 have theta_sat <= 0.520; > 0.52 unambiguously indicates HTESSEL organic class 6.
+        st_src = np.where(np.isfinite(col_max) & (col_max > 0.52), 6, 2)
+
+    wp_s = ECMWF_HTESSEL_SOIL_HYDRO[st_src, 0]
+    fc_s = ECMWF_HTESSEL_SOIL_HYDRO[st_src, 1]
+    sat_s = ECMWF_HTESSEL_SOIL_HYDRO[st_src, 2]
+
+    sat_d = SOIL_PARAM_TABLE[st_dst, 0].astype(np.float64)
+    fc_d = SOIL_PARAM_TABLE[st_dst, 1].astype(np.float64)
+    wp_d = SOIL_PARAM_TABLE[st_dst, 2].astype(np.float64)
+    land = (st_dst >= 1) & (sat_d > 0.05)
+
+    out = np.empty_like(w_in, dtype=np.float32)
+    inv_fc_range_s = 1.0 / np.maximum(fc_s - wp_s, 1e-6)
+    inv_sat_range_s = 1.0 / np.maximum(sat_s - fc_s, 1e-6)
+    inv_wp_s = 1.0 / np.maximum(wp_s, 1e-6)
+
+    for l in range(w_in.shape[0]):
+        w = np.where(np.isfinite(w_in[l]), w_in[l], 0.28)
+        w_below = np.clip(w * inv_wp_s, 0.0, 1.0) * wp_d
+        smi = (w - wp_s) * inv_fc_range_s
+        w_mid = wp_d + smi * (fc_d - wp_d)
+        f_wet = np.clip((w - fc_s) * inv_sat_range_s, 0.0, 1.0)
+        w_abv = fc_d + f_wet * (sat_d - fc_d)
+        w_dst = np.where(w < wp_s, w_below, np.where(w <= fc_s, w_mid, w_abv))
+        out[l] = np.where(land, np.clip(w_dst, 0.02, sat_d), np.clip(w, 0.02, 0.50)).astype(np.float32)
+
+    return out[0] if is_2d else out
 
 
 def initialize_soil_from_ecmwf(

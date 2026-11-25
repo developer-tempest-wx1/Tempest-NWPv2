@@ -780,7 +780,7 @@ def apply_land_surface_oi_from_increments(
             dw = np.clip(k_t * dt_c + k_rh * drh, -0.03, 0.03)
             sm_arr[layer_idx] = np.where(
                 active_sm,
-                np.clip(sm_arr[layer_idx] + dw, 0.05, 0.45),
+                np.clip(sm_arr[layer_idx] + dw, 0.05, 0.76),
                 sm_arr[layer_idx],
             )
         ana_surf["soil_m"] = sm_arr.astype(np.float32)

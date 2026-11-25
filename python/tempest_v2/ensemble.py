@@ -190,7 +190,14 @@ def generate_balanced_member_perturbation(
     surf_p = {k: np.array(v, copy=True) for k, v in base_surf_state.items()}
     if "soil_m" in surf_p:
         d_sm = (sign * cfg.amp_soil_m * soil_pat).astype(np.float32)
-        surf_p["soil_m"] = np.clip(surf_p["soil_m"] + d_sm[None, :, :], 0.02, 0.48).astype(np.float32)
+        if "soil_type" in base_surface_static:
+            from tempest_v2.soil_model import SOIL_PARAM_TABLE
+
+            st_idx = np.clip(np.rint(np.asarray(base_surface_static["soil_type"], dtype=np.float64)).astype(np.int32), 0, 14)
+            sm_max = np.where(st_idx >= 1, SOIL_PARAM_TABLE[st_idx, 0].astype(np.float32), np.float32(0.48))
+        else:
+            sm_max = np.float32(0.766)
+        surf_p["soil_m"] = np.clip(surf_p["soil_m"] + d_sm[None, :, :], 0.02, sm_max).astype(np.float32)
     if "sst_bulk" in surf_p:
         d_sst = (sign * cfg.amp_sst_k * sst_pat).astype(np.float32)
         surf_p["sst_bulk"] = np.clip(surf_p["sst_bulk"] + d_sst, 271.15, 312.0).astype(np.float32)

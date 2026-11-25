@@ -116,6 +116,7 @@ def sample_copernicus_on_2d_grid(
     offline: bool = True,
     compute_subgrid_sso: bool = True,
     smooth_passes: int = 1,
+    sso_prefilter_m: float = 250.0,
 ) -> Dict[str, np.ndarray]:
     """Sample offline Copernicus DEM (GLO-30 with GLO-90 fallback) & WBM onto arbitrary 2D (lat, lon) grid."""
     import rasterio
@@ -211,9 +212,25 @@ def sample_copernicus_on_2d_grid(
                 land_dem_sum = uniform_filter(dem * is_land, size=(box_r, box_c), mode="nearest")
                 dem_mean = np.where(land_f > 0.05, land_dem_sum / np.maximum(land_f, 1e-6), 0.0)
                 if compute_subgrid_sso:
-                    dem2_sum = uniform_filter((dem * dem) * is_land, size=(box_r, box_c), mode="nearest")
+                    dem_sso = dem
+                    if sso_prefilter_m > 0.0:
+                        pre_r = max(1, int(round(sso_prefilter_m / (px_h * 111_195.0))))
+                        pre_c = max(
+                            1,
+                            int(round(sso_prefilter_m / (px_w * 111_195.0 * max(0.2, math.cos(math.radians(tlat + 0.5)))))),
+                        )
+                        if (pre_r > 1 or pre_c > 1) and pre_r < box_r and pre_c < box_c:
+                            lf_pre = uniform_filter(is_land, size=(pre_r, pre_c), mode="nearest")
+                            dem_sso = np.where(
+                                lf_pre > 0.05,
+                                uniform_filter(dem * is_land, size=(pre_r, pre_c), mode="nearest") / np.maximum(lf_pre, 1e-6),
+                                0.0,
+                            )
+                    sso_sum = uniform_filter(dem_sso * is_land, size=(box_r, box_c), mode="nearest")
+                    sso_mean = np.where(land_f > 0.05, sso_sum / np.maximum(land_f, 1e-6), 0.0)
+                    dem2_sum = uniform_filter((dem_sso * dem_sso) * is_land, size=(box_r, box_c), mode="nearest")
                     dem2_mean = np.where(land_f > 0.05, dem2_sum / np.maximum(land_f, 1e-6), 0.0)
-                    dem_std = np.sqrt(np.maximum(0.0, dem2_mean - dem_mean * dem_mean))
+                    dem_std = np.sqrt(np.maximum(0.0, dem2_mean - sso_mean * sso_mean))
                 else:
                     dem_std = np.zeros_like(dem_mean)
             else:
@@ -259,6 +276,7 @@ def write_copernicus_static_wx1(
     *,
     domain_name: str,
     is_projected: bool = True,
+    sso_prefilter_m: float = 250.0,
 ) -> Path:
     """Save Copernicus DEM + WBM composite into a single WX-1 v0.1.8 container with full coordinates."""
     out = Path(output_path)
@@ -284,6 +302,7 @@ def write_copernicus_static_wx1(
         attrs={
             "domain": domain_name,
             "source": "ESA Copernicus DSM (GLO-30 Europe + GLO-90 World) offline composite",
+            "sso_prefilter_m": f"{float(sso_prefilter_m):.1f}",
             "ai_ml_usage": "0%",
         },
     )

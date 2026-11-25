@@ -19,6 +19,7 @@ import numpy as np
 import wx1
 
 from tempest_v2.copernicus_dem import (
+    resolve_local_dem_root,
     sample_copernicus_on_2d_grid,
     write_copernicus_static_wx1,
 )
@@ -61,13 +62,17 @@ def ensure_domain_copernicus_static(
     local_dem_root: Optional[Path | str] = None,
     prefer_glo30: bool = True,
     smooth_passes: int = 1,
+    sso_prefilter_m: float = 250.0,
     force: bool = False,
 ) -> Path:
     """Build or load cached Copernicus DEM + WBM static WX-1 container for any DomainSpec."""
     out_dir = Path(output_dir)
     out_path = out_dir / f"static_copernicus_{spec.name}.wx1"
     if out_path.is_file() and not force:
-        return out_path
+        with wx1.open_dataset(out_path) as ds:
+            has_prefilter = "sso_prefilter_m" in ds.attrs
+        if has_prefilter or not resolve_local_dem_root(local_dem_root).exists():
+            return out_path
     fields = sample_copernicus_on_2d_grid(
         spec.lat2d,
         spec.lon2d,
@@ -78,6 +83,7 @@ def ensure_domain_copernicus_static(
         offline=True,
         compute_subgrid_sso=True,
         smooth_passes=smooth_passes,
+        sso_prefilter_m=sso_prefilter_m,
     )
     return write_copernicus_static_wx1(
         out_path,
@@ -88,6 +94,7 @@ def ensure_domain_copernicus_static(
         spec.lon2d,
         domain_name=spec.name,
         is_projected=spec.is_projected,
+        sso_prefilter_m=sso_prefilter_m,
     )
 
 

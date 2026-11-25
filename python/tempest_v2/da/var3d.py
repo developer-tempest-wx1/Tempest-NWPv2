@@ -761,7 +761,7 @@ def apply_analysis_increments_with_bounds(
         elif k in ("u", "v"):
             np.clip(val, -150.0, 150.0, out=val)
         elif k == "soil_m":
-            np.clip(val, 0.02, 0.55, out=val)
+            np.clip(val, 0.02, 0.77, out=val)
         elif k == "soil_t":
             np.clip(val, 200.0, 340.0, out=val)
         out[k] = val

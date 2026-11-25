@@ -31,6 +31,7 @@ from tempest_v2.ic_builder import (
     _vertical_map_isobaric_to_klemp,
 )
 from tempest_v2.projection import GRAVITY_M_S2, R_D, DomainSpec
+from tempest_v2.soil_model import remap_ecmwf_swvl_via_smi
 
 logger = logging.getLogger("tempest_v2.ingest_era5")
 
@@ -619,6 +620,8 @@ def era5_wx1_to_domain_state(
         sd_mm = np.clip(np.where(np.isfinite(sb["sd"]), sb["sd"], 0.0), 0.0, 2.0) * 1000.0
         surf["snow_swe"] = np.clip(_regrid_latlon_field(sd_mm, lats, lons, spec, fill_nan_value=0.0), 0.0, 2000.0).astype(np.float32)
 
+    raw_swvl = np.full((4, spec.ny, spec.nx), 0.28, dtype=np.float64)
+    has_swvl = np.zeros(4, dtype=bool)
     for m in range(4):
         tk = f"stl{m + 1}"
         mk = f"swvl{m + 1}"
@@ -629,7 +632,10 @@ def era5_wx1_to_domain_state(
             surf["soil_t"][m] = surf["t_skin"]
         if mk in sb:
             arr_m = np.where((sb[mk] < 0.0) | (sb[mk] > 0.9), np.nan, sb[mk])
-            surf["soil_m"][m] = np.clip(_regrid_latlon_field(arr_m, lats, lons, spec, fill_nan_value=0.28), 0.03, 0.50).astype(np.float32)
+            if "lsm" in sb and sb["lsm"].shape == arr_m.shape and np.any(sb["lsm"] >= 0.5):
+                arr_m = np.where(sb["lsm"] >= 0.5, arr_m, np.nan)
+            raw_swvl[m] = np.clip(_regrid_latlon_field(arr_m, lats, lons, spec, fill_nan_value=0.28), 0.01, 0.85)
+            has_swvl[m] = True
 
     if era5_land_soil_path is not None:
         lmap, l_lats, l_lons = _load_era5_land_soil_maps(era5_land_soil_path)
@@ -648,12 +654,43 @@ def era5_wx1_to_domain_state(
             st_el = _regrid_land((f"stl{idx}", f"soil_temperature_level_{idx}"), t2m_mean, 210.0, 340.0)
             if st_el is not None:
                 surf["soil_t"][m] = np.where(is_land, st_el, surf["soil_t"][m]).astype(np.float32)
-            sm_el = _regrid_land((f"swvl{idx}", f"volumetric_soil_water_layer_{idx}"), 0.28, 0.03, 0.50)
+            sm_el = _regrid_land((f"swvl{idx}", f"volumetric_soil_water_layer_{idx}"), 0.28, 0.01, 0.85)
             if sm_el is not None:
-                surf["soil_m"][m] = np.where(is_land, sm_el, surf["soil_m"][m]).astype(np.float32)
+                raw_swvl[m] = np.where(is_land, sm_el, raw_swvl[m])
+                has_swvl[m] = True
         sd_el = _regrid_land(("sd", "snow_depth"), 0.0, 0.0, 2.0)
         if sd_el is not None:
             surf["snow_swe"] = np.where(is_land, sd_el * 1000.0, surf["snow_swe"]).astype(np.float32)
+
+    if np.any(has_swvl):
+        if surface_static is not None and "soil_type" in surface_static:
+            slt_key = next((k for k in ("slt", "soil_type") if k in sb), None)
+            slt_child = None
+            if slt_key is not None:
+                from scipy.interpolate import RegularGridInterpolator
+
+                la_src = np.asarray(lats, dtype=np.float64)
+                lo_src = np.asarray(lons, dtype=np.float64)
+                s_src = np.asarray(sb[slt_key], dtype=np.float64)
+                if la_src[0] > la_src[-1]:
+                    la_src = la_src[::-1]
+                    s_src = s_src[::-1, :]
+                if lo_src[0] > lo_src[-1]:
+                    lo_src = lo_src[::-1]
+                    s_src = s_src[:, ::-1]
+                tgt_lon = ((np.asarray(spec.lon2d, dtype=np.float64) + 180.0) % 360.0) - 180.0
+                if lo_src.max() > 180.0 and lo_src.min() >= 0.0:
+                    tgt_lon = np.mod(spec.lon2d, 360.0)
+                itp_slt = RegularGridInterpolator((la_src, lo_src), s_src, method="nearest", bounds_error=False, fill_value=2.0)
+                slt_child = itp_slt(np.column_stack([spec.lat2d.ravel(), tgt_lon.ravel()])).reshape(spec.ny, spec.nx)
+            sm_mapped = remap_ecmwf_swvl_via_smi(raw_swvl, surface_static["soil_type"], src_soil_type=slt_child)
+            for m in range(4):
+                if has_swvl[m]:
+                    surf["soil_m"][m] = np.where(is_land, sm_mapped[m], np.clip(raw_swvl[m], 0.02, 0.50)).astype(np.float32)
+        else:
+            for m in range(4):
+                if has_swvl[m]:
+                    surf["soil_m"][m] = np.clip(raw_swvl[m], 0.02, 0.77).astype(np.float32)
 
     surf["lake_tbot"] = np.clip(skt_h - 1.5, 273.15, 305.0).astype(np.float32)
     if surface_static is not None and "bathy_depth_m" in surface_static:

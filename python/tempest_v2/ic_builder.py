@@ -26,6 +26,13 @@ from tempest_v2.aurora_adapter import aurora_wx1_to_domain_state
 from tempest_v2.bathymetry import load_bathymetry, prepare_bathymetry_on_2d_grid
 from tempest_v2.cuda_bridge import NonHydrostaticGPUSolver
 from tempest_v2.hwsd22_soil import sample_hwsd22_on_grid
+from tempest_v2.land_static import (
+    ensure_domain_soilgrids_static,
+    ensure_domain_worldcover_static,
+    resolve_soilgrids_root,
+    resolve_worldcover_root,
+)
+from tempest_v2.soil_model import remap_ecmwf_swvl_via_smi
 from tempest_v2.projection import (
     CP_D,
     GRAVITY_M_S2,
@@ -116,10 +123,14 @@ def build_domain_static_fields(
     static_dir: Path | str = STATIC_DIR,
     dem_root: Optional[Path | str] = None,
     gebco_root: Optional[Path | str] = DEFAULT_GEBCO_ROOT,
+    worldcover_root: Optional[Path | str] = None,
+    soilgrids_root: Optional[Path | str] = None,
+    use_worldcover: bool = True,
+    use_soilgrids: bool = True,
     force: bool = False,
     allow_synthetic_fallback: bool = True,
 ) -> Tuple[np.ndarray, Dict[str, np.ndarray]]:
-    """Build or load cached Copernicus DEM + GEBCO 2026 + HWSD v2.2 static fields on `spec`."""
+    """Build or load cached Copernicus DEM + GEBCO 2026 + HWSD v2.2 / SoilGrids / WorldCover static fields on `spec`."""
     sdir = Path(static_dir)
     sdir.mkdir(parents=True, exist_ok=True)
     ny, nx = spec.ny, spec.nx
@@ -236,12 +247,67 @@ def build_domain_static_fields(
             logger.warning("HWSD v2.2 lookup skipped (%s); using loam (class 9) over land.", exc)
     soil_type = np.where(is_land, np.where(soil_type >= 1.0, soil_type, 9.0), 0.0).astype(np.float32)
 
-    # Roughness length z0m, albedo, greenness fraction derived physically from elevation & terrain sigma
-    # Effective 2.5km countryside roughness (~0.15 m base) matches HARMONIE/IFS aerodynamic drag
-    z0m_land = np.clip(0.15 + 0.0015 * oro_std + 0.08 * np.clip(hs_m / 600.0, 0.0, 1.0), 0.05, 1.2)
+    # SoilGrids 250 m seamless European override (texture classes 1..13 + organic peat class 14)
+    if use_soilgrids and resolve_soilgrids_root(soilgrids_root) is not None:
+        try:
+            sg_cache = ensure_domain_soilgrids_static(
+                spec,
+                lsm_land=lsm_bin,
+                output_dir=sdir,
+                local_root=soilgrids_root,
+                force=force,
+            )
+            with wx1.open_dataset(sg_cache) as sgds:
+                sg_valid = np.asarray(sgds["sg_valid"].values, dtype=np.float32) >= 0.5
+                sg_stype = np.asarray(sgds["soil_type"].values, dtype=np.float32)
+            soil_type = np.where(is_land & sg_valid & (sg_stype >= 1.0), sg_stype, soil_type)
+        except Exception as exc:
+            logger.warning("SoilGrids 250 m lookup skipped (%s); keeping HWSD v2.2.", exc)
+    soil_type = np.where(is_land, np.where(soil_type >= 1.0, soil_type, 9.0), 0.0).astype(np.float32)
+
+    # Roughness length z0m, albedo, greenness fraction (ESA WorldCover 10 m when available, else elevation fallback)
+    z0m_land_fb = np.clip(0.15 + 0.0015 * oro_std + 0.08 * np.clip(hs_m / 600.0, 0.0, 1.0), 0.05, 1.2)
+    albedo_fb = np.where(hs_m > 1800.0, 0.35, 0.19)
+    veg_fb = np.clip(0.65 - 0.35 * np.clip((hs_m - 600.0) / 1400.0, 0.0, 1.0), 0.15, 0.75)
+
+    z0m_land = z0m_land_fb
+    albedo_land = albedo_fb
+    veg_land = veg_fb
+    if use_worldcover and resolve_worldcover_root(worldcover_root) is not None:
+        try:
+            wc_cache = ensure_domain_worldcover_static(
+                spec,
+                output_dir=sdir,
+                local_root=worldcover_root,
+                force=force,
+            )
+            with wx1.open_dataset(wc_cache) as wcds:
+                wc_valid = np.asarray(wcds["wc_valid"].values, dtype=np.float32) >= 0.5
+                wc_land_frac = np.asarray(wcds["wc_land_frac"].values, dtype=np.float32)
+                wc_z0m_veg = np.asarray(wcds["z0m_veg"].values, dtype=np.float64)
+                wc_alb = np.asarray(wcds["albedo_land"].values, dtype=np.float64)
+                wc_veg = np.asarray(wcds["veg_frac"].values, dtype=np.float64)
+                wc_dh = np.asarray(wcds["dsm_height_offset_m"].values, dtype=np.float64)
+
+            wc_land_ok = is_land & wc_valid & (wc_land_frac > 0.0)
+            hs_m = np.where(wc_land_ok, hs_m - wc_dh, hs_m)
+            hs_m = np.where(is_land, hs_m, 0.0)
+
+            z_b = 50.0
+            inv_ln2_veg = 1.0 / np.square(np.log(z_b / np.clip(wc_z0m_veg, 0.002, 1.5)))
+            sigma_eff = np.maximum(0.0, np.asarray(oro_std, dtype=np.float64) - 15.0)
+            inv_ln2_tot = inv_ln2_veg + 1.5 * np.square(sigma_eff / 1000.0)
+            z0m_wc = np.clip(z_b * np.exp(-1.0 / np.sqrt(np.maximum(inv_ln2_tot, 1e-6))), 0.002, 1.5)
+
+            z0m_land = np.where(wc_land_ok, z0m_wc, z0m_land_fb)
+            albedo_land = np.where(wc_land_ok, wc_alb, albedo_fb)
+            veg_land = np.where(wc_land_ok, wc_veg, veg_fb)
+        except Exception as exc:
+            logger.warning("ESA WorldCover 10 m lookup skipped (%s); using elevation fallback.", exc)
+
     z0m_base = np.where(is_land, z0m_land, 1.0e-4).astype(np.float32)
-    albedo_base = np.where(is_land, np.where(hs_m > 1800.0, 0.35, 0.19), 0.06).astype(np.float32)
-    veg_frac = np.where(is_land, np.clip(0.65 - 0.35 * np.clip((hs_m - 600.0) / 1400.0, 0.0, 1.0), 0.15, 0.75), 0.0).astype(np.float32)
+    albedo_base = np.where(is_land, albedo_land, 0.06).astype(np.float32)
+    veg_frac = np.where(is_land, veg_land, 0.0).astype(np.float32)
 
     surface_static = {
         "lat_deg": spec.lat2d.astype(np.float32),
@@ -745,7 +811,25 @@ def ecmwf_grib_to_domain_state(
             if arr.ndim == 2:
                 arr = np.broadcast_to(arr[None, :, :], (4, arr.shape[0], arr.shape[1]))
             arr = np.where((arr < 0.0) | (arr > 0.9), np.nan, arr)
-            surf["soil_m"] = np.clip(_regrid_latlon_field(arr[:4], la, lo, spec, fill_nan_value=0.28), 0.03, 0.50).astype(np.float32)
+            if "lsm" in sfc_vars:
+                lsm_sol = np.asarray(sfc_vars["lsm"][0].values, dtype=np.float64)
+                while lsm_sol.ndim > 2:
+                    lsm_sol = lsm_sol[0]
+                if lsm_sol.shape == arr.shape[1:] and np.any(lsm_sol >= 0.5):
+                    arr = np.where(lsm_sol[None, :, :] >= 0.5, arr, np.nan)
+            raw_sm = np.clip(_regrid_latlon_field(arr[:4], la, lo, spec, fill_nan_value=0.28), 0.01, 0.85)
+            if surface_static is not None and "soil_type" in surface_static:
+                slt_key = next((k for k in ("slt", "soil_type") if k in sfc_vars), None)
+                slt_child = None
+                if slt_key is not None:
+                    s_da, s_la, s_lo = sfc_vars[slt_key]
+                    s_arr = np.asarray(s_da.values, dtype=np.float64)
+                    while s_arr.ndim > 2:
+                        s_arr = s_arr[0]
+                    slt_child = np.rint(_regrid_latlon_field(s_arr, s_la, s_lo, spec, fill_nan_value=2.0))
+                surf["soil_m"] = remap_ecmwf_swvl_via_smi(raw_sm, surface_static["soil_type"], src_soil_type=slt_child)
+            else:
+                surf["soil_m"] = np.clip(raw_sm, 0.02, 0.77).astype(np.float32)
     else:
         for layer in range(4):
             surf["soil_t"][layer] = surf["t_skin"]

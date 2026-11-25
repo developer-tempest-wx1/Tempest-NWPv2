@@ -9,9 +9,9 @@ using namespace tempest_cuda_internal;
 
 namespace {
 
-// WMO / NOAA / USDA-HWSD 14-row soil lookup table matching tempest_v2/soil_model.py:
+// WMO / NOAA / USDA-HWSD 15-row soil lookup table matching tempest_v2/soil_model.py:
 // Columns: [0:theta_sat, 1:theta_fc, 2:theta_wilt, 3:b, 4:psi_sat(m), 5:ksat(m/s), 6:kappa_dry(W/mK), 7:kappa_sat(W/mK)]
-__constant__ double c_soil_table[14][8] = {
+__constant__ double c_soil_table[15][8] = {
     {0.000, 0.000, 0.000,  0.00, 0.000, 0.00e-6, 0.00, 0.60}, // 0: Water
     {0.482, 0.395, 0.286, 11.40, 0.405, 1.28e-6, 0.20, 1.25}, // 1: Clay (heavy)
     {0.470, 0.380, 0.270, 10.40, 0.350, 1.50e-6, 0.21, 1.30}, // 2: Silty clay
@@ -25,7 +25,8 @@ __constant__ double c_soil_table[14][8] = {
     {0.420, 0.255, 0.135,  4.90, 0.290, 5.20e-6, 0.26, 1.70}, // 10: Sandy clay loam
     {0.435, 0.215, 0.084,  4.74, 0.141, 1.41e-5, 0.27, 1.80}, // 11: Sandy loam
     {0.410, 0.174, 0.068,  4.26, 0.090, 4.79e-5, 0.28, 2.00}, // 12: Loamy sand
-    {0.395, 0.135, 0.045,  4.05, 0.121, 1.76e-4, 0.30, 2.20}  // 13: Sand
+    {0.395, 0.135, 0.045,  4.05, 0.121, 1.76e-4, 0.30, 2.20}, // 13: Sand
+    {0.766, 0.663, 0.267,  6.10, 0.103, 2.00e-6, 0.05, 0.55}  // 14: Organic / Peat (Balsamo 2009 / Letts 2000)
 };
 
 // ECMWF HTESSEL 4-layer soil thicknesses [m]
@@ -847,7 +848,7 @@ __global__ void nh_surface_and_lsm_kernel(
     if (lsm_v >= 0.5f) {
         int stype = soil_type ? static_cast<int>(lroundf(soil_type[col])) : 9;
         if (stype < 1) stype = 9;
-        if (stype > 13) stype = 13;
+        if (stype > 14) stype = 14;
 
         const float th_sat  = static_cast<float>(c_soil_table[stype][0]);
         const float th_fc   = static_cast<float>(c_soil_table[stype][1]);
