@@ -526,8 +526,7 @@ def _vertical_map_isobaric_to_klemp(
     else:
         u_grid_h, v_grid_h = u_geo_h, v_geo_h
 
-    exner_lvl = (p_levels_pa / P0_PA) ** KAPPA
-    theta_h = t_h / exner_lvl[:, None, None]
+    eps_v = (461.5 / R_D) - 1.0  # Matches EPS_V in nh_internal.cuh (~0.60769)
     nlev = len(p_levels_pa)
     ln_p = np.log(p_levels_pa)
 
@@ -539,7 +538,18 @@ def _vertical_map_isobaric_to_klemp(
 
     zeta_s = spec.vertical.zeta_s[:, None, None].astype(np.float64)
     b_s = spec.vertical.B_s[:, None, None].astype(np.float64)
+    zeta_w = spec.vertical.zeta_w[:, None, None].astype(np.float64)
+    b_w = spec.vertical.B_w[:, None, None].astype(np.float64)
+    db_w = spec.vertical.dB_dzeta_w[1:-1, None, None].astype(np.float64)
+    dzeta = spec.vertical.dzeta[:, None, None].astype(np.float64)
+    dz_w_base = 0.5 * (dzeta[1:] + dzeta[:-1])
+
     hs_2d = np.asarray(hs_m, dtype=np.float64)
+    ps_2d = (
+        np.asarray(ps_child, dtype=np.float64)
+        if ps_child is not None
+        else np.full((ny, nx), np.nan, dtype=np.float64)
+    )
     n2 = float(n_ref_hz) * float(n_ref_hz)
     g2_cp = (GRAVITY_M_S2 * GRAVITY_M_S2) / (CP_D * float(theta_sfc_ref) * max(n2, 1e-12))
     pi_sfc = (float(p_sfc_ref) / P0_PA) ** KAPPA
@@ -549,14 +559,15 @@ def _vertical_map_isobaric_to_klemp(
         j1 = min(ny, j0 + chunk_ny)
         ny_c = j1 - j0
         n_col = ny_c * nx
-        z_chunk = zeta_s + b_s * hs_2d[None, j0:j1, :]
+        hs_c = hs_2d[None, j0:j1, :]
+        z_chunk = zeta_s + b_s * hs_c
         exp_fac = np.exp((n2 / GRAVITY_M_S2) * z_chunk)
         theta_bar_c = float(theta_sfc_ref) * exp_fac
         pi_bar_c = np.maximum(1e-4, pi_sfc - g2_cp * (1.0 - 1.0 / exp_fac))
 
         zs_b = z_h[:, j0:j1, :].reshape(nlev, n_col)
         zt_b = z_chunk.reshape(nz, n_col)
-        th_b = theta_h[:, j0:j1, :].reshape(nlev, n_col)
+        t_b = t_h[:, j0:j1, :].reshape(nlev, n_col)
         u_b = u_grid_h[:, j0:j1, :].reshape(nlev, n_col)
         v_b = v_grid_h[:, j0:j1, :].reshape(nlev, n_col)
         q_b = q_h[:, j0:j1, :].reshape(nlev, n_col)
@@ -569,42 +580,128 @@ def _vertical_map_isobaric_to_klemp(
         z_hi = zs_b[k_hi, col_idx]
         wt = np.clip((zt_b - z_lo) / np.maximum(z_hi - z_lo, 1e-6), 0.0, 1.0)
 
-        th_i = (1.0 - wt) * th_b[k_lo, col_idx] + wt * th_b[k_hi, col_idx]
+        t_lo = t_b[k_lo, col_idx]
+        t_hi = t_b[k_hi, col_idx]
+        q_lo = q_b[k_lo, col_idx]
+        q_hi = q_b[k_hi, col_idx]
+
+        # Interpolate temperature T(z) linearly in z (avoids convex theta chord bias)
+        t_i = np.maximum(150.0, (1.0 - wt) * t_lo + wt * t_hi)
         u_i = (1.0 - wt) * u_b[k_lo, col_idx] + wt * u_b[k_hi, col_idx]
         v_i = (1.0 - wt) * v_b[k_lo, col_idx] + wt * v_b[k_hi, col_idx]
-        q_i = (1.0 - wt) * q_b[k_lo, col_idx] + wt * q_b[k_hi, col_idx]
-        p_i = np.exp((1.0 - wt) * ln_p[k_lo] + wt * ln_p[k_hi])
+        q_i = np.clip((1.0 - wt) * q_lo + wt * q_hi, 1e-7, 0.04)
+
+        # Exact linear-Tv(z) hypsometric pressure inside each isobaric bracket
+        tv_lo = np.maximum(150.0, t_lo * (1.0 + eps_v * np.clip(q_lo, 0.0, 0.04)))
+        tv_hi = np.maximum(150.0, t_hi * (1.0 + eps_v * np.clip(q_hi, 0.0, 0.04)))
+        tv_i = np.maximum(150.0, t_i * (1.0 + eps_v * q_i))
+        d_tv_br = tv_hi - tv_lo
+        safe_denom = np.where(np.abs(d_tv_br) > 1e-3, np.log(tv_hi / tv_lo), 1.0)
+        frac_p = np.where(np.abs(d_tv_br) > 1e-3, np.log(tv_i / tv_lo) / safe_denom, wt)
+        frac_p = np.clip(frac_p, 0.0, 1.0)
+        p_i = np.exp(ln_p[k_lo] + frac_p * (ln_p[k_hi] - ln_p[k_lo]))
 
         above = zt_b > zs_b[-1:, :]
         if np.any(above):
-            t_top = np.maximum(180.0, th_b[-1:, :] * ((p_levels_pa[-1] / P0_PA) ** KAPPA))
-            p_abv = p_levels_pa[-1] * np.exp(-GRAVITY_M_S2 * (zt_b - zs_b[-1:, :]) / (R_D * t_top))
-            th_abv = t_top / ((np.maximum(p_abv, 1.0) / P0_PA) ** KAPPA)
+            t_top = np.maximum(180.0, t_b[-1:, :])
+            q_top = np.clip(q_b[-1:, :], 0.0, 0.04)
+            tv_top = t_top * (1.0 + eps_v * q_top)
+            p_abv = p_levels_pa[-1] * np.exp(-GRAVITY_M_S2 * (zt_b - zs_b[-1:, :]) / (R_D * tv_top))
             p_i = np.where(above, p_abv, p_i)
-            th_i = np.where(above, th_abv, th_i)
+            t_i = np.where(above, t_top, t_i)
 
         below = zt_b < zs_b[0:1, :]
         if np.any(below):
-            gamma_std = 0.0065  # Standard tropospheric lapse rate [K/m]
+            gamma_std = 0.0065  # Fallback standard tropospheric lapse rate [K/m]
             dz_down = np.maximum(0.0, zs_b[0:1, :] - zt_b)
-            t_bot = np.maximum(180.0, th_b[0:1, :] * ((p_levels_pa[0] / P0_PA) ** KAPPA))
+            t_bot = np.maximum(180.0, t_b[0:1, :])
             q_bot = np.clip(q_b[0:1, :], 0.0, 0.04)
-            tv_bot = t_bot * (1.0 + 0.608 * q_bot)
-            tv_bel = np.maximum(180.0, tv_bot + gamma_std * dz_down)
-            t_bel = np.maximum(180.0, t_bot + gamma_std * dz_down)
-            p_bel = p_levels_pa[0] * np.power(tv_bel / tv_bot, GRAVITY_M_S2 / (R_D * gamma_std))
-            th_bel = t_bel / np.power(np.maximum(p_bel, 10.0) / P0_PA, KAPPA)
-            p_i = np.where(below, p_bel, p_i)
-            th_i = np.where(below, th_bel, th_i)
+            tv_bot = t_bot * (1.0 + eps_v * q_bot)
 
-        pi_i = np.power(np.maximum(p_i, 10.0) / P0_PA, KAPPA)
-        t_i = np.maximum(150.0, th_i * pi_i)
-        es_w = 611.2 * np.exp(17.67 * (t_i - 273.15) / np.maximum(t_i - 29.65, 1.0))
-        qs_w = 0.62198 * es_w / np.maximum(p_i - 0.378 * es_w, 10.0)
-        q_i = np.minimum(q_i, 0.995 * qs_w)
-        theta_p_out[:, j0:j1, :] = (th_i.reshape(nz, ny_c, nx) - theta_bar_c).astype(np.float32)
-        pi_p_out[:, j0:j1, :] = (pi_i.reshape(nz, ny_c, nx) - pi_bar_c).astype(np.float32)
-        qv_out[:, j0:j1, :] = np.clip(q_i.reshape(nz, ny_c, nx), 1e-7, 0.04).astype(np.float32)
+            ps_flat = ps_2d[j0:j1, :].reshape(1, n_col)
+            hs_flat = hs_c.reshape(1, n_col)
+            valid_hypso = (
+                np.isfinite(ps_flat)
+                & (ps_flat > p_levels_pa[0] + 150.0)
+                & (zs_b[0:1, :] > hs_flat + 20.0)
+            )
+            log_ratio = np.where(
+                valid_hypso,
+                np.log(np.maximum(ps_flat, p_levels_pa[0] + 150.0) / p_levels_pa[0]),
+                1.0,
+            )
+            tv_mean = np.where(
+                valid_hypso,
+                (GRAVITY_M_S2 * (zs_b[0:1, :] - hs_flat)) / np.maximum(R_D * log_ratio, 1e-3),
+                tv_bot,
+            )
+            tv_sfc_est = np.clip(2.0 * tv_mean - tv_bot, tv_bot - 15.0, tv_bot + 15.0)
+            t_sfc_est = tv_sfc_est / (1.0 + eps_v * q_bot)
+            span_hypso = np.maximum(zs_b[0:1, :] - hs_flat, 1.0)
+            wb = np.clip((zt_b - hs_flat) / span_hypso, 0.0, 1.0)
+            t_hypso = (1.0 - wb) * t_sfc_est + wb * t_bot
+
+            t_std = t_bot + gamma_std * dz_down
+            t_bel = np.maximum(180.0, np.where(valid_hypso, t_hypso, t_std))
+            tv_bel = t_bel * (1.0 + eps_v * q_bot)
+            p_bel = p_levels_pa[0] * np.exp(GRAVITY_M_S2 * dz_down / (R_D * 0.5 * (tv_bot + tv_bel)))
+            p_i = np.where(below, p_bel, p_i)
+            t_i = np.where(below, t_bel, t_i)
+
+        t_3d = t_i.reshape(nz, ny_c, nx)
+        p_3d = p_i.reshape(nz, ny_c, nx)
+        q_3d = np.clip(q_i.reshape(nz, ny_c, nx), 1e-7, 0.04)
+
+        es_w = 611.2 * np.exp(17.67 * (t_3d - 273.15) / np.maximum(t_3d - 29.65, 1.0))
+        qs_w = 0.62198 * es_w / np.maximum(p_3d - 0.378 * es_w, 10.0)
+        q_3d = np.clip(np.minimum(q_3d, 0.995 * qs_w), 1e-7, 0.04)
+
+        # Anchor lowest model level (k=0) to ps_child on lowlands / below bottom isobaric level
+        ps_c = ps_2d[j0:j1, :]
+        hs_2c = hs_2d[j0:j1, :]
+        tv0 = t_3d[0] * (1.0 + eps_v * q_3d[0])
+        dz0 = np.maximum(0.0, z_chunk[0] - hs_2c)
+        p0_from_ps = np.where(
+            np.isfinite(ps_c),
+            ps_c * np.exp(-(GRAVITY_M_S2 * dz0) / (R_D * np.maximum(tv0, 180.0))),
+            p_3d[0],
+        )
+        ps_ok = np.isfinite(ps_c) & (ps_c > 20_000.0) & (ps_c < 120_000.0)
+        w_ps = np.where(ps_ok, np.where(z_chunk[0] < z_h[0, j0:j1, :], 1.0, np.clip(1.0 - hs_2c / 300.0, 0.0, 1.0)), 0.0)
+        p0_anchor = w_ps * p0_from_ps + (1.0 - w_ps) * p_3d[0]
+        pi0_anchor = np.power(np.maximum(p0_anchor, 10.0) / P0_PA, KAPPA)
+
+        # Solve exact discrete hydrostatic balance matching nh_core.cu (3 fixed-point passes)
+        pi_cur = np.power(np.maximum(p_3d, 10.0) / P0_PA, KAPPA)
+        if nz > 1:
+            z_w_c = zeta_w + b_w * hs_c
+            dz_s_c = np.diff(z_w_c, axis=0)
+            wt_w = dz_s_c[:-1] / (dz_s_c[1:] + dz_s_c[:-1])
+            dz_w_cuda = (1.0 + db_w * hs_c) * dz_w_base
+            thb_w = float(theta_sfc_ref) * np.exp((n2 / GRAVITY_M_S2) * z_w_c[1:-1])
+            vf_c = 1.0 + eps_v * q_3d
+            for _ in range(3):
+                th_cur = np.maximum(50.0, t_3d / pi_cur)
+                dthv = (th_cur - theta_bar_c) * vf_c + theta_bar_c * (vf_c - 1.0)
+                dthv_w = (1.0 - wt_w) * dthv[:-1] + wt_w * dthv[1:]
+                thv_w = np.maximum(50.0, thb_w + dthv_w)
+                dpi_p = (GRAVITY_M_S2 * dthv_w / (CP_D * thv_w * thb_w)) * dz_w_cuda
+                pip_new = np.empty_like(pi_cur)
+                pip_new[0] = pi0_anchor - pi_bar_c[0]
+                pip_new[1:] = pip_new[0:1] + np.cumsum(dpi_p, axis=0)
+                pi_cur = np.maximum(1e-4, pi_bar_c + pip_new)
+        else:
+            pi_cur[0] = np.maximum(1e-4, pi0_anchor)
+
+        th_cur = np.maximum(50.0, t_3d / pi_cur)
+        p_cur = P0_PA * np.power(pi_cur, 1.0 / KAPPA)
+        es_w = 611.2 * np.exp(17.67 * (t_3d - 273.15) / np.maximum(t_3d - 29.65, 1.0))
+        qs_w = 0.62198 * es_w / np.maximum(p_cur - 0.378 * es_w, 10.0)
+        q_3d = np.clip(np.minimum(q_3d, 0.995 * qs_w), 1e-7, 0.04)
+
+        theta_p_out[:, j0:j1, :] = (th_cur - theta_bar_c).astype(np.float32)
+        pi_p_out[:, j0:j1, :] = (pi_cur - pi_bar_c).astype(np.float32)
+        qv_out[:, j0:j1, :] = q_3d.astype(np.float32)
         u_c_out[:, j0:j1, :] = u_i.reshape(nz, ny_c, nx).astype(np.float32)
         v_c_out[:, j0:j1, :] = v_i.reshape(nz, ny_c, nx).astype(np.float32)
 

@@ -112,6 +112,24 @@ __device__ inline void eval_cell_thermo(
     rho = fmaxf(1e-5f, p_pa / (R_D_F * tv));
 }
 
+// Exact compressible constant-density Exner update:
+// From p = p0 * pi^(cp/Rd) = rho * Rd * theta_v * pi => pi^(cv/Rd) = (Rd/p0) * rho * theta_v.
+// Holding cell density rho fixed across a diabatic/phase/mixing change (thv_old -> thv_new),
+// optionally multiplied by a gas mass factor (1 + dm_rel) for surface evaporation (LHF):
+//   pi_new = pi_old * ((1 + dm_rel) * thv_new / thv_old)^(Rd / cv).
+// Uses double + log1p/expm1 to avoid FP32 cancellation on small radiative tendencies.
+__device__ inline void update_pip_diabatic_const_rho(
+    float pib, float thv_old, float thv_new, float* pip_ptr, double dm_rel = 0.0
+) {
+    if (!pip_ptr || thv_old <= 1e-3f || thv_new <= 1e-3f) return;
+    const double pi_old = fmax(1e-4, static_cast<double>(pib) + static_cast<double>(*pip_ptr));
+    const double d_thv = (static_cast<double>(thv_new) - static_cast<double>(thv_old)) / static_cast<double>(thv_old);
+    const double d_rel = d_thv + dm_rel * (1.0 + d_thv);
+    if (fabs(d_rel) < 1e-13) return;
+    const double dpi = pi_old * expm1((R_D / CV_D) * log1p(fmax(-0.5, fmin(1.0, d_rel))));
+    *pip_ptr = static_cast<float>(static_cast<double>(*pip_ptr) + dpi);
+}
+
 // ===========================================================================
 // PILLAR 3 (Radiation): ECMWF ecRad Delta-Eddington + Meador-Weaver + Adding
 // ===========================================================================
@@ -637,7 +655,7 @@ __global__ void nh_radiation_ecrad_kernel(
 }
 
 __global__ void nh_apply_rad_kernel(
-    NhGridConfig cfg, double dt_s, const float* rad_dth_dt, float* thp
+    NhGridConfig cfg, DeviceStaticGrid g, double dt_s, const float* rad_dth_dt, float* thp, float* pip
 ) {
     const int32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     const int32_t j = blockIdx.y * blockDim.y + threadIdx.y;
@@ -645,9 +663,19 @@ __global__ void nh_apply_rad_kernel(
     const size_t str = static_cast<size_t>(cfg.ny) * cfg.nx;
     const size_t col = static_cast<size_t>(j) * cfg.nx + i;
     const float dt_f = static_cast<float>(dt_s);
+    const float pi_sfc_f = powf(static_cast<float>(cfg.p_sfc_pa) / P0_PA_F, KAPPA_F);
+    const float th0_f = static_cast<float>(cfg.theta_sfc_k);
+    const float nref_f = static_cast<float>(cfg.n_ref_s);
+    const float hs = static_cast<float>(g.hs[col]);
     for (int32_t k = 0; k < cfg.nz; ++k) {
         const size_t idx = static_cast<size_t>(k) * str + col;
-        thp[idx] += dt_f * rad_dth_dt[idx];
+        const float z_k = static_cast<float>(g.zeta_s[k]) + static_cast<float>(g.b_s[k]) * hs;
+        float thb = 0.0f, pib = 0.0f;
+        eval_theta_pi_bar_f32(z_k, th0_f, pi_sfc_f, nref_f, thb, pib);
+        const float th_old = fmaxf(50.0f, thb + thp[idx]);
+        const float th_new = fmaxf(50.0f, th_old + dt_f * rad_dth_dt[idx]);
+        thp[idx] = th_new - thb;
+        update_pip_diabatic_const_rho(pib, th_old, th_new, pip ? &pip[idx] : nullptr);
     }
 }
 
@@ -1227,9 +1255,10 @@ __global__ void nh_pbl_scalar_kernel(
     NhPhysicsConfig pcfg,
     DeviceStaticGrid g,
     double dt_s,
-    const float* u, const float* v, const float* pip,
+    const float* u, const float* v, float* pip,
     const float* lsm, const float* shf, const float* lhf, const float* ustar,
-    float* thp, float* qv, float* qc, float* qi, float* tke, float* pblh,
+    float* thp, float* qv, float* qc, const float* qr, float* qi, const float* qs, const float* qg,
+    float* tke, float* pblh,
     float* mu_scratch, float* kh_scratch, double* tri_c, double* tri_d
 ) {
     const int32_t i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -1240,6 +1269,8 @@ __global__ void nh_pbl_scalar_kernel(
     const size_t n2 = static_cast<size_t>(cfg.ny) * cfg.nx;
     const size_t col = static_cast<size_t>(j) * cfg.nx + i;
     const float pi_sfc_f = powf(static_cast<float>(cfg.p_sfc_pa) / P0_PA_F, KAPPA_F);
+    const float th0_f = static_cast<float>(cfg.theta_sfc_k);
+    const float nref_f = static_cast<float>(cfg.n_ref_s);
     const float hs = static_cast<float>(g.hs[col]);
     const float lsm_v = lsm ? lsm[col] : 1.0f;
     const float f_cor = fabsf(static_cast<float>(g.fcor[col]));
@@ -1623,12 +1654,36 @@ __global__ void nh_pbl_scalar_kernel(
             z_c = z_kp; dz_c = dz_kp; thb_c = thb_kp; rho_c = rho_kp;
         }
 
-        double x_nxt = tri_d[static_cast<size_t>(nz - 1) * n2 + col];
-        fptr[static_cast<size_t>(nz - 1) * n2 + col] = static_cast<float>((sp > 0) ? fmax(0.0, x_nxt) : x_nxt);
-        for (int32_t k = nz - 2; k >= 0; --k) {
+        double x_nxt = 0.0;
+        for (int32_t k = nz - 1; k >= 0; --k) {
             const size_t idx = static_cast<size_t>(k) * n2 + col;
-            x_nxt = tri_d[idx] - tri_c[idx] * x_nxt;
-            fptr[idx] = static_cast<float>((sp > 0) ? fmax(0.0, x_nxt) : x_nxt);
+            const float old_val = fptr[idx];
+            x_nxt = (k == nz - 1) ? tri_d[idx] : (tri_d[idx] - tri_c[idx] * x_nxt);
+            const float new_val = static_cast<float>((sp > 0) ? fmax(0.0, x_nxt) : x_nxt);
+            fptr[idx] = new_val;
+
+            const float z_k = static_cast<float>(g.zeta_s[k]) + static_cast<float>(g.b_s[k]) * hs;
+            float thb_k = 0.0f, pib_k = 0.0f;
+            eval_theta_pi_bar_f32(z_k, th0_f, pi_sfc_f, nref_f, thb_k, pib_k);
+            if (sp == 0) {
+                const float th_old = fmaxf(50.0f, thb_k + old_val);
+                const float th_new = fmaxf(50.0f, thb_k + new_val);
+                update_pip_diabatic_const_rho(pib_k, th_old, th_new, pip ? &pip[idx] : nullptr);
+            } else if (cfg.has_moist) {
+                const float qv_cur = qv ? fmaxf(0.0f, qv[idx]) : 0.0f;
+                const float qh_cur = (qc ? fmaxf(0.0f, qc[idx]) : 0.0f)
+                                   + (qr ? fmaxf(0.0f, qr[idx]) : 0.0f)
+                                   + (qi ? fmaxf(0.0f, qi[idx]) : 0.0f)
+                                   + (qs ? fmaxf(0.0f, qs[idx]) : 0.0f)
+                                   + (qg ? fmaxf(0.0f, qg[idx]) : 0.0f);
+                const float vf_new = fmaxf(0.5f, 1.0f + EPS_V_F * qv_cur - qh_cur);
+                const float d_q = new_val - old_val;
+                const float vf_old = fmaxf(0.5f, (sp == 1) ? (vf_new - EPS_V_F * d_q) : (vf_new + d_q));
+                const double dm_rel = (sp == 1 && k == 0)
+                    ? fmax(-0.02, fmin(0.02, (static_cast<double>(lhf_v) / LV0) * dt_s / fmax(1.0, static_cast<double>(rho0 * dz_0))))
+                    : 0.0;
+                update_pip_diabatic_const_rho(pib_k, vf_old, vf_new, pip ? &pip[idx] : nullptr, dm_rel);
+            }
         }
     }
 
@@ -1874,7 +1929,7 @@ __global__ void nh_microphysics_kernel(
     DeviceStaticGrid g,
     double dt_s,
     const float* lsm,
-    float* thp, const float* pip,
+    float* thp, float* pip,
     float* qv, float* qc, float* qr, float* qi, float* qs, float* qg,
     float* rain_acc, float* snow_acc, float* graupel_acc,
     float* precip_liq_rate, float* precip_ice_rate,
@@ -1924,6 +1979,7 @@ __global__ void nh_microphysics_kernel(
             fmaxf(0.0f, qs[idx]),
             fmaxf(0.0f, qg[idx])
         };
+        const float thv_old = th_k * fmaxf(0.5f, 1.0f + EPS_V_F * q[0] - (q[1] + q[2] + q[3] + q[4] + q[5]));
 
         // 1a. Fast melting (>0C) & homogeneous freezing (<-37C); SLW preserved for -37C..0C!
         if (t_k > T_FREEZE_F && q[3] > 0.0f) {
@@ -2106,13 +2162,16 @@ __global__ void nh_microphysics_kernel(
         }
         t_k = fmaxf(140.0f, t_k + dh / CP_D_F);
 
-        thp[idx] = t_k / pi_k - thb;
+        const float th_new = fmaxf(50.0f, t_k / pi_k);
+        const float thv_new = th_new * fmaxf(0.5f, 1.0f + EPS_V_F * q[0] - (q[1] + q[2] + q[3] + q[4] + q[5]));
+        thp[idx] = th_new - thb;
         qv[idx] = q[0];
         qc[idx] = q[1];
         qr[idx] = q[2];
         qi[idx] = q[3];
         qs[idx] = q[4];
         qg[idx] = q[5];
+        update_pip_diabatic_const_rho(pib, thv_old, thv_new, pip ? &pip[idx] : nullptr);
     }
 
     // Pass 2: Subcycled Conservative Float64 Budget Column Fallout (qc, qr, qi, qs, qg)
@@ -2556,7 +2615,7 @@ int32_t nh_cuda_step_physics(NhCudaHandle* h, double dt_s) {
             h->rad_timer_s = 0.0;
         }
         h->rad_timer_s += dt_s;
-        nh_apply_rad_kernel<<<grid, block>>>(h->cfg, dt_s, h->d_rad_dth_dt, h->d_thp);
+        nh_apply_rad_kernel<<<grid, block>>>(h->cfg, g, dt_s, h->d_rad_dth_dt, h->d_thp, h->d_pip);
         NH_CUDA_CHECK(cudaGetLastError());
     }
 
@@ -2591,7 +2650,8 @@ int32_t nh_cuda_step_physics(NhCudaHandle* h, double dt_s) {
                 h->cfg, h->pcfg, g, dt_s,
                 h->d_u, h->d_v, h->d_pip,
                 h->d_lsm, h->d_shf, h->d_lhf, h->d_ustar,
-                h->d_thp, h->d_qv, h->d_qc, h->d_qi, h->d_tke, h->d_pblh,
+                h->d_thp, h->d_qv, h->d_qc, h->d_qr, h->d_qi, h->d_qs, h->d_qg,
+                h->d_tke, h->d_pblh,
                 h->d_div, h->d_q_tmp, h->d_tri_c, h->d_tri_d
             );
             NH_CUDA_CHECK(cudaGetLastError());
