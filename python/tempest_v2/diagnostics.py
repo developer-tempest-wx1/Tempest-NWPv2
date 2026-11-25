@@ -88,9 +88,37 @@ def _es_water_pa(temp_k: np.ndarray) -> np.ndarray:
     return 611.2 * np.exp((17.67 * tc) / (tc + 243.5))
 
 
+def _es_ice_pa(temp_k: np.ndarray) -> np.ndarray:
+    """IFS Tetens saturation vapour pressure over ice [Pa] matching nh_physics.cu."""
+    t = np.clip(temp_k, 150.0, 273.15)
+    return 611.21 * np.exp((22.587 * (t - 273.15)) / np.maximum(t + 0.7, 1.0))
+
+
 def _qsat_water(temp_k: np.ndarray, p_pa: np.ndarray) -> np.ndarray:
     es = np.minimum(_es_water_pa(temp_k), 0.90 * np.maximum(p_pa, 100.0))
     return (_EPS_MW * es) / np.maximum(p_pa - (1.0 - _EPS_MW) * es, 100.0)
+
+
+def _exp_ran_cloud_cover(
+    cf_3d: np.ndarray,
+    z_s: np.ndarray,
+    z_decorr_m: float = 2000.0,
+) -> np.ndarray:
+    """Exact ecRad Exponential-Random cumulative cloud overlap (`radiation_cloud_cover.F90`)."""
+    clear_cum = 1.0 - np.clip(cf_3d[0], 0.0, 1.0)
+    for k in range(1, cf_3d.shape[0]):
+        cf_prev = np.clip(cf_3d[k - 1], 0.0, 1.0)
+        cf_cur = np.clip(cf_3d[k], 0.0, 1.0)
+        dz_sep = np.maximum(np.abs(z_s[k] - z_s[k - 1]), 10.0)
+        alpha = np.exp(-dz_sep / float(z_decorr_m))
+        pair = alpha * np.maximum(cf_prev, cf_cur) + (1.0 - alpha) * (cf_prev + cf_cur - cf_prev * cf_cur)
+        denom = np.maximum(1.0 - cf_prev, 1e-6)
+        clear_cum = np.where(
+            cf_prev >= 1.0 - 1e-6,
+            0.0,
+            clear_cum * np.maximum(0.0, 1.0 - pair) / denom,
+        )
+    return np.clip(1.0 - clear_cum, 0.0, 1.0)
 
 
 def _bolton_theta_e_and_lcl(temp_k: np.ndarray, qv: np.ndarray, p_pa: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
@@ -465,16 +493,30 @@ def compute_synoptic_convective_2d(
     lwp = np.sum(rho * (qc + qr) * dz_s, axis=0)
     iwp = np.sum(rho * (qi + qs) * dz_s, axis=0)
 
-    # Tiered & total cloud cover from layer cloud fraction `1 - exp(-beta * q_cloud * rho * dz)`
-    cld_3d = 1.0 - np.exp(-32.0 * rho * (qc + qi + 0.3 * qs) * dz_s)
-    cld_3d = np.clip(cld_3d, 0.0, 1.0)
+    # Tiered & total cloud cover: Sundqvist (1989) mixed-phase subgrid RH + resolved condensate + ecRad Exp-Ran overlap
+    f_liq = np.clip((t_3d - 250.16) / 23.0, 0.0, 1.0) ** 2
+    es_mix = np.minimum(
+        f_liq * _es_water_pa(t_3d) + (1.0 - f_liq) * _es_ice_pa(t_3d),
+        0.90 * np.maximum(p_3d, 100.0),
+    )
+    qs_mix = np.clip((_EPS_MW * es_mix) / np.maximum(p_3d - (1.0 - _EPS_MW) * es_mix, 100.0), 1e-7, 0.1)
+    rh_mix = np.clip(qv / qs_mix, 0.0, 1.0)
+    uc = np.where(p_3d >= 80_000.0, 0.80, 0.75)
+    cf_rh = np.where(
+        (p_3d >= 15_000.0) & (rh_mix > uc),
+        1.0 - np.sqrt(np.maximum(0.0, (1.0 - rh_mix) / np.maximum(1.0 - uc, 1e-4))),
+        0.0,
+    )
+    cf_res = 1.0 - np.exp(-32.0 * rho * np.maximum(0.0, qc + qi + 0.10 * qs) * dz_s)
+    cld_3d = np.clip(np.maximum(cf_rh, cf_res), 0.0, 1.0)
+    cld_3d = np.where(cld_3d < 1e-3, 0.0, cld_3d)
     low_m = p_3d >= 80_000.0
     mid_m = (p_3d < 80_000.0) & (p_3d >= 45_000.0)
     high_m = p_3d < 45_000.0
-    lcc = 1.0 - np.prod(1.0 - np.where(low_m, cld_3d, 0.0), axis=0)
-    mcc = 1.0 - np.prod(1.0 - np.where(mid_m, cld_3d, 0.0), axis=0)
-    hcc = 1.0 - np.prod(1.0 - np.where(high_m, cld_3d, 0.0), axis=0)
-    tcc = 1.0 - (1.0 - lcc) * (1.0 - mcc) * (1.0 - hcc)
+    lcc = _exp_ran_cloud_cover(np.where(low_m, cld_3d, 0.0), z_s)
+    mcc = _exp_ran_cloud_cover(np.where(mid_m, cld_3d, 0.0), z_s)
+    hcc = _exp_ran_cloud_cover(np.where(high_m, cld_3d, 0.0), z_s)
+    tcc = _exp_ran_cloud_cover(cld_3d, z_s)
 
     # Surface-based & Most-Unstable CAPE / CIN
     k0 = np.zeros((spec.ny, spec.nx), dtype=np.int64)

@@ -166,62 +166,90 @@ __device__ inline float lw_band_planck_flux(int band, float t_k) {
     return b_tot * f2;
 }
 
-__device__ inline void sw_layer_optics(
-    int band, float p_pa, float t_k, float dz, float rho,
-    float qv, float qc, float qr, float qi, float qs,
-    float n_drop_m3, float co2_ppm,
-    float mu0, float& r_diff, float& t_diff, float& r_dir, float& t_dir_diff, float& t_dir_dir
+__device__ inline void eval_layer_cloud_subgrid(
+    float p_pa, float t_k, float dz, float rho,
+    float qv, float qc, float qi, float qs, int enable_subgrid_rh,
+    float& cf_out, float& qc_rad, float& qi_rad
 ) {
-    const float dp = rho * GRAVITY_F * dz;
-    const float dm_air = dp / GRAVITY_F;
-    const float dm_wv = fmaxf(0.0f, qv) * dm_air;
-    const float p_scale = powf(fminf(fmaxf(p_pa / P0_PA_F, 1e-4f), 1.2f), 0.85f) * sqrtf(273.15f / fmaxf(t_k, 150.0f));
-    const float dm_wv_p = dm_wv * p_scale;
+    // Mixed-phase liquid fraction (IFS foealfa) using shared IFS Tetens es_water/es_ice.
+    float f_liq = fminf(1.0f, fmaxf(0.0f, (t_k - 250.16f) / 23.0f));
+    f_liq *= f_liq;
+    const float es_mix = f_liq * es_water(t_k) + (1.0f - f_liq) * es_ice(t_k);
+    const float qs_mix = fminf(0.1f, fmaxf(1e-7f, qsat_from_es(es_mix, p_pa)));
+    const float rh = fminf(1.0f, fmaxf(0.0f, qv / qs_mix));
+    const float uc = (p_pa >= 80000.0f) ? 0.80f : 0.75f;
 
-    float od_gas = 0.0f, od_sca_ray = 0.0f, od_cld = 0.0f, ssa_cld = 0.999f, g_cld = 0.85f;
-    if (band == 0) {
-        od_sca_ray = 0.145f * (dp / 101325.0f);
-        const float ln_p = logf(fmaxf(p_pa, 50.0f) / 3000.0f);
-        const float o3_prof = expf(-0.5f * ln_p * ln_p / (1.1f * 1.1f));
-        od_gas = 0.025f * (dp / 101325.0f) + 0.032f * o3_prof * (dp / 8000.0f);
-    } else {
-        od_sca_ray = 0.012f * (dp / 101325.0f);
-        // Dimensionless pressure fraction matches Band 0 (column broadband NIR CO2+O2 OD ~ 0.017)
-        od_gas = 0.0085f * dm_wv_p + 0.030f * (co2_ppm / 425.0f) * (dp / 101325.0f) * p_scale;
+    float cf_rh = 0.0f;
+    if (enable_subgrid_rh != 0 && p_pa >= 15000.0f && rh > uc) {
+        cf_rh = 1.0f - sqrtf(fmaxf(0.0f, (1.0f - rh) / fmaxf(1.0f - uc, 1e-4f)));
+    }
+    const float cf_res = 1.0f - expf(-32.0f * rho * fmaxf(0.0f, qc + qi + 0.10f * qs) * dz);
+    cf_out = fminf(1.0f, fmaxf(cf_rh, cf_res));
+    if (cf_out < 1e-3f) cf_out = 0.0f;
+
+    const float q_sub = (cf_rh > 1e-3f) ? (0.12f * cf_rh * cf_rh * (1.0f - uc) * qs_mix) : 0.0f;
+    qc_rad = fmaxf(qc, f_liq * q_sub);
+    qi_rad = fmaxf(qi, (1.0f - f_liq) * q_sub);
+}
+
+__device__ inline void calc_tripleclouds_overlap_uv(
+    const float f_up[3], const float f_lo[3], float alpha, float alpha_inhom,
+    float u_mat[3][3], float v_mat[3][3]
+) {
+    // Exact ecRad calc_alpha_overlap_matrix (radiation_overlap.F90) for 3 regions (0=clear, 1=thin, 2=thick).
+    const float cf_u = f_up[1] + f_up[2];
+    const float cf_l = f_lo[1] + f_lo[2];
+    const float pcc = alpha * fmaxf(cf_u, cf_l) + (1.0f - alpha) * (cf_u + cf_l - cf_u * cf_l);
+
+    float om[3][3] = {};
+    om[0][0] = fmaxf(0.0f, 1.0f - pcc);
+    if (cf_l > 1e-6f) {
+        const float inv = 1.0f / cf_l;
+        const float cl_new = fmaxf(0.0f, pcc - cf_u) * inv;
+        om[0][1] = cl_new * f_lo[1];
+        om[0][2] = cl_new * f_lo[2];
+    }
+    if (cf_u > 1e-6f) {
+        const float inv = 1.0f / cf_u;
+        const float cu_new = fmaxf(0.0f, pcc - cf_l) * inv;
+        om[1][0] = cu_new * f_up[1];
+        om[2][0] = cu_new * f_up[2];
+    }
+    const float fb = fmaxf(0.0f, cf_u + cf_l - pcc);
+    if (fb > 1e-9f && cf_u > 1e-6f && cf_l > 1e-6f) {
+        const float cu3 = f_up[2] / cf_u;
+        const float cl3 = f_lo[2] / cf_l;
+        const float pcc2 = alpha_inhom * fmaxf(cu3, cl3) + (1.0f - alpha_inhom) * (cu3 + cl3 - cu3 * cl3);
+        om[1][1] = fb * fmaxf(0.0f, 1.0f - pcc2);
+        om[1][2] = fb * fmaxf(0.0f, pcc2 - cu3);
+        om[2][1] = fb * fmaxf(0.0f, pcc2 - cl3);
+        om[2][2] = fb * fmaxf(0.0f, cu3 + cl3 - pcc2);
     }
 
-    const float lwc = rho * fmaxf(0.0f, qc + 0.15f * qr);
-    const float iwc = rho * fmaxf(0.0f, qi + 0.35f * qs);
-    float tau_tot = od_gas + od_sca_ray;
-    float sca_tot = od_sca_ray;
-    float g_sca_tot = 0.0f;
-
-    if (lwc > 1e-8f) {
-        const float re_l = fminf(50.0e-6f, fmaxf(3.0e-6f,
-            cbrtf(3.0f * lwc / (4.0f * PI_CONST_F * 1000.0f * 0.8f * fmaxf(n_drop_m3, 2e7f))) * 1.07f));
-        const float lwp = lwc * dz;
-        const float tau_l = 1.5f * lwp / (1000.0f * re_l) * (1.0f + 1.1e-6f / re_l);
-        const float ssa_l = (band == 0) ? 0.9999f : fminf(0.998f, fmaxf(0.955f, 0.993f - 120.0f * re_l));
-        const float g_l = (band == 0) ? 0.855f : 0.820f;
-        od_cld += tau_l;
-        ssa_cld = ssa_l;
-        g_cld = g_l;
-        tau_tot += tau_l;
-        sca_tot += tau_l * ssa_l;
-        g_sca_tot += tau_l * ssa_l * g_l;
+    for (int i = 0; i < 3; ++i) {
+        for (int j = 0; j < 3; ++j) {
+            u_mat[i][j] = (f_lo[j] > 1e-7f) ? (om[i][j] / f_lo[j]) : 0.0f;
+            v_mat[j][i] = (f_up[i] > 1e-7f) ? (om[i][j] / f_up[i]) : 0.0f;
+        }
     }
-    if (iwc > 1e-8f) {
-        const float re_um = fminf(100.0f, fmaxf(8.0f, 28.0f + 18.0f * powf(iwc * 1000.0f, 0.25f)));
-        const float iwp = iwc * dz;
-        const float tau_i = iwp * fmaxf(0.002f, -0.0003f + 2.52f / re_um) * 1000.0f;
-        const float ssa_i = (band == 0) ? 0.9995f : fminf(0.995f, fmaxf(0.94f, 0.990f - 0.0004f * re_um));
-        const float g_i = fminf(0.88f, fmaxf(0.75f, 0.77f + 0.0005f * re_um));
-        tau_tot += tau_i;
-        sca_tot += tau_i * ssa_i;
-        g_sca_tot += tau_i * ssa_i * g_i;
-    }
-    (void)od_cld; (void)ssa_cld; (void)g_cld;
+}
 
+__device__ inline void eval_radiation_moist(
+    const NhGridConfig& cfg, size_t idx,
+    const float* qv, const float* qc, const float* qr, const float* qi, const float* qs,
+    float& qv_v, float& qc_v, float& qr_v, float& qi_v, float& qs_v
+) {
+    qv_v = (cfg.has_moist && qv) ? fmaxf(0.0f, qv[idx]) : 0.0f;
+    qc_v = (cfg.has_moist && qc) ? fmaxf(0.0f, qc[idx]) : 0.0f;
+    qr_v = (cfg.has_moist && qr) ? fmaxf(0.0f, qr[idx]) : 0.0f;
+    qi_v = (cfg.has_moist && qi) ? fmaxf(0.0f, qi[idx]) : 0.0f;
+    qs_v = (cfg.has_moist && qs) ? fmaxf(0.0f, qs[idx]) : 0.0f;
+}
+
+__device__ inline void sw_two_stream_solve(
+    float tau_tot, float sca_tot, float g_sca_tot, float mu0,
+    float& r_diff, float& t_diff, float& r_dir, float& t_dir_diff, float& t_dir_dir
+) {
     if (tau_tot < 1e-9f) {
         r_diff = 0.0f; t_diff = 1.0f; r_dir = 0.0f; t_dir_diff = 0.0f; t_dir_dir = 1.0f;
         return;
@@ -272,6 +300,103 @@ __device__ inline void sw_layer_optics(
     t_dir_diff = fminf(mu0_loc - r_dir, fmaxf(0.0f, t_dir_diff));
 }
 
+__device__ inline void sw_layer_region_optics(
+    int band, float p_pa, float t_k, float z_agl, float dz, float rho, float lsm_v,
+    float qv, float qc_rad, float qr, float qi_rad, float qs, float cf,
+    float n_drop_m3, float co2_ppm, float mu0,
+    float r_diff[3], float t_diff[3], float r_dir[3], float t_dir_diff[3], float t_dir_dir[3]
+) {
+    const float dp = rho * GRAVITY_F * dz;
+    const float dm_air = dp / GRAVITY_F;
+    const float dm_wv = fmaxf(0.0f, qv) * dm_air;
+    const float p_scale = powf(fminf(fmaxf(p_pa / P0_PA_F, 1e-4f), 1.2f), 0.85f) * sqrtf(273.15f / fmaxf(t_k, 150.0f));
+    const float dm_wv_p = dm_wv * p_scale;
+
+    // Climatological boundary-layer aerosol integral over H_aer = 2000 m
+    const float z_bot = fmaxf(0.0f, z_agl - 0.5f * dz);
+    const float aer_frac = fmaxf(0.0f, expf(-z_bot / 2000.0f) - expf(-(z_bot + dz) / 2000.0f));
+    const float aod550 = (lsm_v >= 0.5f) ? 0.10f : 0.06f;
+    const float ssa_aer = (lsm_v >= 0.5f) ? 0.92f : 0.97f;
+    const float g_aer = (lsm_v >= 0.5f) ? 0.70f : 0.75f;
+
+    float od_gas = 0.0f, od_sca_ray = 0.0f, od_aer = 0.0f;
+    if (band == 0) {
+        od_sca_ray = 0.145f * (dp / 101325.0f);
+        const float ln_p = logf(fmaxf(p_pa, 50.0f) / 3000.0f);
+        const float o3_prof = expf(-0.5f * ln_p * ln_p / (1.1f * 1.1f));
+        od_gas = 0.015f * (dp / 101325.0f) + 0.032f * o3_prof * (dp / 8000.0f);
+        od_aer = aod550 * aer_frac;
+    } else if (band == 1) {
+        od_sca_ray = 0.015f * (dp / 101325.0f);
+        od_gas = 0.0022f * dm_wv_p + 0.012f * (co2_ppm / 425.0f) * (dp / 101325.0f) * p_scale;
+        od_aer = 0.50f * aod550 * aer_frac;
+    } else {
+        od_sca_ray = 0.003f * (dp / 101325.0f);
+        od_gas = 0.105f * dm_wv_p + 0.045f * (co2_ppm / 425.0f) * (dp / 101325.0f) * p_scale;
+        od_aer = 0.25f * aod550 * aer_frac;
+    }
+
+    const float tau_clr = od_gas + od_sca_ray + od_aer;
+    const float sca_clr = od_sca_ray + od_aer * ssa_aer;
+    const float g_sca_clr = od_aer * ssa_aer * g_aer;
+    sw_two_stream_solve(tau_clr, sca_clr, g_sca_clr, mu0,
+                        r_diff[0], t_diff[0], r_dir[0], t_dir_diff[0], t_dir_dir[0]);
+
+    if (cf <= 0.0f) {
+        r_diff[1] = 0.0f; t_diff[1] = 1.0f; r_dir[1] = 0.0f; t_dir_diff[1] = 0.0f; t_dir_dir[1] = 1.0f;
+        r_diff[2] = 0.0f; t_diff[2] = 1.0f; r_dir[2] = 0.0f; t_dir_diff[2] = 0.0f; t_dir_dir[2] = 1.0f;
+        return;
+    }
+
+    // In-cloud condensate + direct precipitation geometric cross-sections (Gamma Tripleclouds FSD=0.75)
+    const float inv_cf = 1.0f / fmaxf(cf, 0.02f);
+    const float lwc_ic = rho * fmaxf(0.0f, qc_rad) * inv_cf;
+    const float iwc_ic = rho * fmaxf(0.0f, qi_rad) * inv_cf;
+    const float tau_rain = 3.7f * rho * fmaxf(0.0f, qr) * dz * inv_cf;
+    const float tau_snow = 8.0f * rho * fmaxf(0.0f, qs) * dz * inv_cf;
+    const float ssa_rain = (band == 0) ? 0.999f : 0.96f;
+    const float ssa_snow = (band == 0) ? 0.999f : 0.95f;
+    float tau_cld = tau_rain + tau_snow;
+    float sca_cld = tau_rain * ssa_rain + tau_snow * ssa_snow;
+    float g_sca_cld = tau_rain * ssa_rain * 0.85f + tau_snow * ssa_snow * 0.82f;
+
+    if (lwc_ic > 1e-8f) {
+        const float re_l = fminf(50.0e-6f, fmaxf(4.0e-6f,
+            cbrtf(3.0f * lwc_ic / (4.0f * PI_CONST_F * 1000.0f * 0.8f * fmaxf(n_drop_m3, 2e7f))) * 1.07f));
+        const float tau_l = 1.5f * (lwc_ic * dz) / (1000.0f * re_l) * (1.0f + 1.1e-6f / re_l);
+        const float ssa_l = (band == 0) ? 0.9999f :
+                            ((band == 1) ? fminf(0.999f, fmaxf(0.975f, 0.997f - 60.0f * re_l))
+                                         : fminf(0.992f, fmaxf(0.920f, 0.985f - 180.0f * re_l)));
+        const float g_l = (band == 0) ? 0.855f : 0.820f;
+        tau_cld += tau_l;
+        sca_cld += tau_l * ssa_l;
+        g_sca_cld += tau_l * ssa_l * g_l;
+    }
+    if (iwc_ic > 1e-8f) {
+        const float re_um = fminf(100.0f, fmaxf(12.0f, 28.0f + 18.0f * powf(iwc_ic * 1000.0f, 0.25f)));
+        const float tau_i = (iwc_ic * dz) * fmaxf(0.002f, -0.0003f + 2.52f / re_um) * 1000.0f;
+        const float ssa_i = (band == 0) ? 0.9995f : ((band == 1) ? 0.992f : 0.940f);
+        const float g_i = fminf(0.88f, fmaxf(0.75f, 0.77f + 0.0005f * re_um));
+        tau_cld += tau_i;
+        sca_cld += tau_i * ssa_i;
+        g_sca_cld += tau_i * ssa_i * g_i;
+    }
+
+    const float s_thin = 0.025f + 0.975f * expf(-0.75f * (1.0f + 0.375f * 1.375f));
+    const float s_thick = 2.0f - s_thin;
+    const float sc_od[2] = {s_thin, s_thick};
+    for (int r = 0; r < 2; ++r) {
+        const float sc = sc_od[r];
+        sw_two_stream_solve(
+            tau_clr + tau_cld * sc,
+            sca_clr + sca_cld * sc,
+            g_sca_clr + g_sca_cld * sc,
+            mu0,
+            r_diff[r + 1], t_diff[r + 1], r_dir[r + 1], t_dir_diff[r + 1], t_dir_dir[r + 1]
+        );
+    }
+}
+
 __device__ inline float cy46_cdnc_m3(float p_pa, int32_t k) {
     // Gleeson et al. (2024) HARMONIE-AROME Cy46 Sec. 2.5.1: uniform land/sea linear profile, 0.25x at lowest level
     float n = 250.0e6f * fminf(1.2f, fmaxf(0.05f, p_pa / 100000.0f));
@@ -300,61 +425,10 @@ __device__ inline float nielsen_lw_kabs_si(int band, float re_um) {
     return fminf(200.0f, fmaxf(12.0f, (n_m2g / 1.66f) * 1000.0f));
 }
 
-__device__ inline void lw_layer_optics(
-    int band, float p_pa, float t_k, float t_bot, float t_top, float dz, float rho,
-    float qv, float qc, float qr, float qi, float qs,
-    float n_drop_m3, float co2_ppm, int use_cy46_lw,
+__device__ inline void lw_two_stream_solve(
+    float od_abs, float od_sca, float g_sca, float p_top, float p_bot,
     float& ref, float& trans, float& src_up, float& src_dn
 ) {
-    const float dp = rho * GRAVITY_F * dz;
-    const float dm_air = dp / GRAVITY_F;
-    const float dm_wv = fmaxf(0.0f, qv) * dm_air;
-    const float p_scale = powf(fminf(fmaxf(p_pa / P0_PA_F, 1e-4f), 1.2f), 0.80f) * sqrtf(273.15f / fmaxf(t_k, 150.0f));
-    const float dm_wv_p = dm_wv * p_scale;
-    const float e_vap = fmaxf(0.0f, p_pa * qv / (EPS_MW_F + (1.0f - EPS_MW_F) * qv));
-
-    float od_abs = 0.0f, od_sca = 0.0f, g_sca = 0.0f;
-    if (band == 0) {
-        od_abs = 0.42f * dm_wv_p + 0.015f * dm_wv * (e_vap / 1000.0f + 0.25f);
-    } else if (band == 1) {
-        od_abs = 0.00085f * (co2_ppm / 425.0f) * dm_air * powf(fmaxf(p_pa / P0_PA_F, 1e-4f), 0.70f)
-               + 0.035f * dm_wv_p;
-    } else {
-        od_abs = 0.0065f * dm_wv * (e_vap / 1000.0f + 0.25f)
-               + 0.000015f * (co2_ppm / 425.0f) * dm_air * p_scale;
-    }
-
-    const float lwc = rho * fmaxf(0.0f, qc + 0.25f * qr);
-    const float iwc = rho * fmaxf(0.0f, qi + 0.40f * qs);
-    if (lwc > 1e-8f) {
-        const float lwp = lwc * dz;
-        const float re_um = fminf(40.0f, fmaxf(4.0f,
-            1e6f * cbrtf(3.0f * lwc / (4.0f * PI_CONST_F * 1000.0f * 0.8f * fmaxf(n_drop_m3, 2e7f))) * 1.07f));
-        const float ssa_l = (band == 2) ? 0.30f : 0.18f;
-        float od_abs_l, od_sca_l;
-        if (use_cy46_lw != 0) {
-            const float k_abs_si = nielsen_lw_kabs_si(band, re_um);
-            od_abs_l = lwp * k_abs_si;
-            od_sca_l = od_abs_l * (ssa_l / (1.0f - ssa_l));
-        } else {
-            const float od_l = lwp * (90.0f + 280.0f / re_um);
-            od_abs_l = od_l * (1.0f - ssa_l);
-            od_sca_l = od_l * ssa_l;
-        }
-        od_abs += od_abs_l;
-        od_sca += od_sca_l;
-        g_sca += od_sca_l * 0.72f;
-    }
-    if (iwc > 1e-8f) {
-        const float iwp = iwc * dz;
-        const float re_um = fminf(100.0f, fmaxf(8.0f, 28.0f + 18.0f * powf(iwc * 1000.0f, 0.25f)));
-        const float od_i = iwp * (10.0f + 1850.0f / re_um);
-        const float ssa_i = 0.22f;
-        od_abs += od_i * (1.0f - ssa_i);
-        od_sca += od_i * ssa_i;
-        g_sca += od_i * ssa_i * 0.76f;
-    }
-
     const float od = od_abs + od_sca;
     const float ssa = (od > 1e-12f) ? fminf(0.99f, od_sca / od) : 0.0f;
     const float asym = (od_sca > 1e-12f) ? fminf(0.95f, g_sca / od_sca) : 0.0f;
@@ -364,9 +438,6 @@ __device__ inline void lw_layer_optics(
     const float g1 = D_LW * (1.0f - 0.5f * ssa * (1.0f + asym));
     const float g2 = D_LW * 0.5f * ssa * (1.0f - asym);
     const float k_exp = sqrtf(fmaxf((g1 - g2) * (g1 + g2), 1e-12f));
-
-    const float p_top = lw_band_planck_flux(band, t_top);
-    const float p_bot = lw_band_planck_flux(band, t_bot);
 
     if (od > 1.0e-3f) {
         const float exp1 = expf(-fminf(50.0f, k_exp * od));
@@ -391,6 +462,96 @@ __device__ inline void lw_layer_optics(
     }
 }
 
+__device__ inline void lw_layer_region_optics(
+    int band, float p_pa, float t_k, float t_bot, float t_top, float dz, float rho,
+    float qv, float qc_rad, float qr, float qi_rad, float qs, float cf,
+    float n_drop_m3, float co2_ppm, int use_cy46_lw,
+    float ref[3], float trans[3], float src_up[3], float src_dn[3]
+) {
+    const float dp = rho * GRAVITY_F * dz;
+    const float dm_air = dp / GRAVITY_F;
+    const float dm_wv = fmaxf(0.0f, qv) * dm_air;
+    const float p_scale = powf(fminf(fmaxf(p_pa / P0_PA_F, 1e-4f), 1.2f), 0.80f) * sqrtf(273.15f / fmaxf(t_k, 150.0f));
+    const float dm_wv_p = dm_wv * p_scale;
+    const float e_vap = fmaxf(0.0f, p_pa * qv / (EPS_MW_F + (1.0f - EPS_MW_F) * qv));
+
+    float od_gas = 0.0f;
+    if (band == 0) {
+        od_gas = 0.42f * dm_wv_p + 0.015f * dm_wv * (e_vap / 1000.0f + 0.25f);
+    } else if (band == 1) {
+        od_gas = 0.00085f * (co2_ppm / 425.0f) * dm_air * powf(fmaxf(p_pa / P0_PA_F, 1e-4f), 0.70f)
+               + 0.035f * dm_wv_p;
+    } else {
+        od_gas = 0.0065f * dm_wv * (e_vap / 1000.0f + 0.25f)
+               + 0.000015f * (co2_ppm / 425.0f) * dm_air * p_scale;
+    }
+
+    const float p_top = lw_band_planck_flux(band, t_top);
+    const float p_bot = lw_band_planck_flux(band, t_bot);
+    const float reg_frac[3] = {1.0f - cf, 0.5f * cf, 0.5f * cf};
+
+    float su0, sd0;
+    lw_two_stream_solve(od_gas, 0.0f, 0.0f, p_top, p_bot, ref[0], trans[0], su0, sd0);
+    src_up[0] = reg_frac[0] * su0;
+    src_dn[0] = reg_frac[0] * sd0;
+
+    if (cf <= 0.0f) {
+        ref[1] = 0.0f; trans[1] = 1.0f; src_up[1] = 0.0f; src_dn[1] = 0.0f;
+        ref[2] = 0.0f; trans[2] = 1.0f; src_up[2] = 0.0f; src_dn[2] = 0.0f;
+        return;
+    }
+
+    const float inv_cf = 1.0f / fmaxf(cf, 0.02f);
+    const float lwc_ic = rho * fmaxf(0.0f, qc_rad) * inv_cf;
+    const float iwc_ic = rho * fmaxf(0.0f, qi_rad) * inv_cf;
+    float oa_cld = (3.5f * rho * fmaxf(0.0f, qr) + 7.5f * rho * fmaxf(0.0f, qs)) * dz * inv_cf;
+    float os_cld = 0.0f;
+    float gs_cld = 0.0f;
+
+    if (lwc_ic > 1e-8f) {
+        const float lwp = lwc_ic * dz;
+        const float re_um = fminf(40.0f, fmaxf(4.0f,
+            1e6f * cbrtf(3.0f * lwc_ic / (4.0f * PI_CONST_F * 1000.0f * 0.8f * fmaxf(n_drop_m3, 2e7f))) * 1.07f));
+        const float ssa_l = (band == 2) ? 0.30f : 0.18f;
+        float od_abs_l, od_sca_l;
+        if (use_cy46_lw != 0) {
+            const float k_abs_si = nielsen_lw_kabs_si(band, re_um);
+            od_abs_l = lwp * k_abs_si;
+            od_sca_l = od_abs_l * (ssa_l / (1.0f - ssa_l));
+        } else {
+            const float od_l = lwp * (90.0f + 280.0f / re_um);
+            od_abs_l = od_l * (1.0f - ssa_l);
+            od_sca_l = od_l * ssa_l;
+        }
+        oa_cld += od_abs_l;
+        os_cld += od_sca_l;
+        gs_cld += od_sca_l * 0.72f;
+    }
+    if (iwc_ic > 1e-8f) {
+        const float iwp = iwc_ic * dz;
+        const float re_um = fminf(100.0f, fmaxf(12.0f, 28.0f + 18.0f * powf(iwc_ic * 1000.0f, 0.25f)));
+        const float od_i = iwp * (10.0f + 1850.0f / re_um);
+        const float ssa_i = 0.22f;
+        oa_cld += od_i * (1.0f - ssa_i);
+        os_cld += od_i * ssa_i;
+        gs_cld += od_i * ssa_i * 0.76f;
+    }
+
+    const float s_thin = 0.025f + 0.975f * expf(-0.75f * (1.0f + 0.375f * 1.375f));
+    const float s_thick = 2.0f - s_thin;
+    const float sc_od[2] = {s_thin, s_thick};
+    for (int r = 0; r < 2; ++r) {
+        const float sc = sc_od[r];
+        float sur, sdr;
+        lw_two_stream_solve(
+            od_gas + oa_cld * sc, os_cld * sc, gs_cld * sc, p_top, p_bot,
+            ref[r + 1], trans[r + 1], sur, sdr
+        );
+        src_up[r + 1] = reg_frac[r + 1] * sur;
+        src_dn[r + 1] = reg_frac[r + 1] * sdr;
+    }
+}
+
 __global__ void nh_radiation_ecrad_kernel(
     NhGridConfig cfg,
     NhPhysicsConfig pcfg,
@@ -402,7 +563,8 @@ __global__ void nh_radiation_ecrad_kernel(
     const float* t_skin,
     const float* sea_ice_frac, const float* sea_ice_tsfc, const float* sea_ice_albedo,
     float* rad_dth_dt, float* sw_down_out, float* lw_down_out,
-    float* scratch_f, double* tri_c, double* tri_d
+    float* rad_a0, float* rad_a1, float* rad_a2,
+    float* rad_b0, float* rad_b1, float* rad_b2
 ) {
     const int32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     const int32_t j = blockIdx.y * blockDim.y + threadIdx.y;
@@ -427,6 +589,7 @@ __global__ void nh_radiation_ecrad_kernel(
     const float n_drop = static_cast<float>((lsm_v >= 0.5f) ? pcfg.cloud_num_land : pcfg.cloud_num_sea);
     const float co2_ppm = static_cast<float>(pcfg.co2_ppm);
     const int use_cy46 = (pcfg.cy46_physics != 0) ? 1 : 0;
+    const int enable_subgrid_rh = (pcfg.enable_microphysics != 0 && cfg.has_moist) ? 1 : 0;
 
     float alb_sfc = alb0;
     if (lsm_v >= 0.5f && snow_v > 0.0f) {
@@ -468,186 +631,321 @@ __global__ void nh_radiation_ecrad_kernel(
     const float s0_toa = 1361.0f * (1.000110f + 0.034221f * cosf(gamma) + 0.001280f * sinf(gamma)
                                   + 0.000719f * cosf(2.0f * gamma) + 0.000077f * sinf(2.0f * gamma));
 
+    // -----------------------------------------------------------------------
+    // 1. Shortwave 3-Band Tripleclouds Adding Method
+    // -----------------------------------------------------------------------
     float sw_dn_sfc = 0.0f;
     if (mu0 > 0.01f) {
-        const float sw_frac[2] = {0.46f, 0.54f};
-        for (int b = 0; b < 2; ++b) {
+        const float sw_frac[3] = {0.46f, 0.37f, 0.17f};
+        for (int b = 0; b < 3; ++b) {
             const float s0_b = s0_toa * sw_frac[b];
-            float f_dir = s0_b;
-            for (int32_t k = nz - 1; k >= 0; --k) {
-                const size_t idx = static_cast<size_t>(k) * str3 + col;
-                float z_s, dz_k, thb, pib, th_t, pi_t, t_k, p_k, rho;
-                eval_cell_thermo(cfg, g, k, col, hs, pi_sfc_f, thp, pip, qv, qc, qr, qi, qs, qg,
-                                 z_s, dz_k, thb, pib, th_t, pi_t, t_k, p_k, rho);
-                const float qv_v = (cfg.has_moist && qv) ? fmaxf(0.0f, qv[idx]) : 0.0f;
-                const float qc_v = (cfg.has_moist && qc) ? fmaxf(0.0f, qc[idx]) : 0.0f;
-                const float qr_v = (cfg.has_moist && qr) ? fmaxf(0.0f, qr[idx]) : 0.0f;
-                const float qi_v = (cfg.has_moist && qi) ? fmaxf(0.0f, qi[idx]) : 0.0f;
-                const float qs_v = (cfg.has_moist && qs) ? fmaxf(0.0f, qs[idx]) : 0.0f;
+            rad_a0[col] = alb_sfc;
+            rad_a1[col] = alb_sfc;
+            rad_a2[col] = alb_sfc;
+            rad_b0[col] = alb_sfc * mu0;
+            rad_b1[col] = alb_sfc * mu0;
+            rad_b2[col] = alb_sfc * mu0;
 
-                scratch_f[idx] = f_dir;
-                const float n_drop_k = use_cy46 ? cy46_cdnc_m3(p_k, k) : n_drop;
-                float r_d, t_d, r_dir, t_dd, t_dir;
-                sw_layer_optics(b, p_k, t_k, dz_k, rho, qv_v, qc_v, qr_v, qi_v, qs_v,
-                                n_drop_k, co2_ppm, mu0, r_d, t_d, r_dir, t_dd, t_dir);
-                f_dir *= t_dir;
-            }
-            const float f_dir_sfc = f_dir;
+            float z_c, dz_c, thb_c, pib_c, th_c, pi_c, t_c, p_c, rho_c;
+            eval_cell_thermo(cfg, g, 0, col, hs, pi_sfc_f, thp, pip, qv, qc, qr, qi, qs, qg,
+                             z_c, dz_c, thb_c, pib_c, th_c, pi_c, t_c, p_c, rho_c);
+            float qv_c, qc_c, qr_c, qi_c, qs_c, cf_c, qc_rc, qi_rc;
+            eval_radiation_moist(cfg, col, qv, qc, qr, qi, qs, qv_c, qc_c, qr_c, qi_c, qs_c);
+            eval_layer_cloud_subgrid(p_c, t_c, dz_c, rho_c, qv_c, qc_c, qi_c, qs_c, enable_subgrid_rh,
+                                     cf_c, qc_rc, qi_rc);
 
-            // Bottom-up Adding pass (k = 0..nz-1)
-            tri_c[col] = static_cast<double>(alb_sfc);
-            tri_d[col] = static_cast<double>(alb_sfc * f_dir_sfc * mu0);
             for (int32_t k = 0; k < nz; ++k) {
-                const size_t idx = static_cast<size_t>(k) * str3 + col;
-                float z_s, dz_k, thb, pib, th_t, pi_t, t_k, p_k, rho;
-                eval_cell_thermo(cfg, g, k, col, hs, pi_sfc_f, thp, pip, qv, qc, qr, qi, qs, qg,
-                                 z_s, dz_k, thb, pib, th_t, pi_t, t_k, p_k, rho);
-                const float qv_v = (cfg.has_moist && qv) ? fmaxf(0.0f, qv[idx]) : 0.0f;
-                const float qc_v = (cfg.has_moist && qc) ? fmaxf(0.0f, qc[idx]) : 0.0f;
-                const float qr_v = (cfg.has_moist && qr) ? fmaxf(0.0f, qr[idx]) : 0.0f;
-                const float qi_v = (cfg.has_moist && qi) ? fmaxf(0.0f, qi[idx]) : 0.0f;
-                const float qs_v = (cfg.has_moist && qs) ? fmaxf(0.0f, qs[idx]) : 0.0f;
+                const size_t idx_bot = static_cast<size_t>(k) * str3 + col;
+                const size_t idx_top = static_cast<size_t>(k + 1) * str3 + col;
 
-                const float n_drop_k = use_cy46 ? cy46_cdnc_m3(p_k, k) : n_drop;
-                float r_d, t_d, r_dir, t_dd, t_dir;
-                sw_layer_optics(b, p_k, t_k, dz_k, rho, qv_v, qc_v, qr_v, qi_v, qs_v,
-                                n_drop_k, co2_ppm, mu0, r_d, t_d, r_dir, t_dd, t_dir);
-                const float f_dir_in = scratch_f[idx];
-                const float r_b = static_cast<float>(tri_c[static_cast<size_t>(k) * str3 + col]);
-                const float s_b = static_cast<float>(tri_d[static_cast<size_t>(k) * str3 + col]);
-                const float inv = 1.0f / fmaxf(1.0f - r_b * r_d, 1e-7f);
-                tri_c[static_cast<size_t>(k + 1) * str3 + col] = static_cast<double>(r_d + t_d * t_d * r_b * inv);
-                tri_d[static_cast<size_t>(k + 1) * str3 + col] =
-                    static_cast<double>(r_dir * f_dir_in + t_d * (s_b + r_b * t_dd * f_dir_in) * inv);
+                float r_d[3], t_d[3], r_dir[3], t_dd[3], t_dir[3];
+                sw_layer_region_optics(
+                    b, p_c, t_c, fmaxf(0.0f, z_c - hs), dz_c, rho_c, lsm_v,
+                    qv_c, qc_rc, qr_c, qi_rc, qs_c, cf_c,
+                    use_cy46 ? cy46_cdnc_m3(p_c, k) : n_drop, co2_ppm, mu0,
+                    r_d, t_d, r_dir, t_dd, t_dir
+                );
+
+                float a_bel[3] = {0.0f, 0.0f, 0.0f};
+                float ad_bel[3] = {0.0f, 0.0f, 0.0f};
+                const float a_in[3] = {rad_a0[idx_bot], rad_a1[idx_bot], rad_a2[idx_bot]};
+                const float ad_in[3] = {rad_b0[idx_bot], rad_b1[idx_bot], rad_b2[idx_bot]};
+                const int nr = (cf_c > 0.0f) ? 3 : 1;
+                for (int r = 0; r < nr; ++r) {
+                    const float inv = 1.0f / fmaxf(1.0f - a_in[r] * r_d[r], 1e-7f);
+                    a_bel[r] = r_d[r] + t_d[r] * t_d[r] * a_in[r] * inv;
+                    ad_bel[r] = r_dir[r] + (t_dir[r] * ad_in[r] + t_dd[r] * a_in[r]) * t_d[r] * inv;
+                }
+
+                // Prepare next layer k+1 (or outer space clear sky when k+1 == nz)
+                float z_n = z_c, dz_n = dz_c, thbn = thb_c, pibn = pib_c, thn = th_c, pin = pi_c, t_n = t_c, pn = p_c, rhon = rho_c;
+                float qv_n = 0.0f, qc_n = 0.0f, qr_n = 0.0f, qi_n = 0.0f, qs_n = 0.0f, cf_n = 0.0f, qc_rn = 0.0f, qi_rn = 0.0f;
+                if (k + 1 < nz) {
+                    eval_cell_thermo(cfg, g, k + 1, col, hs, pi_sfc_f, thp, pip, qv, qc, qr, qi, qs, qg,
+                                     z_n, dz_n, thbn, pibn, thn, pin, t_n, pn, rhon);
+                    eval_radiation_moist(cfg, idx_top, qv, qc, qr, qi, qs, qv_n, qc_n, qr_n, qi_n, qs_n);
+                    eval_layer_cloud_subgrid(pn, t_n, dz_n, rhon, qv_n, qc_n, qi_n, qs_n, enable_subgrid_rh,
+                                             cf_n, qc_rn, qi_rn);
+                }
+
+                if (cf_c <= 0.0f && cf_n <= 0.0f) {
+                    rad_a0[idx_top] = a_bel[0]; rad_a1[idx_top] = 0.0f; rad_a2[idx_top] = 0.0f;
+                    rad_b0[idx_top] = ad_bel[0]; rad_b1[idx_top] = 0.0f; rad_b2[idx_top] = 0.0f;
+                } else {
+                    const float f_lo[3] = {1.0f - cf_c, 0.5f * cf_c, 0.5f * cf_c};
+                    const float f_up[3] = {1.0f - cf_n, 0.5f * cf_n, 0.5f * cf_n};
+                    const float alpha = (k + 1 < nz) ? expf(-fmaxf(10.0f, z_n - z_c) / 2000.0f) : 1.0f;
+                    float u_mat[3][3], v_mat[3][3];
+                    calc_tripleclouds_overlap_uv(f_up, f_lo, alpha, alpha * alpha, u_mat, v_mat);
+                    (void)u_mat;
+                    float a_top[3] = {0.0f, 0.0f, 0.0f};
+                    float ad_top[3] = {0.0f, 0.0f, 0.0f};
+                    for (int r = 0; r < 3; ++r) {
+                        for (int r2 = 0; r2 < 3; ++r2) {
+                            a_top[r] += v_mat[r2][r] * a_bel[r2];
+                            ad_top[r] += v_mat[r2][r] * ad_bel[r2];
+                        }
+                    }
+                    rad_a0[idx_top] = a_top[0]; rad_a1[idx_top] = a_top[1]; rad_a2[idx_top] = a_top[2];
+                    rad_b0[idx_top] = ad_top[0]; rad_b1[idx_top] = ad_top[1]; rad_b2[idx_top] = ad_top[2];
+                }
+
+                if (k + 1 < nz) {
+                    z_c = z_n; dz_c = dz_n; thb_c = thbn; pib_c = pibn;
+                    th_c = thn; pi_c = pin; t_c = t_n; p_c = pn; rho_c = rhon;
+                    qv_c = qv_n; qc_c = qc_n; qr_c = qr_n; qi_c = qi_n; qs_c = qs_n;
+                    cf_c = cf_n; qc_rc = qc_rn; qi_rc = qi_rn;
+                }
             }
 
-            // Top-down diffuse sweep & radiative heating accumulation
-            float f_dn_diff = 0.0f;
-            float f_up_top = static_cast<float>(tri_d[static_cast<size_t>(nz) * str3 + col]);
-            float f_net_above = s0_b * mu0 - f_up_top;
+            // Pass 2 downward: z_c..cf_c still hold top layer k = nz-1
+            float f_dn[3] = {0.0f, 0.0f, 0.0f};
+            float f_dir[3] = {s0_b * (1.0f - cf_c), s0_b * 0.5f * cf_c, s0_b * 0.5f * cf_c};
+            float f_net_above = s0_b * (mu0 - rad_b0[static_cast<size_t>(nz) * str3 + col]);
 
             for (int32_t k = nz - 1; k >= 0; --k) {
-                const size_t idx = static_cast<size_t>(k) * str3 + col;
-                float z_s, dz_k, thb, pib, th_t, pi_t, t_k, p_k, rho;
-                eval_cell_thermo(cfg, g, k, col, hs, pi_sfc_f, thp, pip, qv, qc, qr, qi, qs, qg,
-                                 z_s, dz_k, thb, pib, th_t, pi_t, t_k, p_k, rho);
-                const float qv_v = (cfg.has_moist && qv) ? fmaxf(0.0f, qv[idx]) : 0.0f;
-                const float qc_v = (cfg.has_moist && qc) ? fmaxf(0.0f, qc[idx]) : 0.0f;
-                const float qr_v = (cfg.has_moist && qr) ? fmaxf(0.0f, qr[idx]) : 0.0f;
-                const float qi_v = (cfg.has_moist && qi) ? fmaxf(0.0f, qi[idx]) : 0.0f;
-                const float qs_v = (cfg.has_moist && qs) ? fmaxf(0.0f, qs[idx]) : 0.0f;
+                const size_t idx_bot = static_cast<size_t>(k) * str3 + col;
+                float r_d[3], t_d[3], r_dir[3], t_dd[3], t_dir[3];
+                sw_layer_region_optics(
+                    b, p_c, t_c, fmaxf(0.0f, z_c - hs), dz_c, rho_c, lsm_v,
+                    qv_c, qc_rc, qr_c, qi_rc, qs_c, cf_c,
+                    use_cy46 ? cy46_cdnc_m3(p_c, k) : n_drop, co2_ppm, mu0,
+                    r_d, t_d, r_dir, t_dd, t_dir
+                );
 
-                const float n_drop_k = use_cy46 ? cy46_cdnc_m3(p_k, k) : n_drop;
-                float r_d, t_d, r_dir, t_dd, t_dir;
-                sw_layer_optics(b, p_k, t_k, dz_k, rho, qv_v, qc_v, qr_v, qi_v, qs_v,
-                                n_drop_k, co2_ppm, mu0, r_d, t_d, r_dir, t_dd, t_dir);
-                const float f_dir_in = scratch_f[idx];
-                const float r_b = static_cast<float>(tri_c[idx]);
-                const float s_b = static_cast<float>(tri_d[idx]);
-                const float inv = 1.0f / fmaxf(1.0f - r_b * r_d, 1e-7f);
-                f_dn_diff = (t_d * f_dn_diff + r_d * s_b + t_dd * f_dir_in) * inv;
-                const float f_up_below = r_b * f_dn_diff + s_b;
-                const float f_dir_below = f_dir_in * t_dir;
-                const float f_net_below = f_dn_diff + f_dir_below * mu0 - f_up_below;
-                const float dth_dt = (f_net_above - f_net_below) / (rho * CP_D_F * dz_k * pi_t);
-                rad_dth_dt[idx] += dth_dt;
+                const float a_bot[3] = {rad_a0[idx_bot], rad_a1[idx_bot], rad_a2[idx_bot]};
+                const float ad_bot[3] = {rad_b0[idx_bot], rad_b1[idx_bot], rad_b2[idx_bot]};
+                const int nr = (cf_c > 0.0f) ? 3 : 1;
+                float f_net_below = 0.0f;
+                for (int r = 0; r < nr; ++r) {
+                    const float inv = 1.0f / fmaxf(1.0f - r_d[r] * a_bot[r], 1e-7f);
+                    f_dn[r] = (t_d[r] * f_dn[r] + f_dir[r] * (t_dir[r] * ad_bot[r] * r_d[r] + t_dd[r])) * inv;
+                    f_dir[r] = t_dir[r] * f_dir[r];
+                    const float f_up_r = f_dir[r] * ad_bot[r] + f_dn[r] * a_bot[r];
+                    f_net_below += (f_dn[r] + f_dir[r] * mu0 - f_up_r);
+                }
+                if (nr == 1) {
+                    f_dn[1] = 0.0f; f_dn[2] = 0.0f;
+                    f_dir[1] = 0.0f; f_dir[2] = 0.0f;
+                }
+
+                rad_dth_dt[idx_bot] += (f_net_above - f_net_below) / (rho_c * CP_D_F * dz_c * pi_c);
                 f_net_above = f_net_below;
+
+                if (k > 0) {
+                    const size_t idx_below = static_cast<size_t>(k - 1) * str3 + col;
+                    float z_p, dz_p, thbp, pibp, thp_v, pip_v, t_p, pp, rhop;
+                    float qv_p, qc_p, qr_p, qi_p, qs_p, cf_p, qc_rp, qi_rp;
+                    eval_cell_thermo(cfg, g, k - 1, col, hs, pi_sfc_f, thp, pip, qv, qc, qr, qi, qs, qg,
+                                     z_p, dz_p, thbp, pibp, thp_v, pip_v, t_p, pp, rhop);
+                    eval_radiation_moist(cfg, idx_below, qv, qc, qr, qi, qs, qv_p, qc_p, qr_p, qi_p, qs_p);
+                    eval_layer_cloud_subgrid(pp, t_p, dz_p, rhop, qv_p, qc_p, qi_p, qs_p, enable_subgrid_rh,
+                                             cf_p, qc_rp, qi_rp);
+
+                    if (cf_c > 0.0f || cf_p > 0.0f) {
+                        const float f_up[3] = {1.0f - cf_c, 0.5f * cf_c, 0.5f * cf_c};
+                        const float f_lo[3] = {1.0f - cf_p, 0.5f * cf_p, 0.5f * cf_p};
+                        const float alpha = expf(-fmaxf(10.0f, z_c - z_p) / 2000.0f);
+                        float u_mat[3][3], v_mat[3][3];
+                        calc_tripleclouds_overlap_uv(f_up, f_lo, alpha, alpha * alpha, u_mat, v_mat);
+                        (void)u_mat;
+                        float fn_n[3] = {0.0f, 0.0f, 0.0f};
+                        float fr_n[3] = {0.0f, 0.0f, 0.0f};
+                        for (int r = 0; r < 3; ++r) {
+                            for (int r2 = 0; r2 < 3; ++r2) {
+                                fn_n[r] += v_mat[r][r2] * f_dn[r2];
+                                fr_n[r] += v_mat[r][r2] * f_dir[r2];
+                            }
+                        }
+                        for (int r = 0; r < 3; ++r) { f_dn[r] = fn_n[r]; f_dir[r] = fr_n[r]; }
+                    }
+                    z_c = z_p; dz_c = dz_p; thb_c = thbp; pib_c = pibp;
+                    th_c = thp_v; pi_c = pip_v; t_c = t_p; p_c = pp; rho_c = rhop;
+                    qv_c = qv_p; qc_c = qc_p; qr_c = qr_p; qi_c = qi_p; qs_c = qs_p;
+                    cf_c = cf_p; qc_rc = qc_rp; qi_rc = qi_rp;
+                }
             }
-            sw_dn_sfc += f_dn_diff + f_dir_sfc * mu0;
+            sw_dn_sfc += (f_dn[0] + f_dn[1] + f_dn[2]) + (f_dir[0] + f_dir[1] + f_dir[2]) * mu0;
         }
     }
 
-    // Longwave 3-band Linear-Planck Adding Method (sliding column T cache avoids redundant thermo evals)
+    // -----------------------------------------------------------------------
+    // 2. Longwave 3-Band Linear-Planck Tripleclouds Adding Method
+    // -----------------------------------------------------------------------
     float lw_dn_sfc = 0.0f;
     for (int b = 0; b < 3; ++b) {
-        tri_c[col] = static_cast<double>(1.0f - emis_sfc);
-        tri_d[col] = static_cast<double>(emis_sfc * lw_band_planck_flux(b, t_rad_sk));
+        const float emis_flux_b = emis_sfc * lw_band_planck_flux(b, t_rad_sk);
 
-        float t_prev = t_rad_sk;
         float z_c, dz_c, thb_c, pib_c, th_c, pi_c, t_c, p_c, rho_c;
         eval_cell_thermo(cfg, g, 0, col, hs, pi_sfc_f, thp, pip, qv, qc, qr, qi, qs, qg,
                          z_c, dz_c, thb_c, pib_c, th_c, pi_c, t_c, p_c, rho_c);
+        float qv_c, qc_c, qr_c, qi_c, qs_c, cf_c, qc_rc, qi_rc;
+        eval_radiation_moist(cfg, col, qv, qc, qr, qi, qs, qv_c, qc_c, qr_c, qi_c, qs_c);
+        eval_layer_cloud_subgrid(p_c, t_c, dz_c, rho_c, qv_c, qc_c, qi_c, qs_c, enable_subgrid_rh,
+                                 cf_c, qc_rc, qi_rc);
 
+        rad_a0[col] = 1.0f - emis_sfc;
+        rad_a1[col] = 1.0f - emis_sfc;
+        rad_a2[col] = 1.0f - emis_sfc;
+        rad_b0[col] = (1.0f - cf_c) * emis_flux_b;
+        rad_b1[col] = (0.5f * cf_c) * emis_flux_b;
+        rad_b2[col] = (0.5f * cf_c) * emis_flux_b;
+
+        float t_prev = t_rad_sk;
         for (int32_t k = 0; k < nz; ++k) {
-            const size_t idx = static_cast<size_t>(k) * str3 + col;
-            float z_n, dz_n, thbn, pibn, thn, pin, t_nxt = t_c, pn, rhon;
+            const size_t idx_bot = static_cast<size_t>(k) * str3 + col;
+            const size_t idx_top = static_cast<size_t>(k + 1) * str3 + col;
+
+            float z_n = z_c, dz_n = dz_c, thbn = thb_c, pibn = pib_c, thn = th_c, pin = pi_c, t_n = t_c, pn = p_c, rhon = rho_c;
+            float qv_n = 0.0f, qc_n = 0.0f, qr_n = 0.0f, qi_n = 0.0f, qs_n = 0.0f, cf_n = 0.0f, qc_rn = 0.0f, qi_rn = 0.0f;
             if (k + 1 < nz) {
                 eval_cell_thermo(cfg, g, k + 1, col, hs, pi_sfc_f, thp, pip, qv, qc, qr, qi, qs, qg,
-                                 z_n, dz_n, thbn, pibn, thn, pin, t_nxt, pn, rhon);
+                                 z_n, dz_n, thbn, pibn, thn, pin, t_n, pn, rhon);
+                eval_radiation_moist(cfg, idx_top, qv, qc, qr, qi, qs, qv_n, qc_n, qr_n, qi_n, qs_n);
+                eval_layer_cloud_subgrid(pn, t_n, dz_n, rhon, qv_n, qc_n, qi_n, qs_n, enable_subgrid_rh,
+                                         cf_n, qc_rn, qi_rn);
             }
             const float t_bot_if = (k == 0) ? t_c : 0.5f * (t_prev + t_c);
-            const float t_top_if = (k + 1 == nz) ? t_c : 0.5f * (t_c + t_nxt);
+            const float t_top_if = (k + 1 == nz) ? t_c : 0.5f * (t_c + t_n);
             t_prev = t_c;
 
-            const float qv_v = (cfg.has_moist && qv) ? fmaxf(0.0f, qv[idx]) : 0.0f;
-            const float qc_v = (cfg.has_moist && qc) ? fmaxf(0.0f, qc[idx]) : 0.0f;
-            const float qr_v = (cfg.has_moist && qr) ? fmaxf(0.0f, qr[idx]) : 0.0f;
-            const float qi_v = (cfg.has_moist && qi) ? fmaxf(0.0f, qi[idx]) : 0.0f;
-            const float qs_v = (cfg.has_moist && qs) ? fmaxf(0.0f, qs[idx]) : 0.0f;
+            float r_d[3], t_d[3], su_d[3], sd_d[3];
+            lw_layer_region_optics(
+                b, p_c, t_c, t_bot_if, t_top_if, dz_c, rho_c,
+                qv_c, qc_rc, qr_c, qi_rc, qs_c, cf_c,
+                use_cy46 ? cy46_cdnc_m3(p_c, k) : n_drop, co2_ppm, use_cy46,
+                r_d, t_d, su_d, sd_d
+            );
 
-            const float n_drop_k = use_cy46 ? cy46_cdnc_m3(p_c, k) : n_drop;
-            float r_d, t_d, s_up_k, s_dn_k;
-            lw_layer_optics(b, p_c, t_c, t_bot_if, t_top_if, dz_c, rho_c,
-                            qv_v, qc_v, qr_v, qi_v, qs_v, n_drop_k, co2_ppm, use_cy46,
-                            r_d, t_d, s_up_k, s_dn_k);
+            float a_bel[3] = {0.0f, 0.0f, 0.0f};
+            float s_bel[3] = {0.0f, 0.0f, 0.0f};
+            const float a_in[3] = {rad_a0[idx_bot], rad_a1[idx_bot], rad_a2[idx_bot]};
+            const float s_in[3] = {rad_b0[idx_bot], rad_b1[idx_bot], rad_b2[idx_bot]};
+            const int nr = (cf_c > 0.0f) ? 3 : 1;
+            for (int r = 0; r < nr; ++r) {
+                const float inv = 1.0f / fmaxf(1.0f - a_in[r] * r_d[r], 1e-7f);
+                a_bel[r] = r_d[r] + t_d[r] * t_d[r] * a_in[r] * inv;
+                s_bel[r] = su_d[r] + t_d[r] * (s_in[r] + a_in[r] * sd_d[r]) * inv;
+            }
 
-            const float r_b = static_cast<float>(tri_c[idx]);
-            const float s_b = static_cast<float>(tri_d[idx]);
-            const float inv = 1.0f / fmaxf(1.0f - r_b * r_d, 1e-7f);
-            tri_c[static_cast<size_t>(k + 1) * str3 + col] = static_cast<double>(r_d + t_d * t_d * r_b * inv);
-            tri_d[static_cast<size_t>(k + 1) * str3 + col] = static_cast<double>(s_up_k + t_d * (s_b + r_b * s_dn_k) * inv);
+            if (cf_c <= 0.0f && cf_n <= 0.0f) {
+                rad_a0[idx_top] = a_bel[0]; rad_a1[idx_top] = 0.0f; rad_a2[idx_top] = 0.0f;
+                rad_b0[idx_top] = s_bel[0]; rad_b1[idx_top] = 0.0f; rad_b2[idx_top] = 0.0f;
+            } else {
+                const float f_lo[3] = {1.0f - cf_c, 0.5f * cf_c, 0.5f * cf_c};
+                const float f_up[3] = {1.0f - cf_n, 0.5f * cf_n, 0.5f * cf_n};
+                const float alpha = (k + 1 < nz) ? expf(-fmaxf(10.0f, z_n - z_c) / 2000.0f) : 1.0f;
+                float u_mat[3][3], v_mat[3][3];
+                calc_tripleclouds_overlap_uv(f_up, f_lo, alpha, alpha * alpha, u_mat, v_mat);
+                float a_top[3] = {0.0f, 0.0f, 0.0f};
+                float s_top[3] = {0.0f, 0.0f, 0.0f};
+                for (int r = 0; r < 3; ++r) {
+                    for (int r2 = 0; r2 < 3; ++r2) {
+                        a_top[r] += v_mat[r2][r] * a_bel[r2];
+                        s_top[r] += u_mat[r][r2] * s_bel[r2];
+                    }
+                }
+                rad_a0[idx_top] = a_top[0]; rad_a1[idx_top] = a_top[1]; rad_a2[idx_top] = a_top[2];
+                rad_b0[idx_top] = s_top[0]; rad_b1[idx_top] = s_top[1]; rad_b2[idx_top] = s_top[2];
+            }
 
             if (k + 1 < nz) {
                 z_c = z_n; dz_c = dz_n; thb_c = thbn; pib_c = pibn;
-                th_c = thn; pi_c = pin; t_c = t_nxt; p_c = pn; rho_c = rhon;
+                th_c = thn; pi_c = pin; t_c = t_n; p_c = pn; rho_c = rhon;
+                qv_c = qv_n; qc_c = qc_n; qr_c = qr_n; qi_c = qi_n; qs_c = qs_n;
+                cf_c = cf_n; qc_rc = qc_rn; qi_rc = qi_rn;
             }
         }
 
-        float f_dn = 0.0f; // TOA downward LW = 0
-        float f_up_top = static_cast<float>(tri_d[static_cast<size_t>(nz) * str3 + col]);
-        float f_net_above = f_dn - f_up_top;
-
-        // Pass 2 downward: t_c starts at nz-1 (already held in registers!), t_above holds k+1, compute k-1 once per k
+        // Pass 2 downward: t_c..cf_c still hold top layer k = nz-1
+        float f_dn[3] = {0.0f, 0.0f, 0.0f};
+        float f_net_above = -rad_b0[static_cast<size_t>(nz) * str3 + col];
         float t_above = t_c;
+
         for (int32_t k = nz - 1; k >= 0; --k) {
-            const size_t idx = static_cast<size_t>(k) * str3 + col;
-            float z_p, dz_p, thbp, pibp, thp_v, pip_v, t_below = t_c, pp, rhop;
+            const size_t idx_bot = static_cast<size_t>(k) * str3 + col;
+            float z_p = z_c, dz_p = dz_c, thbp = thb_c, pibp = pib_c, thp_v = th_c, pip_v = pi_c, t_p = t_c, pp = p_c, rhop = rho_c;
+            float qv_p = 0.0f, qc_p = 0.0f, qr_p = 0.0f, qi_p = 0.0f, qs_p = 0.0f, cf_p = 0.0f, qc_rp = 0.0f, qi_rp = 0.0f;
             if (k > 0) {
+                const size_t idx_below = static_cast<size_t>(k - 1) * str3 + col;
                 eval_cell_thermo(cfg, g, k - 1, col, hs, pi_sfc_f, thp, pip, qv, qc, qr, qi, qs, qg,
-                                 z_p, dz_p, thbp, pibp, thp_v, pip_v, t_below, pp, rhop);
+                                 z_p, dz_p, thbp, pibp, thp_v, pip_v, t_p, pp, rhop);
+                eval_radiation_moist(cfg, idx_below, qv, qc, qr, qi, qs, qv_p, qc_p, qr_p, qi_p, qs_p);
+                eval_layer_cloud_subgrid(pp, t_p, dz_p, rhop, qv_p, qc_p, qi_p, qs_p, enable_subgrid_rh,
+                                         cf_p, qc_rp, qi_rp);
             }
-            const float t_bot_if = (k > 0) ? 0.5f * (t_below + t_c) : t_c;
+            const float t_bot_if = (k > 0) ? 0.5f * (t_p + t_c) : t_c;
             const float t_top_if = (k + 1 < nz) ? 0.5f * (t_c + t_above) : t_c;
 
-            const float qv_v = (cfg.has_moist && qv) ? fmaxf(0.0f, qv[idx]) : 0.0f;
-            const float qc_v = (cfg.has_moist && qc) ? fmaxf(0.0f, qc[idx]) : 0.0f;
-            const float qr_v = (cfg.has_moist && qr) ? fmaxf(0.0f, qr[idx]) : 0.0f;
-            const float qi_v = (cfg.has_moist && qi) ? fmaxf(0.0f, qi[idx]) : 0.0f;
-            const float qs_v = (cfg.has_moist && qs) ? fmaxf(0.0f, qs[idx]) : 0.0f;
+            float r_d[3], t_d[3], su_d[3], sd_d[3];
+            lw_layer_region_optics(
+                b, p_c, t_c, t_bot_if, t_top_if, dz_c, rho_c,
+                qv_c, qc_rc, qr_c, qi_rc, qs_c, cf_c,
+                use_cy46 ? cy46_cdnc_m3(p_c, k) : n_drop, co2_ppm, use_cy46,
+                r_d, t_d, su_d, sd_d
+            );
 
-            const float n_drop_k = use_cy46 ? cy46_cdnc_m3(p_c, k) : n_drop;
-            float r_d, t_d, s_up_k, s_dn_k;
-            lw_layer_optics(b, p_c, t_c, t_bot_if, t_top_if, dz_c, rho_c,
-                            qv_v, qc_v, qr_v, qi_v, qs_v, n_drop_k, co2_ppm, use_cy46,
-                            r_d, t_d, s_up_k, s_dn_k);
+            const float a_bot[3] = {rad_a0[idx_bot], rad_a1[idx_bot], rad_a2[idx_bot]};
+            const float s_bot[3] = {rad_b0[idx_bot], rad_b1[idx_bot], rad_b2[idx_bot]};
+            const int nr = (cf_c > 0.0f) ? 3 : 1;
+            float f_net_below = 0.0f;
+            for (int r = 0; r < nr; ++r) {
+                const float inv = 1.0f / fmaxf(1.0f - r_d[r] * a_bot[r], 1e-7f);
+                f_dn[r] = (t_d[r] * f_dn[r] + r_d[r] * s_bot[r] + sd_d[r]) * inv;
+                const float f_up_r = s_bot[r] + f_dn[r] * a_bot[r];
+                f_net_below += (f_dn[r] - f_up_r);
+            }
+            if (nr == 1) {
+                f_dn[1] = 0.0f; f_dn[2] = 0.0f;
+            }
 
-            const float r_b = static_cast<float>(tri_c[idx]);
-            const float s_b = static_cast<float>(tri_d[idx]);
-            const float inv = 1.0f / fmaxf(1.0f - r_b * r_d, 1e-7f);
-            f_dn = (t_d * f_dn + r_d * s_b + s_dn_k) * inv;
-            const float f_up_below = r_b * f_dn + s_b;
-            const float f_net_below = f_dn - f_up_below;
-            const float dth_dt = (f_net_above - f_net_below) / (rho_c * CP_D_F * dz_c * pi_c);
-            rad_dth_dt[idx] += dth_dt;
+            rad_dth_dt[idx_bot] += (f_net_above - f_net_below) / (rho_c * CP_D_F * dz_c * pi_c);
             f_net_above = f_net_below;
 
             t_above = t_c;
             if (k > 0) {
+                if (cf_c > 0.0f || cf_p > 0.0f) {
+                    const float f_up[3] = {1.0f - cf_c, 0.5f * cf_c, 0.5f * cf_c};
+                    const float f_lo[3] = {1.0f - cf_p, 0.5f * cf_p, 0.5f * cf_p};
+                    const float alpha = expf(-fmaxf(10.0f, z_c - z_p) / 2000.0f);
+                    float u_mat[3][3], v_mat[3][3];
+                    calc_tripleclouds_overlap_uv(f_up, f_lo, alpha, alpha * alpha, u_mat, v_mat);
+                    (void)u_mat;
+                    float fn_n[3] = {0.0f, 0.0f, 0.0f};
+                    for (int r = 0; r < 3; ++r) {
+                        for (int r2 = 0; r2 < 3; ++r2) {
+                            fn_n[r] += v_mat[r][r2] * f_dn[r2];
+                        }
+                    }
+                    for (int r = 0; r < 3; ++r) f_dn[r] = fn_n[r];
+                }
                 z_c = z_p; dz_c = dz_p; thb_c = thbp; pib_c = pibp;
-                th_c = thp_v; pi_c = pip_v; t_c = t_below; p_c = pp; rho_c = rhop;
+                th_c = thp_v; pi_c = pip_v; t_c = t_p; p_c = pp; rho_c = rhop;
+                qv_c = qv_p; qc_c = qc_p; qr_c = qr_p; qi_c = qi_p; qs_c = qs_p;
+                cf_c = cf_p; qc_rc = qc_rp; qi_rc = qi_rp;
             }
         }
-        lw_dn_sfc += f_dn;
+        lw_dn_sfc += (f_dn[0] + f_dn[1] + f_dn[2]);
     }
 
     if (sw_down_out) sw_down_out[col] = sw_dn_sfc;
@@ -2597,10 +2895,17 @@ int32_t nh_cuda_step_physics(NhCudaHandle* h, double dt_s) {
     const dim3 block(16, 16);
     const dim3 grid((h->cfg.nx + 15) / 16, (h->cfg.ny + 15) / 16);
 
-    // 1. Cloud-interactive two-stream SW/LW Radiation (ecRad)
+    // 1. Cloud-interactive 3-region Tripleclouds SW/LW Radiation (ecRad) using zero extra VRAM
     if (h->pcfg.enable_radiation) {
         if (!h->rad_initialized || h->pcfg.rad_interval_s <= 0.0 ||
             (h->rad_timer_s + 1e-9 >= h->pcfg.rad_interval_s)) {
+            const size_t n_w = h->n_w;
+            float* rad_a0 = reinterpret_cast<float*>(h->d_tri_c);
+            float* rad_a1 = rad_a0 + n_w;
+            float* rad_a2 = reinterpret_cast<float*>(h->d_tri_d);
+            float* rad_b0 = rad_a2 + n_w;
+            float* rad_b1 = h->d_rw;
+            float* rad_b2 = h->d_w_n;
             nh_radiation_ecrad_kernel<<<grid, block>>>(
                 h->cfg, h->pcfg, g,
                 h->d_thp, h->d_pip, h->d_qv, h->d_qc, h->d_qr, h->d_qi, h->d_qs, h->d_qg,
@@ -2608,7 +2913,7 @@ int32_t nh_cuda_step_physics(NhCudaHandle* h, double dt_s) {
                 h->d_lake_mask, h->d_lake_hice, h->d_t_skin,
                 h->d_sea_ice_frac, h->d_sea_ice_tsfc, h->d_sea_ice_albedo,
                 h->d_rad_dth_dt, h->d_sw_down, h->d_lw_down,
-                h->d_div, h->d_tri_c, h->d_tri_d
+                rad_a0, rad_a1, rad_a2, rad_b0, rad_b1, rad_b2
             );
             NH_CUDA_CHECK(cudaGetLastError());
             h->rad_initialized = 1;
