@@ -10,7 +10,7 @@ version = "0.2.0"
 edition = "2021"
 rust-version = "1.85"
 authors = ["Tempest NWP Team"]
-license = "MIT OR Apache-2.0"
+license = "Apache-2.0"
 
 [workspace.dependencies]
 tempest-core = { path = "crates/tempest-core" }

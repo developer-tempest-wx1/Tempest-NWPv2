@@ -59,10 +59,7 @@ def resolve_worldcover_root(local_root: Optional[Path | str] = None) -> Optional
     env_dir = os.environ.get("TEMPEST_WORLDCOVER_DIR")
     if env_dir:
         candidates.append(Path(env_dir))
-    candidates.extend([
-        STATIC_DIR / "esa_worldcover_2021",
-        Path("/home/j_ord/AI/Tempest/esa-world-cover/data/esa_worldcover_2021"),
-    ])
+    candidates.append(STATIC_DIR / "esa_worldcover_2021")
     for cand in candidates:
         if cand.exists() and any(cand.glob("ESA_WorldCover_*.tif")):
             return cand
@@ -77,10 +74,7 @@ def resolve_soilgrids_root(local_root: Optional[Path | str] = None) -> Optional[
     env_dir = os.environ.get("TEMPEST_SOILGRIDS_DIR")
     if env_dir:
         candidates.append(Path(env_dir))
-    candidates.extend([
-        STATIC_DIR / "soilgrids_250m",
-        Path("/home/j_ord/AI/Tempest/static-data/data/lam_static/soilgrids_250m"),
-    ])
+    candidates.append(STATIC_DIR / "soilgrids_250m")
     for cand in candidates:
         if cand.exists() and (cand / "SoilGrids_clay_0-5cm_Q0p5.tif").is_file():
             return cand

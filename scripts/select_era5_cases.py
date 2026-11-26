@@ -1,8 +1,8 @@
 """Fast Local Case Selector for ARCO-ERA5 Hindcasts Using KNMI Hourly CSV Archives.
 
-Reads compressed KNMI hourly station archives (`knmi_uur_*.csv.gz`) in `/home/j_ord/AI/Tempest/era5_cases`
-(legacy 0.1x integer-scaled CSV fields: FH, FX, T in 0.1 C, RH precipitation in 0.1 mm / -1 trace,
-S=snow, O=thunder, M=fog) and ranks standout Dutch weather days by meteorological regime:
+Reads compressed KNMI hourly station archives (`knmi_uur_*.csv.gz`) in `data/knmi_cases/`
+(or `TEMPEST_ERA5_CASES_DIR`, with sibling `../era5_cases` fallback) and ranks standout Dutch
+weather days by meteorological regime:
   - radiation_fog : widespread fog (M) with light wind (FH <= 4.0 m/s) & dry (rain <= 0.5 mm)
   - fog           : maximum widespread fog station-hours (M)
   - storm         : strongest widespread gusts (FX p95 & max) and mean wind (FH)
@@ -31,8 +31,8 @@ def resolve_era5_cases_dir() -> Path:
     repo_cases = Path(__file__).resolve().parents[1] / "data" / "knmi_cases"
     if repo_cases.exists():
         return repo_cases
-    legacy = Path("/home/j_ord/AI/Tempest/era5_cases")
-    return legacy if legacy.exists() else repo_cases
+    sibling = Path(__file__).resolve().parents[2] / "era5_cases"
+    return sibling if sibling.exists() else repo_cases
 
 
 DEFAULT_CASES_DIR = resolve_era5_cases_dir()

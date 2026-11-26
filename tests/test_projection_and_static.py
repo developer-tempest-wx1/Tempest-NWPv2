@@ -92,8 +92,6 @@ def test_offline_copernicus_dem_polders_lakes_mountains_and_wx1_write(tmp_path):
     env_dem = os.environ.get("TEMPEST_COPERNICUS_DEM_DIR")
     dem_root = Path(env_dem) if env_dem else (repo_root / "data/static/copernicus_dem_raw")
     if not dem_root.exists():
-        dem_root = Path("/mnt/d/AI/weer-ai/Tempest/COPERNICUS_DEM")
-    if not dem_root.exists():
         pytest.skip("Local Copernicus DEM directory not mounted")
 
     # Small patch covering Zuidplaspolder (52.00N, 4.63E), Bodensee Lake (47.60N, 9.50E, WBM==2),

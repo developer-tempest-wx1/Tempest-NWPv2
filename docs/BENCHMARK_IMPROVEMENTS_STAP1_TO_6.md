@@ -1,7 +1,7 @@
 # Tempest-NWP v2 — Overzicht van Opgeloste Problemen en Oude vs. Nieuwe Biases (Stap 1 t/m 6)
 
 **Bijgewerkt:** 2026-11-26  
-**Repository:** `/home/j_ord/AI/Tempest/Tempest-NWPv2-kopie` (branch `master`)  
+**Repository:** `Tempest-NWPv2` (branch `master`)  
 **Referentie-baseline (ongewijzigd):** `runs/era5_benchmark/` (20 cases, 24h, KNMI LAND-stations)
 
 ## Statusoverzicht

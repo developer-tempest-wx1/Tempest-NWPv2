@@ -50,27 +50,34 @@ from tempest_v2.static_fields import (
 
 logger = logging.getLogger("tempest_v2.ic_builder")
 
-def _resolve_default_static_dir(env_name: str, local_sub: str, legacy_path: str) -> Path:
+def _resolve_default_static_dir(env_name: str, local_sub: str) -> Path:
     env_val = os.environ.get(env_name)
     if env_val:
         return Path(env_val)
-    local_dir = STATIC_DIR / local_sub
-    if local_dir.exists():
-        return local_dir
-    legacy = Path(legacy_path)
-    return legacy if legacy.exists() else local_dir
+    return STATIC_DIR / local_sub
 
 
-DEFAULT_COPERNICUS_ROOT = _resolve_default_static_dir(
-    "TEMPEST_COPERNICUS_DEM_DIR",
-    "copernicus_dem_raw",
-    "/mnt/d/AI/weer-ai/Tempest/COPERNICUS_DEM",
-)
-DEFAULT_GEBCO_ROOT = _resolve_default_static_dir(
-    "TEMPEST_BATHY_DIR",
-    "bathymetry_raw",
-    "/mnt/d/AI/weer-ai/Tempest/bathymetrie",
-)
+def _pick_gebco_elevation_nc(gebco_root: Path) -> Optional[Path]:
+    """Select primary GEBCO elevation NetCDF under `gebco_root`, skipping TID masks."""
+    candidates = [
+        p
+        for p in sorted(Path(gebco_root).rglob("*.nc"))
+        if "_tid" not in p.name.lower()
+        and "tid" not in p.stem.lower().split("_")
+        and "tid" not in p.parent.name.lower().split("_")
+    ]
+    if not candidates:
+        return None
+    for preferred in ("gebco_2026.nc", "gebco_2025.nc"):
+        for p in candidates:
+            if p.name.lower() == preferred and "sub_ice" not in p.name.lower():
+                return p
+    non_sub_ice = [p for p in candidates if "sub_ice" not in p.name.lower()]
+    return non_sub_ice[0] if non_sub_ice else candidates[0]
+
+
+DEFAULT_COPERNICUS_ROOT = _resolve_default_static_dir("TEMPEST_COPERNICUS_DEM_DIR", "copernicus_dem_raw")
+DEFAULT_GEBCO_ROOT = _resolve_default_static_dir("TEMPEST_BATHY_DIR", "bathymetry_raw")
 
 
 def stagger_uv(u_c: np.ndarray, v_c: np.ndarray, *, periodic_x: bool = False) -> Tuple[np.ndarray, np.ndarray]:
@@ -139,15 +146,15 @@ def build_domain_static_fields(
     cop_cache = sdir / f"static_copernicus_{spec.name}.wx1"
     used_fast_global_gebco = False
     if not spec.is_projected and spec.dx_m >= 15_000.0 and not cop_cache.is_file() and gebco_root is not None and Path(gebco_root).exists():
-        nc_candidates = sorted(Path(gebco_root).rglob("*.nc"))
-        if nc_candidates:
+        gebco_nc = _pick_gebco_elevation_nc(Path(gebco_root))
+        if gebco_nc is not None:
             try:
                 bathy_fast = sdir / f"bathymetry_{spec.name}.wx1"
                 if not bathy_fast.is_file() or force:
                     prepare_bathymetry_on_2d_grid(
-                        nc_candidates[0], spec.name, spec.lat2d, spec.lon2d, vertical_datum="msl", output_path=bathy_fast
+                        gebco_nc, spec.name, spec.lat2d, spec.lon2d, vertical_datum="msl", output_path=bathy_fast
                     )
-                with xr.open_dataset(nc_candidates[0]) as gds:
+                with xr.open_dataset(gebco_nc) as gds:
                     sy = max(1, int(gds["elevation"].sizes["lat"]) // max(2 * ny, 720))
                     sx = max(1, int(gds["elevation"].sizes["lon"]) // max(2 * nx, 1440))
                     sub = gds["elevation"].isel(lat=slice(None, None, sy), lon=slice(None, None, sx))
@@ -220,10 +227,10 @@ def build_domain_static_fields(
         if loaded_b is not None:
             depth = np.asarray(loaded_b[0], dtype=np.float32)
     elif gebco_root is not None and Path(gebco_root).exists():
-        nc_candidates = sorted(Path(gebco_root).rglob("*.nc"))
-        if nc_candidates:
+        gebco_nc = _pick_gebco_elevation_nc(Path(gebco_root))
+        if gebco_nc is not None:
             prepare_bathymetry_on_2d_grid(
-                nc_candidates[0], spec.name, spec.lat2d, spec.lon2d, vertical_datum="msl", output_path=bathy_cache
+                gebco_nc, spec.name, spec.lat2d, spec.lon2d, vertical_datum="msl", output_path=bathy_cache
             )
             loaded_b = load_bathymetry(bathy_cache, expected_shape=(ny, nx))
             if loaded_b is not None:

@@ -1,318 +1,230 @@
-# Tempest-NWP v2 — Classical Non-Hydrostatic GPU NWP Model
+# Tempest-NWP v2
 
-> **Absolute Project Directive: 0% AI / 0% Machine Learning**  
-> Tempest-NWP v2 is a 100% deterministic, classical physics-based Numerical Weather Prediction (NWP) system solving the compressible non-hydrostatic Euler / Navier-Stokes equations on GPU in strict SI units (`K`, `Pa`, `m/s`, `kg/kg`, `m^2/s^2`, `W/m^2`). No neural networks, deep learning surrogates, or data-driven parameterizations are used anywhere in the dynamical core or model physics.
+**A 100% Classical, Deterministic, GPU-Accelerated Non-Hydrostatic Numerical Weather Prediction Model (0% AI / 0% Machine Learning)**
 
----
+Tempest-NWP v2 solves the compressible non-hydrostatic Euler equations on an Arakawa C-grid with a smooth Klemp (2011) terrain-following height coordinate in **Rust + NVIDIA CUDA**, coupled to classical physical parameterizations, 3D-Var + IAU data assimilation, and the lossless **WX-1** (`.wx1`, `zstd_shuffle`) scientific container format.
 
-## Key Architecture & Features
-
-- **Self-Contained CUDA/Rust Solver (No External NEMO Clone Required):**  
-  Both the atmospheric non-hydrostatic core (`nh_core.cu`), full atmospheric/land physics (`nh_physics.cu`), and the coupled **NEMO 5.0.2 + SI3** ocean & 5-category sea-ice solver (`nh_ocean_si3.cu`) are implemented directly in native CUDA C++ and compiled into a single shared library (`crates/tempest-cuda/libtempest_cuda.so`). You do **not** need to clone or build external NEMO/SI3 repositories on a new machine (`external_refs/` is strictly optional offline reference storage and gitignored).
-- **Dynamical Core (`crates/tempest-cuda/src/cuda/nh_core.cu`):**
-  - Arakawa C-grid staggered velocity/scalar formulation on spherical Lambert Conformal Conic (LCC) domains (`D2`, `D3`, standalone LAMs) and global latitude-longitude grids (`D1`).
-  - Klemp (2011) smooth terrain-following vertical coordinates (`nz = 65`, `90`, `137`, IEEE 754 `float64` analytic hydrostatic reference state).
-  - Split-explicit 3rd-order Wicker-Skamarock Runge-Kutta (`RK3`) time integration with WENO-5 / UP3 positive-definite tracer advection, 3D divergence damping, Rayleigh upper sponge, Davies lateral boundary relaxation (`bc_x=2, bc_y=2`), and Incremental Analysis Update (`IAU`).
-  - Automatic 2D halo-tiling memory manager (`cuda_bridge.py`) so regional 2.5 km domains fit comfortably even on 6 GiB VRAM laptop GPUs (e.g. RTX 3060) and scale cleanly up to 24–32+ GiB RTX 4090 / 5080 / 5090 cards.
-- **Physical Parameterizations (`crates/tempest-cuda/src/cuda/nh_physics.cu`):**
-  - **Microphysics:** 6-species (`qv, qc, qr, qi, qs, qg`) mixed-phase scheme (WRF WSM6 / ICON / ICE-T principles) with Supercooled Liquid Water (SLW) preservation down to `-37 °C`, proportional sink scaling for positivity/conservation, subcycled precipitation fallout, and optional **HARMONIE-AROME Cy46** physics (`--cy46-physics`, `--pbl-last`).
-  - **PBL & Convection:** Nonlocal YSU K-profile boundary layer + shallow EDMF thermal updraft mass-flux coupling.
-  - **Radiation:** Two-stream delta-Eddington SW/LW radiative transfer (`ecRad` principles) with liquid/ice cloud optics.
-  - **Surface, Land, Lakes & Ocean/Sea-Ice:** 4-layer soil thermo-hydrology (ECMWF HTESSEL/Noah depths `0.07, 0.21, 0.72, 1.89 m`, WMO/USDA 14-class FAO HWSD v2.2 lookup), FLake freshwater inland lakes, COARE 3.6/VOSKIN air-sea fluxes, and self-contained coupled 3D ocean + 5-category SI3 mEVP sea-ice (`nh_ocean_si3.cu` with TEOS-10 75-term EOS).
-- **WX-1 Scientific Storage Backbone (`tempest-wx1` on PyPI):**  
-  All gridded forecasts, restarts, initial/boundary conditions, static datasets, and observation containers use the open-source **`tempest-wx1`** container format (`pip install tempest-wx1>=0.1.8`), defaulting to lossless `zstd_shuffle` compression (`[1, nlat, nlon]` horizontal slice chunking & `[time, nlevels, 1, 1]` sounding chunking).
-- **Open-Access Operational & Hindcast Initialization + Dual Verification:**
-  - Operational cold-start & 3-hourly LBCs from **ECMWF Open Data** (`0p1`/`0p25` GRIB2, no account required).
-  - Historical 24h+ hindcasts initialized & bounded from public **ARCO-ERA5** on Google Cloud Storage (zero-login Zarr streaming via `--stream-era5-lbc`, plus optional ERA5-Land soil).
-  - Local Balanced 3D-Var + IAU data assimilation & TITAN-style spatial/temporal QC (`knmi`, `dwd`, radiosondes, WIS2, marine, OSI-SAF sea-ice).
-  - Automated hourly verification (`scripts/verify_knmi_wx1.py` & `scripts/run_benchmark_suite.py`) against **KNMI official observations** (`10-min` / `hourly-validated` / local `knmi_uur_*.csv.gz`) side-by-side with **ARCO-ERA5** / **ECMWF IFS** baselines across 14+ metrics and categorical weather events (`fog`, `rain`, `gusts`, `snow`, `hail/graupel`, `thunder`, `freezing rain / ijzel`).
+> **Project Rule:** 0% neural networks, 0% ML surrogates, 0% data-driven dynamics. Every equation in the dynamical core and physics suite uses classical atmospheric physics, thermodynamics, and strict SI units (`K`, `Pa`, `m/s`, `kg/kg`, `m²/s²`, `kg/(m²·s)`).
 
 ---
 
-## `tempest-wx1` Storage Container (PyPI)
+## Key Architecture Highlights
 
-Tempest-NWP v2 uses the official [`tempest-wx1`](https://pypi.org/project/tempest-wx1/) package (`v0.1.8+`, Apache-2.0):
+- **Non-Hydrostatic GPU Dynamical Core (`crates/tempest-cuda`):** Split-explicit RK3 time integration with acoustic substepping, WENO-5 / monotonic positive-definite tracer advection ($q_v, q_c, q_r, q_i, q_s, q_g$), spherical Lambert Conformal Conic (LCC) & global latitude-longitude geometry, and coupled NEMO 5.0.2 + SI3 ocean/sea-ice GPU kernels.
+- **Deterministic Mixed Precision (`FP64` / `FP32`):** Commit `1e8dfcb` introduced deterministic FP64/FP32 mixed precision while keeping prognostic state, hydrostatic reference fields, Exner pressure, and WX-1 restarts bit-exact IEEE 754 `float64` in the dynamical core:
+  - *RTX 3060 benchmark (`65 × 216 × 216`, 800 m mountain, `physics_every=3`):*
+    - `step_full` (60 steps): `225.46 ms/step` (4.435 step/s) → `204.73 ms/step` (**4.885 step/s, +10.1% throughput**)
+    - `step_rk3` (60 steps): `210.89 ms/step` (4.742 step/s) → `191.28 ms/step` (**5.228 step/s, +10.3% throughput**, `max|w_dyn| = 0.0`, `max|pip_dyn| = 0.0`)
+    - `step_phys` (20 calls): `47.05 ms/call` → `44.01 ms/call` (**+6.9%**)
+    - `ocean_si3` (1800 s): `47.64 ms/step` → `48.47 ms/step` (unchanged FP64, within run-to-run noise)
+- **High-Resolution Static Coupling:** Sub-grid topography and coastal masks from **Copernicus DEM GLO-30/90**, bathymetry from **GEBCO 2026** / **EMODnet**, 10 m land cover from **ESA WorldCover 2021** (`z0`, albedo, emissivity, urban/forest morphology, inland water), and 250 m soil properties from **ISRIC SoilGrids v2.0** + **FAO HWSD v2.2**.
+- **Steps 1–6 Physics & Bias Calibration:** Dual verification against official KNMI AWS hourly observations and ARCO-ERA5 upper-air/surface fields drove systematic fixes across MSLP/hydrostatic balance, TripleClouds sub-grid radiation + climatological AOD, SBL/skin temperature/radiation fog/gust diagnostics, and microphysics/thunderstorm initiation. See [docs/BENCHMARK_IMPROVEMENTS_STAP1_TO_6.md](docs/BENCHMARK_IMPROVEMENTS_STAP1_TO_6.md).
+- **WX-1 Storage Backbone:** All static containers, initial conditions, LBCs, lossless checkpoints, and synoptic/column outputs use [WX-1](https://github.com/developer-tempest-wx1/tempest-wx1) with lossless `zstd_shuffle` compression.
 
-- **PyPI:** https://pypi.org/project/tempest-wx1/
-- **GitHub:** https://github.com/developer-tempest-wx1/tempest-wx1
-- **Install standalone or alongside Tempest-NWP v2:**
+---
+
+## Supported Domains
+
+| Domain Key | Projection / Grid | Grid Shape (`ny × nx`) | Horizontal Spacing | Default Dynamics `dt` |
+| :--- | :--- | :--- | :--- | :--- |
+| `d1_global_0p25` | Global Lat-Lon (periodic) | `721 × 1440` | `0.25°` (~27.8 km) | `60.0 s` |
+| `d1_global_0p4` | Global Lat-Lon (periodic) | `451 × 900` | `0.40°` (~44.5 km) | `90.0 s` |
+| `d1_global_0p5` | Global Lat-Lon (periodic) | `361 × 720` | `0.50°` (~55.6 km) | `120.0 s` |
+| `d2_eu_lcc` | Europe LCC | `400 × 520` | `7.5 km` | `20.0 s` |
+| `lam_eu_5km` | Europe LCC | `480 × 560` | `5.0 km` | `15.0 s` |
+| `lam_bnl_ns_de_2p5km` | Benelux / North Sea / DE LCC | `432 × 432` | `2.5 km` | `6.0 s` |
+| `d3_benelux_de_2p5km` | Benelux / DE LCC | `432 × 432` | `2.5 km` | `6.0 s` |
+| `d3_nl_2p5km` | Netherlands LCC | `216 × 216` | `2.5 km` | `6.0 s` |
+| `d3_benelux_de_1p5km` | Benelux / DE LCC | `720 × 720` | `1.5 km` | `4.0 s` |
+
+Vertical terrain-following coordinates support `nz ∈ {65, 90, 137}` levels (`z_top = 22 km` for `nz < 90`, `31 km` for `nz >= 90`).
+
+---
+
+## Prerequisites & Building
+
+### 1. System Requirements
+
+- **OS:** Linux (x86_64) or WSL2 with NVIDIA GPU driver & CUDA Toolkit
+- **Rust:** `>= 1.85` (via `rustup`)
+- **CUDA Toolkit (`nvcc`):** `>= 12.0` (`>= 12.8` required for native `sm_120` Blackwell compilation)
+- **Python:** `>= 3.10` with `numpy`, `scipy`, `xarray`, `netCDF4`, `rasterio`, `eccodes` / `cfgrib` (see [pyproject.toml](pyproject.toml))
+- **WX-1 storage library (`wx1`):** Install [`tempest-wx1`](https://github.com/developer-tempest-wx1/tempest-wx1) from PyPI (`pip install tempest-wx1`) or editable from a sibling clone (`pip install -e ../WX-1`)
+- **Optional OS tools for FAO HWSD v2.2 & GRIB2:**
   ```bash
-  pip install "tempest-wx1>=0.1.8"
+  sudo apt-get update && sudo apt-get install -y mdbtools libeccodes-dev
   ```
-- **Why WX-1?**
-  - **Lossless prognostic storage (`zstd_shuffle`):** Byte-shuffled Zstandard preserves exact IEEE 754 `float32`/`float64` bits for restarts and checkpoints.
-  - **Domain-specific chunk topologies:** Fast `[1, ny, nx]` synoptic horizontal slices for 2D/3D forecast maps and `[time, nz, 1, 1]` column chunks for atmospheric soundings.
 
----
+### 2. Clone & Build GPU Kernels
 
-## Supported GPUs (Including NVIDIA RTX 50xx Blackwell `sm_120`)
+`crates/tempest-cuda/build.rs` compiles the CUDA kernels with `nvcc -O3 -std=c++17` and links `crates/tempest-cuda/libtempest_cuda.so`:
 
-The Rust/CUDA build script (`crates/tempest-cuda/build.rs`) inspects both the installed `nvcc --list-gpu-arch` and `nvidia-smi` via `TEMPEST_CUDA_ARCH`:
-
-| GPU Generation | Representative Cards | Compute Capability | `TEMPEST_CUDA_ARCH` | Minimum CUDA Toolkit |
-| :--- | :--- | :---: | :---: | :--- |
-| **RTX 50xx (Blackwell)** | **RTX 5090, 5080, 5070 Ti, 5070** | **`12.0`** | **`sm_120`** *(or `auto`)* | **CUDA 12.8+** (tested on **13.1**) |
-| Datacenter Blackwell | B200 / GB200 | `10.0` | `sm_100` | CUDA 12.8+ |
-| Hopper | H100 / H200 | `9.0` | `sm_90` | CUDA 12.0+ |
-| RTX 40xx (Ada Lovelace) | RTX 4090, 4080, 4070, 4060 | `8.9` | `sm_89` | CUDA 11.8+ |
-| RTX 30xx / Ampere | RTX 3060 / 3080 / 3090, A100 | `8.6` / `8.0` | `sm_86` / `sm_80` | CUDA 11.1+ |
-| RTX 20xx (Turing) | RTX 2060 – 2080 Ti, T4 | `7.5` | `sm_75` | CUDA 10.0+ |
-
-- `TEMPEST_CUDA_ARCH=auto` *(default)*: auto-detects local GPU(s) via `nvidia-smi`. If an RTX 50xx GPU (`sm_120`) is present alongside an older CUDA `< 12.8` toolkit, `build.rs` emits a warning advising CUDA `>= 12.8` and compiles the highest available virtual PTX (`compute_MAX`) for JIT forward compatibility.
-- `TEMPEST_CUDA_ARCH=sm_120`: explicitly compiles native **RTX 50xx Blackwell** SASS + PTX (`-gencode arch=compute_120,code=sm_120 -gencode arch=compute_120,code=compute_120`).
-- `TEMPEST_CUDA_ARCH=all`: builds a portable multi-architecture fatbin across `sm_75, sm_80, sm_86, sm_89, sm_90, sm_100, sm_120` (filtered to architectures supported by your `nvcc`) plus forward-compatible PTX.
-
-### VRAM Sizing Guide
-- `d3_nl_2p5km` (`216x216`, `nz=65`) & `lam_bnl_ns_de_2p5km` (`432x432`, `nz=65`): runs smoothly on **6 GiB VRAM** (e.g. RTX 3060 Laptop; large domains automatically halo-tile within VRAM budget).
-- `d3_benelux_de_1p5km` (`720x720`, `nz=90/137`), `lam_eu_5km`, or full global `d1_global_0p25` + NEMO/SI3: recommended **12–32 GiB VRAM** (RTX 4070 Ti Super / 4090 / 5080 / 5090), or automatic multi-tile GPU paging on 6–8 GiB GPUs.
-
----
-
-## Clean-Machine Installation & Build (Linux / WSL2)
-
-### 1. System Prerequisites
-```bash
-sudo apt update
-sudo apt install -y build-essential git curl pkg-config mdbtools libeccodes-dev
-```
-- **Rust (`>= 1.85`):** https://rustup.rs (`curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh`)
-- **NVIDIA Driver + CUDA Toolkit:** **CUDA 12.8+** recommended (**CUDA 12.8+ required** for native RTX 50xx `sm_120` compilation). Ensure `nvcc` is in `PATH` or export `CUDA_HOME=/usr/local/cuda`.
-- **Python (`>= 3.10`):** Conda, Miniconda, Mamba, or `venv`.
-
-### 2. Clone, Install Python Package & Build CUDA/Rust Core
 ```bash
 git clone https://github.com/developer-tempest-wx1/Tempest-NWPv2.git
 cd Tempest-NWPv2
 
-# Create/activate Python environment, then install Tempest + tempest-wx1 (PyPI) + optional deps
-pip install -e ".[all]"
+# Automatic GPU detection via nvidia-smi (default; falls back safely if older nvcc)
+./scripts/build.sh --arch auto
 
-# Build Rust + CUDA solver + self-contained NEMO 5.0.2 / SI3 shared library
-./scripts/build.sh --arch auto --test
+# Build + run cargo test --release and pytest -q tests/ (+ optional editable pip install)
+./scripts/build.sh --arch auto --test --editable-python
 ```
 
-To explicitly target an **RTX 5090 / 5080 / 5070 Ti / 5070** (`sm_120`):
+Supported `TEMPEST_CUDA_ARCH` / `--arch` targets:
+
+| Spec | Compiled `sm_*` Targets | Intended Use |
+| :--- | :--- | :--- |
+| `auto` (default) | Detected `nvidia-smi` GPU(s) (headless fallback: `80,86,89,90,120`) | Local workstation / node |
+| `all` / `portable` | Filtered subset of `75,80,86,89,90,100,120` supported by your `nvcc` | Redistributable fat binary |
+| `sm_75` .. `sm_120` | Explicit GPU generation (e.g. `sm_86` RTX 30xx, `sm_89` RTX 40xx, `sm_90` Hopper, `sm_120` RTX 50xx Blackwell) | Explicit single/multi target (`sm_86,sm_120`) |
+
+Manual Cargo build & full test suites:
+
 ```bash
-./scripts/build.sh --arch sm_120 --test
-```
-
-To compile a portable multi-GPU binary (`RTX 20xx -> RTX 50xx`):
-```bash
-./scripts/build.sh --arch all --test
-```
-
----
-
-## Static Geophysical Data Setup
-
-Static raw terrain, bathymetry, and soil files are excluded from Git (several GiB). Use the built-in deterministic downloader [`scripts/download_static_data.py`](scripts/download_static_data.py) — **no login or API key needed** for Copernicus DEM, EMODnet/GEBCO ERDDAP/CEDA, or FAO HWSD v2.2.
-
-### Quick All-in-One Download for Benelux-DE 2.5 km + Lossless `.wx1` Build
-```bash
-# 1. Inspect resolved URLs and tile count without downloading
-python scripts/download_static_data.py --all --domain lam_bnl_ns_de_2p5km --dry-run
-
-# 2. Download Copernicus DEM GLO-30 + WBM, regional MSL Bathymetry, FAO HWSD v2.2, and build .wx1
-python scripts/download_static_data.py --all --domain lam_bnl_ns_de_2p5km --workers 6 --prepare-wx1
-```
-
-### Dataset-by-Dataset Commands & Manual Sources
-
-1. **Copernicus DEM GLO-30 (30 m) & GLO-90 (90 m) + Water Body Mask (`WBM.tif`):**
-   - Source: Public AWS S3 Open Data buckets `copernicus-dem-30m` and `copernicus-dem-90m` (anonymous HTTPS, zero credentials).
-   - Preserves below-sea-level polders (Flevoland / Zuidplaspolder) and distinguishes ocean (`WBM=1`), inland lakes (`WBM=2`), and rivers (`WBM=3`).
-   ```bash
-   # Download GLO-30 (+ optional --glo90 fallback) for European/Dutch domains
-   python scripts/download_static_data.py --copernicus-dem --glo90 --domain lam_eu_5km --workers 8
-   ```
-   Expected layout (`TEMPEST_COPERNICUS_DEM_DIR` or `data/static/copernicus_dem_raw`):
-   ```
-   dem30_europe/{DEM,WBM}/Copernicus_DSM_COG_10_{N|S}XX_00_{E|W}XXX_00_{DEM|WBM}.tif
-   dem90_world/{DEM,WBM}/Copernicus_DSM_COG_30_{N|S}XX_00_{E|W}XXX_00_{DEM|WBM}.tif
-   ```
-
-2. **Bathymetry (GEBCO 2026 / 2025 / ERDDAP MSL & EMODnet WCS LAT):**
-   - **Fast regional MSL NetCDF subset (`--bathy-source gebco-erddap`, default, ~10 MB):**
-     ```bash
-     python scripts/download_static_data.py --bathymetry --bathy-source gebco-erddap --domain lam_bnl_ns_de_2p5km
-     ```
-   - **Full global `GEBCO_2026.nc` (~7.0 GiB, MSL) from BODC/CEDA (recommended for Global `D1` + NEMO/SI3):**
-     ```bash
-     python scripts/download_static_data.py --bathymetry --bathy-source gebco-2026-global
-     ```
-     *(Alternative global zip: `--bathy-source gebco-2025-zip` ~4.0 GiB from CEDA, or interactive/CEDA portals at https://www.gebco.net/data-products/gridded-bathymetry-data)*
-   - **EMODnet Bathymetry Digital Terrain Model via OGC WCS (`emodnet:mean`):**
-     ```bash
-     python scripts/download_static_data.py --bathymetry --bathy-source emodnet-wcs --domain lam_bnl_ns_de_2p5km
-     ```
-     > **Datum Integrity Note:** EMODnet heights are referenced to **LAT** (Lowest Astronomical Tide), whereas GEBCO & Tempest ocean grids use **MSL** (Mean Sea Level). `tempest_v2.bathymetry.prepare_bathymetry()` strictly refuses to mix `lat`/`alat` inputs into MSL unless an explicit spatial `(MSL - LAT)` offset GeoTIFF is passed (`--vertical-offset-raster`).
-
-3. **FAO / IIASA Harmonized World Soil Database v2.2 (HWSD v2.2):**
-   - Requires OS package `mdbtools` (`mdb-tables`, `mdb-export`) to read `HWSD2.2.mdb` cleanly (no HWSD v1.x fallback mixing).
-   ```bash
-   sudo apt install -y mdbtools
-   python scripts/download_static_data.py --hwsd
-   ```
-   Official archives fetched into `data/static/hwsd_v22/downloads/`:
-   - `hwsd2.2_db.zip` (~11.1 MB, `HWSD2.2.mdb`)
-   - `hwsd2.2_raster.zip` (~22.4 MB, `HWSD2.bil` 1 km global grid)
-
-### Portable Path Environment Variables
-If you store large raw static datasets or KNMI archives on another drive (e.g. `/data/...`), set:
-```bash
-export TEMPEST_COPERNICUS_DEM_DIR="/path/to/COPERNICUS_DEM"
-export TEMPEST_BATHY_DIR="/path/to/bathymetrie"
-export TEMPEST_HWSD_V22_DIR="/path/to/hwsd_v22"
-export TEMPEST_ERA5_CASES_DIR="/path/to/knmi_uur_archives"  # optional local knmi_uur_*.csv.gz dir
-export KNMI_API_KEY="your_optional_knmi_open_data_key"     # or config/knmi_api_key.txt (gitignored)
+export PATH="$HOME/.cargo/bin:/usr/local/cuda/bin:$PATH"
+TEMPEST_CUDA_ARCH=auto cargo build --release
+cargo test --release
+PYTHONPATH=python pytest -v tests/
 ```
 
 ---
 
-## Runnable Weather Cases & Multi-Season Verification
+## Static Geophysical Data Download & External Storage
 
-Tempest-NWP v2 supports both **live ECMWF operational forecasts** and **reproducible historical ARCO-ERA5 hindcasts** paired with automated **KNMI station + ARCO-ERA5 dual verification**.
+[scripts/download_static_data.py](scripts/download_static_data.py) uses **Python standard library only** (no `geopandas`, `shapely`, or `requests` required) to download official open-access datasets into the directory layout expected by `tempest_v2`.
 
-### 1. Single 24h Hindcast Examples (ARCO-ERA5, Zero Login Required)
+### Available Datasets & Flags
 
-| Weather Regime / Case | Date (`00:00Z`) | Domain | Why It Matters |
-| :--- | :---: | :---: | :--- |
-| **Winter Storm Eunice** | `2022-02-18` | `lam_bnl_ns_de_2p5km` | Extreme coastal/inland gusts (~40 m/s), sting-jet dynamics |
-| **Winter Storm Henk** | `2024-01-02` | `lam_bnl_ns_de_2p5km` | Strong frontal gusts (35 m/s) + heavy winter rain |
-| **Summer Storm Poly** | `2023-07-05` | `lam_bnl_ns_de_2p5km` | Explosive North Sea coast mesoscale storm (41 m/s gusts + thunder) |
-| **Brabant Hail Supercell** | `2016-06-23` | `d3_nl_2p5km` | Giant hail (`qs`/`qg` graupel + deep convection + 131 KNMI thunder hrs, 49.6 mm) |
-| **Spring MCS Convection** | `2018-05-29` | `d3_nl_2p5km` | Organized spring deep convection (136 thunder hrs) |
-| **Warm High Conv. (No Thunder)** | `2024-06-18` | `d3_nl_2p5km` | Heavy warm showers just below lightning initiation (34.5 mm max, 0 thunder) |
-| **Cold Low-Topped Thunder** | `2024-11-22` | `d3_nl_2p5km` | Polar-air trough shallow convection with thunder & snow (47 thunder, 79 snow hrs) |
-| **Snowstorm Darcy** | `2021-02-07` | `lam_bnl_ns_de_2p5km` | Easterly blizzard & snow-albedo coupling (495 KNMI snow hrs, `-5.9 °C`) |
-| **Freezing Rain / IJzel** | `2016-01-05` | `d3_nl_2p5km` | Warm-nose aloft + sub-zero boundary layer ice transition |
-| **Limburg Cut-Off Extreme Rain** | `2021-07-14` | `lam_bnl_ns_de_2p5km` | Quasistationary convective rainband (40.6 mm at KNMI AWS) |
-| **Winter Radiation Fog** | `2024-12-27` | `d3_nl_2p5km` | Light-wind stable boundary layer & persistent radiation fog (490 fog hrs) |
-| **Clear Spring Diurnal Cycle** | `2025-03-19` | `d3_nl_2p5km` | Cloudless radiative heating/cooling amplitude (`-4.7 °C` to `+18.6 °C`, 0 mm) |
-| **All-Time Heatwave Record** | `2019-07-25` | `d3_nl_2p5km` | Extreme dry soil + sensible heat flux (`+40.3 °C` peak) |
+| Dataset | CLI Flag(s) | Options / Layers | Vertical Datum / Notes |
+| :--- | :--- | :--- | :--- |
+| **Copernicus DEM GLO-30 / GLO-90** | `--copernicus-dem`, `--glo90` | `--copernicus-layers`: `minimal` (`DEM,WBM`), `standard` (default: `DEM,WBM,EDM,FLM,HEM`), `all` (`DEM,WBM,EDM,FLM,HEM,ACM,XML,PREVIEW,INFO`) | Public AWS S3 (`copernicus-dem-30m`, `copernicus-dem-90m`); uses `tileList.txt` to skip ocean tiles; `INFO/eula_F.pdf` saved once per resolution |
+| **Bathymetry (GEBCO / EMODnet)** | `--bathymetry` | `--bathy-source`: `gebco-erddap` (fast regional MSL), `gebco-2026-global` (`GEBCO_2026.nc` ~7 GiB), `gebco-2026-zip` (ZIP + extract), `gebco-2026-full` (`GEBCO_2026` + `GEBCO_2026_sub_ice` + `gebco_2026_tid`), `gebco-2025-zip`, `emodnet-wcs` | GEBCO = MSL; EMODnet = LAT (saved with `.json` metadata). `_pick_gebco_elevation_nc` automatically skips `TID` grids |
+| **ESA WorldCover 10 m** | `--worldcover` | `--worldcover-year`: `2021` (`v200`, default) or `2020` (`v100`) | Public AWS S3 (`esa_worldcover_grid.geojson` intersection with 3° fallback); drives `z0`, albedo, emissivity, urban/forest & water masks |
+| **ISRIC SoilGrids 250 m v2.0** | `--soilgrids` | `--soilgrids-mode`: `tempest` (14 layers used by Tempest), `surface` (10 layers `0-5cm` + WRB), `full` (55 layers: 9 properties × 6 depths + WRB), `--no-wrb` | ISRIC WCS 2.0.1 (`GEOTIFF_INT16`, EPSG:4326); includes XML/HTML exception guard |
+| **FAO / IIASA HWSD v2.2** | `--hwsd` | Downloads `hwsd2.2_db.zip` + `hwsd2.2_raster.zip`, verifies ZIP CRCs & SHA-256 | Requires OS `mdbtools` (`mdb-tables`, `mdb-export`) during `--prepare-wx1` |
+| **FABDEM v1.2** *(opt-in)* | `--fabdem` | 1° bare-earth DEM tiles from HuggingFace `links-ads/fabdem-v12` | Optional forest/building bias-removed DEM (not included in `--all`) |
+| **PDOK AHN** *(opt-in, NL only)* | `--ahn` | `--ahn-product`: `dtm_05m` / `dsm_05m`; `--ahn-resolution`: spacing in m (default `5.0`) | Optional Netherlands high-res WCS (clipped to NL bounds; not in `--all`) |
 
-Run any 24h hindcast directly with lean ERA5 LBC streaming (`--stream-era5-lbc` avoids downloading multi-GB raw caches) and verify against KNMI + ARCO-ERA5:
+> **Bulk / Alternative Mirrors:**
+> - **Copernicus DEM CDSE:** Besides anonymous AWS S3, EU/ESA provides mirrors via Copernicus Data Space Ecosystem (`eodata`).
+> - **SoilGrids Global VRTs:** For global or continental runs beyond WCS regional subsets, ISRIC publishes full VRT/COG hierarchies via WebDAV at `https://files.isric.org/soilgrids/latest/data/`.
+
+### Download Commands
+
+Preview URLs, tile counts, and target paths offline (`--dry-run` makes zero downloads):
 
 ```bash
-# Example A: 2016-06-23 Giant-Hail Supercell (24h, Benelux-NL 2.5 km)
-python scripts/run_tempest_v2.py \
-  --mode lam_era5_hindcast \
-  --lam-domain d3_nl_2p5km \
-  --init-time 2016-06-23T00:00Z \
-  --hours 24 --nz 65 \
-  --stream-era5-lbc --cy46-physics --pbl-last \
-  --runs-root runs/examples/supercell_20160623
-
-python scripts/verify_knmi_wx1.py \
-  --run-dir runs/examples/supercell_20160623/20160623_00Z \
-  --obs-source auto \
-  --compare-era5
-
-# Example B: 2022-02-18 Storm Eunice (24h, Benelux-North Sea-Germany 2.5 km)
-python scripts/run_tempest_v2.py \
-  --mode lam_era5_hindcast \
-  --lam-domain lam_bnl_ns_de_2p5km \
-  --init-time 2022-02-18T00:00Z \
-  --hours 24 --nz 65 \
-  --stream-era5-lbc --cy46-physics --pbl-last \
-  --runs-root runs/examples/eunice_20220218
-
-python scripts/verify_knmi_wx1.py \
-  --run-dir runs/examples/eunice_20220218/20220218_00Z \
-  --obs-source auto \
-  --compare-era5
+python3 scripts/download_static_data.py --all --domain lam_bnl_ns_de_2p5km --dry-run
 ```
 
-### 2. Multi-Season Benchmark Suite (`quick4`, `core10`, `full20`)
-Run curated presets spanning winter/spring/summer/autumn + storm/convection/fog/snow/hail/freezing-rain/heatwave, automatically persisting all `.wx1` forecasts and producing `benchmark_scorecard.csv`, `benchmark_scorecard.json`, and `benchmark_scorecard.png` (resumable if interrupted):
+Download the standard regional static bundle (Copernicus GLO-30 `standard`, regional GEBCO, HWSD v2.2, ESA WorldCover 2021, SoilGrids 14-layer `tempest`) and compile lossless `.wx1` grids:
 
 ```bash
-# Inspect all cases and cache status without running the GPU solver
-python scripts/run_benchmark_suite.py --preset full20 --dry-run
-
-# Fast 4-regime smoke benchmark (radiation fog, clear diurnal, hail supercell, low-topped thunder)
-python scripts/run_benchmark_suite.py --preset quick4 --lam-domain d3_nl_2p5km --hours 24
-
-# Representative 10-case multi-season benchmark
-python scripts/run_benchmark_suite.py --preset core10 --lam-domain d3_nl_2p5km --hours 24
-
-# Full 20-case all-season, all-weather-type verification suite
-python scripts/run_benchmark_suite.py --preset full20 --lam-domain d3_nl_2p5km --hours 24
+python3 scripts/download_static_data.py \
+  --all \
+  --domain lam_bnl_ns_de_2p5km \
+  --prepare-wx1
 ```
 
-*(Note: `--knmi-cache-dir` uses KNMI's open `hourly-in-situ-meteorological-observations-validated` dataset automatically for historical cases via `obs_source=auto`, or local `knmi_uur_*.csv.gz` archives if `TEMPEST_ERA5_CASES_DIR` is populated.)*
+Download the **complete** full archives (Copernicus GLO-30 + GLO-90 with all `DEM,WBM,EDM,FLM,HEM,ACM,XML,PREVIEW,INFO` layers, full GEBCO 2026 `ice_surface_elevation + sub_ice + tid`, full 55-layer SoilGrids 250 m + WRB, ESA WorldCover 2021, and HWSD v2.2):
 
-### 3. Operational Real-Time ECMWF LBC Forecast
-Run a live 2.5 km Limited-Area forecast initialized from ECMWF Open Data (`0p1` with `0p25` fallback, `--ecmwf` selects ECMWF 3h/6h output schedule while physics/dynamics remain 100% Tempest):
 ```bash
-python scripts/run_tempest_v2.py \
+python3 scripts/download_static_data.py \
+  --copernicus-dem --glo90 --copernicus-layers all \
+  --bathymetry --bathy-source gebco-2026-full \
+  --worldcover --worldcover-year 2021 \
+  --soilgrids --soilgrids-mode full \
+  --hwsd \
+  --domain lam_bnl_ns_de_2p5km \
+  --prepare-wx1
+```
+
+### External Storage, Symlinks & Environment Variables
+
+Large static archives (Copernicus DEM, full GEBCO 2026, ESA WorldCover, SoilGrids, HWSD v2.2) can live on an external SSD/HDD or shared data directory. Link them cleanly into `data/static/` (which is gitignored for raw/compiled binaries):
+
+```bash
+mkdir -p data/static
+ln -s /path/to/external/COPERNICUS_DEM      data/static/copernicus_dem_raw
+ln -s /path/to/external/bathymetry          data/static/bathymetry_raw
+ln -s /path/to/external/esa_worldcover_2021 data/static/esa_worldcover_2021
+ln -s /path/to/external/soilgrids_250m      data/static/soilgrids_250m
+ln -s /path/to/external/hwsd_v22            data/static/hwsd_v22
+```
+
+Alternatively, override any directory explicitly via CLI flags (`--dem-dir`, `--bathy-dir`, `--worldcover-dir`, `--soilgrids-dir`, `--hwsd-dir`) or environment variables:
+
+| Environment Variable | Default Path (`data/static/...`) | Purpose |
+| :--- | :--- | :--- |
+| `TEMPEST_COPERNICUS_DEM_DIR` | `data/static/copernicus_dem_raw` | Copernicus DEM GLO-30/90 root (`dem30_europe/`, `dem90_world/`) |
+| `TEMPEST_BATHY_DIR` | `data/static/bathymetry_raw` | GEBCO 2026/2025/ERDDAP & EMODnet bathymetry files |
+| `TEMPEST_WORLDCOVER_DIR` | `data/static/esa_worldcover_2021` | ESA WorldCover 10 m GeoTIFF tiles |
+| `TEMPEST_SOILGRIDS_DIR` | `data/static/soilgrids_250m` | ISRIC SoilGrids 250 m `Q0p5` & `WRB_MostProbable` GeoTIFFs |
+| `TEMPEST_HWSD_V22_DIR` | `data/static/hwsd_v22` | FAO HWSD v2.2 `.mdb` & `.bil` archives |
+| `TEMPEST_ERA5_CASES_DIR` | `data/knmi_cases` (or `../era5_cases`) | KNMI hourly CSV archives (`knmi_uur_*.csv.gz`) for `select_era5_cases.py` |
+| `TEMPEST_CUDA_ARCH` | `auto` | Target GPU compute capability (`auto`, `all`, or explicit `sm_75`..`sm_120`) |
+
+---
+
+## Running Forecasts & Benchmarks
+
+```bash
+# Operational 24h LAM forecast driven by ECMWF Open Data LBCs (100% Tempest physics;
+# --ecmwf selects the 3h->T+144 / 6h->T+360 output cadence, not ECMWF physics)
+PYTHONPATH=python python3 scripts/run_tempest_v2.py \
   --mode lam_ecmwf_lbc \
   --lam-domain lam_bnl_ns_de_2p5km \
-  --lbc-resol auto \
-  --lbc-interval-hours 3 \
-  --hours 24 --nz 65 \
-  --cy46-physics --pbl-last \
-  --runs-root runs/operational_lam
-```
-Add `--enable-da --download-live` to assimilate live KNMI/DWD/radiosonde observations via Balanced 3D-Var + IAU, and `--enable-ocean-si3` on coupled global/marine configurations.
+  --hours 24 \
+  --ecmwf
 
-### 4. Global Coupled Atmosphere + NEMO 5.0.2 / SI3 (`D1`)
-```bash
-python scripts/run_tempest_v2.py \
-  --mode d1 \
-  --d1-domain d1_global_0p4 \
-  --hours 24 --nz 65 \
+# Global D1 -> Europe D2 -> Benelux/DE D3 nested run with coupled NEMO+SI3
+PYTHONPATH=python python3 scripts/run_tempest_v2.py \
+  --mode d1_to_d2_to_d3 \
   --enable-ocean-si3 \
-  --runs-root runs/global_coupled_smoke
+  --hours 24
+
+# Multi-season ARCO-ERA5 hindcast & KNMI AWS verification benchmark (e.g. quick4 preset)
+PYTHONPATH=python python3 scripts/run_benchmark_suite.py --preset quick4 --hours 24
+
+# Find notable historical Dutch weather cases in local KNMI archives
+python3 scripts/select_era5_cases.py --regime storm --top 10
+```
+
+Verify an existing forecast run directory against KNMI AWS stations & ERA5:
+
+```bash
+PYTHONPATH=python python3 scripts/verify_knmi_wx1.py --help
 ```
 
 ---
 
-## Repository Structure
+## Repository Layout
 
 ```text
-├── AGENTS.md                        # Project engineering rules (0% AI/ML, SI units, WX-1, minimal design)
-├── Cargo.toml / Cargo.lock          # Rust workspace (tempest-core + tempest-cuda)
-├── pyproject.toml                   # Python packaging (depends on PyPI tempest-wx1>=0.1.8)
+Tempest-NWPv2/
+├── Cargo.toml                         # Rust workspace (Apache-2.0)
+├── pyproject.toml                     # Python package metadata & dependencies
+├── LICENSE                            # Apache License 2.0
 ├── crates/
-│   ├── tempest-core/                # Rust geodesy, thermodynamic constants & core utilities
-│   └── tempest-cuda/
-│       ├── build.rs                 # Auto-detects GPU arch, supports RTX 50xx sm_120 & multi-arch fatbin
-│       └── src/cuda/
-│           ├── nh_core.cu           # Non-hydrostatic split-explicit RK3 / WENO-5 dynamical core
-│           ├── nh_physics.cu        # 6-class microphysics, YSU+EDMF PBL, ecRad SW/LW, 4L soil, FLake
-│           └── nh_ocean_si3.cu      # Self-contained NEMO 5.0.2 3D ocean + SI3 5-category sea-ice solver
-├── python/tempest_v2/               # Drivers, CUDA ctypes bridge, static preprocessors, DA, WX-1 I/O, verification
+│   ├── tempest-core/                  # Core Rust dynamical/state orchestration & WX-1 bridge
+│   └── tempest-cuda/                  # CUDA non-hydrostatic dycore, physics & NEMO/SI3 kernels
+├── python/tempest_v2/                 # Projections, IC/LBC builders, static pipelines, DA, verification
 ├── scripts/
-│   ├── build.sh                     # One-command Rust + CUDA build & test helper
-│   ├── download_static_data.py      # Copernicus DEM, GEBCO/EMODnet Bathymetry, FAO HWSD v2.2 downloader
-│   ├── run_tempest_v2.py            # Main operational & ERA5 hindcast CLI
-│   ├── run_benchmark_suite.py       # Resumable multi-season benchmark & KNMI/ERA5 scorecard runner
-│   ├── select_era5_cases.py         # Historical KNMI archive weather-regime case selector
-│   ├── verify_knmi_wx1.py           # Automated hourly KNMI + ARCO-ERA5/IFS verification CLI
-│   ├── export_wx1_products.py       # WX-1 derived synoptic/sounding product exporter
-│   └── run_operational_daemon.py    # Cycled operational forecast daemon
-├── docs/                            # Physics equations provenance & NEMO/SI3 port notes
-└── tests/                           # Pytest & CUDA regression suite
+│   ├── build.sh                       # GPU & Rust release build helper
+│   ├── download_static_data.py        # Open-access static geophysical data downloader
+│   ├── run_tempest_v2.py              # Operational forecast CLI
+│   ├── run_benchmark_suite.py         # Multi-regime ERA5 + KNMI validation suite
+│   ├── select_era5_cases.py           # KNMI station archive case selector
+│   └── verify_knmi_wx1.py             # Station + ERA5 verification CLI
+├── docs/
+│   ├── BENCHMARK_IMPROVEMENTS_STAP1_TO_6.md
+│   └── PHYSICS_SOURCES.md
+└── tests/                             # Rust + pytest verification suites
 ```
 
 ---
 
-## GitHub Private-to-Public Checklist
+## License & Data Attribution
 
-Before switching a private mirror to **public**:
-1. Confirm `git status` is clean and no secrets/keys (`KNMI_API_KEY`, `.env`, `config/knmi_api_key.txt`) or large `.wx1`/`.nc`/`.grib2`/`.tif`/`.mdb` binaries are tracked (all covered in `.gitignore`).
-2. Review/remove any personal scratch notebooks (e.g. `notebooks/aurora15_colab_fixed_v4.ipynb`) or machine-local path links (e.g. in `REPORT.md`) if desired.
-3. Add your preferred open-source `LICENSE` file (note `Cargo.toml` specifies `MIT OR Apache-2.0` and `pyproject.toml` specifies `Apache-2.0` — align both before public release).
-
----
-
-## Running Tests
-
-```bash
-# Rust & CUDA kernel tests (runs on GPU)
-cargo test --release
-
-# Python unit, physics, static-data, and pipeline tests
-pytest -q tests/
-```
+- **Source Code:** Licensed under the [Apache License, Version 2.0](LICENSE).
+- **Static Datasets:** Subject to their respective upstream open licenses when downloaded by users (Copernicus DEM EULA, GEBCO Terms of Use, ESA WorldCover CC BY 4.0, ISRIC SoilGrids CC BY 4.0, FAO HWSD v2.2 Terms, FABDEM CC BY 4.0 / OGL, PDOK AHN CC0).

@@ -36,10 +36,7 @@ def resolve_local_dem_root(local_root: Optional[Path | str] = None) -> Path:
     env_dir = os.environ.get("TEMPEST_COPERNICUS_DEM_DIR")
     if env_dir:
         return Path(env_dir)
-    if DEFAULT_LOCAL_DEM_ROOT.exists():
-        return DEFAULT_LOCAL_DEM_ROOT
-    fallback = Path("/mnt/d/AI/weer-ai/Tempest/COPERNICUS_DEM")
-    return fallback
+    return DEFAULT_LOCAL_DEM_ROOT
 
 
 def format_tile_stem(lat: int, lon: int, tag: str) -> Tuple[str, str]:
