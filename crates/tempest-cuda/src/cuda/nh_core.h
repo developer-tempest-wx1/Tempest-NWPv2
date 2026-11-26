@@ -131,8 +131,8 @@ typedef struct NhSurfaceStaticPtrs {
  */
 typedef struct NhSurfaceStatePtrs {
     float* t_skin;
-    float* soil_t;
-    float* soil_m;
+    double* soil_t;
+    double* soil_m;
     float* snow_swe;
     float* sst_bulk;
     float* dt_cool;
@@ -141,9 +141,9 @@ typedef struct NhSurfaceStatePtrs {
     float* lake_hmld;
     float* lake_ctheta;
     float* lake_hice;
-    float* rain_acc;
-    float* snow_acc;
-    float* graupel_acc;
+    double* rain_acc;
+    double* snow_acc;
+    double* graupel_acc;
     float* sw_down;
     float* lw_down;
     float* shf;
@@ -158,13 +158,13 @@ typedef struct NhSurfaceStatePtrs {
     float* sea_ice_thick;  /* Optional mean sea-ice thickness [m] */
     float* sea_ice_tsfc;   /* Optional sea-ice surface temp [K] */
     float* sea_ice_albedo; /* Optional sea-ice broadband albedo [-] */
-    float* lightning_acc;  /* Optional accumulated lightning flash density [flashes km^-2] */
+    double* lightning_acc;  /* Optional accumulated lightning flash density [flashes km^-2] */
 } NhSurfaceStatePtrs;
 
 typedef struct NhConstSurfaceStatePtrs {
     const float* t_skin;
-    const float* soil_t;
-    const float* soil_m;
+    const double* soil_t;
+    const double* soil_m;
     const float* snow_swe;
     const float* sst_bulk;
     const float* dt_cool;
@@ -173,9 +173,9 @@ typedef struct NhConstSurfaceStatePtrs {
     const float* lake_hmld;
     const float* lake_ctheta;
     const float* lake_hice;
-    const float* rain_acc;
-    const float* snow_acc;
-    const float* graupel_acc;
+    const double* rain_acc;
+    const double* snow_acc;
+    const double* graupel_acc;
     const float* sw_down;
     const float* lw_down;
     const float* shf;
@@ -190,7 +190,7 @@ typedef struct NhConstSurfaceStatePtrs {
     const float* sea_ice_thick;
     const float* sea_ice_tsfc;
     const float* sea_ice_albedo;
-    const float* lightning_acc;
+    const double* lightning_acc;
 } NhConstSurfaceStatePtrs;
 
 typedef struct NhCudaHandle NhCudaHandle;

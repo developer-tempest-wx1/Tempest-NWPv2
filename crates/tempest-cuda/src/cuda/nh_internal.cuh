@@ -43,6 +43,17 @@ struct DeviceStaticGrid {
     const double* hs;
     const double* msf;
     const double* fcor;
+    // Pre-converted FP32 shadows to eliminate per-stencil cvt.f32.f64 on 1:64 consumer GPUs
+    const float* zeta_w_f;
+    const float* zeta_s_f;
+    const float* dzeta_f;
+    const float* b_w_f;
+    const float* b_s_f;
+    const float* db_w_f;
+    const float* db_s_f;
+    const float* hs_f;
+    const float* msf_f;
+    const float* fcor_f;
 };
 
 constexpr float R_D_F = 287.058f;
@@ -294,6 +305,13 @@ __device__ inline float read_2d_f(
     return static_cast<float>(arr[idx_h(j, i, ny, nx, bc_x, bc_y)]);
 }
 
+__device__ inline float read_2d_f(
+    const float* arr, int32_t j, int32_t i,
+    int32_t ny, int32_t nx, int32_t bc_x, int32_t bc_y
+) {
+    return arr[idx_h(j, i, ny, nx, bc_x, bc_y)];
+}
+
 __device__ inline float read_s_f(
     const float* arr, int32_t k, int32_t j, int32_t i,
     int32_t nz, int32_t ny, int32_t nx, int32_t bc_x, int32_t bc_y
@@ -357,6 +375,9 @@ struct NhCudaHandle {
     double *d_zeta_w = nullptr, *d_zeta_s = nullptr, *d_dzeta = nullptr;
     double *d_b_w = nullptr, *d_b_s = nullptr, *d_db_w = nullptr, *d_db_s = nullptr;
     double *d_hs = nullptr, *d_msf = nullptr, *d_fcor = nullptr;
+    float *d_zeta_w_f = nullptr, *d_zeta_s_f = nullptr, *d_dzeta_f = nullptr;
+    float *d_b_w_f = nullptr, *d_b_s_f = nullptr, *d_db_w_f = nullptr, *d_db_s_f = nullptr;
+    float *d_hs_f = nullptr, *d_msf_f = nullptr, *d_fcor_f = nullptr;
 
     float *d_u = nullptr, *d_v = nullptr, *d_w = nullptr, *d_thp = nullptr, *d_pip = nullptr;
     float *d_qv = nullptr, *d_qc = nullptr, *d_qr = nullptr, *d_qi = nullptr, *d_qs = nullptr, *d_qg = nullptr;
@@ -389,10 +410,11 @@ struct NhCudaHandle {
     float *d_albedo_base = nullptr, *d_veg_frac = nullptr;
 
     // 2D / 4-layer prognostic & diagnostic surface state
-    float *d_t_skin = nullptr, *d_soil_t = nullptr, *d_soil_m = nullptr, *d_snow_swe = nullptr;
+    float *d_t_skin = nullptr, *d_snow_swe = nullptr;
+    double *d_soil_t = nullptr, *d_soil_m = nullptr;
     float *d_sst_bulk = nullptr, *d_dt_cool = nullptr, *d_dt_warm = nullptr;
     float *d_lake_tbot = nullptr, *d_lake_hmld = nullptr, *d_lake_ctheta = nullptr, *d_lake_hice = nullptr;
-    float *d_rain_acc = nullptr, *d_snow_acc = nullptr, *d_graupel_acc = nullptr, *d_lightning_acc = nullptr;
+    double *d_rain_acc = nullptr, *d_snow_acc = nullptr, *d_graupel_acc = nullptr, *d_lightning_acc = nullptr;
     float *d_sw_down = nullptr, *d_lw_down = nullptr, *d_shf = nullptr, *d_lhf = nullptr;
     float *d_ustar = nullptr, *d_pblh = nullptr, *d_t2m = nullptr, *d_q2m = nullptr, *d_u10m = nullptr, *d_v10m = nullptr;
     float *d_sea_ice_frac = nullptr, *d_sea_ice_thick = nullptr, *d_sea_ice_tsfc = nullptr, *d_sea_ice_albedo = nullptr;

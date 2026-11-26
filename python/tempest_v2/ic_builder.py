@@ -1082,7 +1082,8 @@ def save_tempest_restart_wx1(
     for k in NonHydrostaticGPUSolver.SURFACE_STATE_STRUCT_ORDER:
         if k not in surf_state:
             continue
-        arr = np.asarray(surf_state[k], dtype=np.float32)
+        dt = np.float64 if k in NonHydrostaticGPUSolver.SURFACE_FP64_FIELDS else np.float32
+        arr = np.asarray(surf_state[k], dtype=dt)
         if arr.ndim == 3:
             data_vars[k] = (("soil_layer", "y", "x"), arr)
         else:
@@ -1145,5 +1146,6 @@ def load_tempest_restart_wx1(
                 state_3d[k] = np.asarray(ds[k].values, dtype=np.float32)
         for k in NonHydrostaticGPUSolver.SURFACE_STATE_STRUCT_ORDER:
             if k in surf_keys and k in ds:
-                surf_state[k] = np.asarray(ds[k].values, dtype=np.float32)
+                dt = np.float64 if k in NonHydrostaticGPUSolver.SURFACE_FP64_FIELDS else np.float32
+                surf_state[k] = np.asarray(ds[k].values, dtype=dt)
     return state_3d, surf_state, meta

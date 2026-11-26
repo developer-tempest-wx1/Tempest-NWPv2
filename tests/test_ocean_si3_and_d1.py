@@ -285,7 +285,7 @@ def test_nemo_teos10_eos_and_freezing_point_accuracy() -> None:
     tf500 = freezing_temp_c(35.0, 500.0)
     assert -1.96 < tf0 < -1.86
     assert abs((tf500 - tf0) + 0.3765) < 1e-3
-    assert estimate_ocean_si3_vram_bytes(16, 721, 1440, enable_si3=True) < 1_300_000_000
+    assert estimate_ocean_si3_vram_bytes(16, 721, 1440, enable_si3=True) < 1_500_000_000
 
 
 def test_nemo_barotropic_inverse_barometer_and_land_mask_isolation() -> None:

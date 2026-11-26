@@ -133,8 +133,8 @@ pub struct NhSurfaceStaticPtrs {
 #[repr(C)]
 pub struct NhSurfaceStatePtrs {
     pub t_skin: *mut f32,
-    pub soil_t: *mut f32,
-    pub soil_m: *mut f32,
+    pub soil_t: *mut f64,
+    pub soil_m: *mut f64,
     pub snow_swe: *mut f32,
     pub sst_bulk: *mut f32,
     pub dt_cool: *mut f32,
@@ -143,9 +143,9 @@ pub struct NhSurfaceStatePtrs {
     pub lake_hmld: *mut f32,
     pub lake_ctheta: *mut f32,
     pub lake_hice: *mut f32,
-    pub rain_acc: *mut f32,
-    pub snow_acc: *mut f32,
-    pub graupel_acc: *mut f32,
+    pub rain_acc: *mut f64,
+    pub snow_acc: *mut f64,
+    pub graupel_acc: *mut f64,
     pub sw_down: *mut f32,
     pub lw_down: *mut f32,
     pub shf: *mut f32,
@@ -160,14 +160,14 @@ pub struct NhSurfaceStatePtrs {
     pub sea_ice_thick: *mut f32,
     pub sea_ice_tsfc: *mut f32,
     pub sea_ice_albedo: *mut f32,
-    pub lightning_acc: *mut f32,
+    pub lightning_acc: *mut f64,
 }
 
 #[repr(C)]
 pub struct NhConstSurfaceStatePtrs {
     pub t_skin: *const f32,
-    pub soil_t: *const f32,
-    pub soil_m: *const f32,
+    pub soil_t: *const f64,
+    pub soil_m: *const f64,
     pub snow_swe: *const f32,
     pub sst_bulk: *const f32,
     pub dt_cool: *const f32,
@@ -176,9 +176,9 @@ pub struct NhConstSurfaceStatePtrs {
     pub lake_hmld: *const f32,
     pub lake_ctheta: *const f32,
     pub lake_hice: *const f32,
-    pub rain_acc: *const f32,
-    pub snow_acc: *const f32,
-    pub graupel_acc: *const f32,
+    pub rain_acc: *const f64,
+    pub snow_acc: *const f64,
+    pub graupel_acc: *const f64,
     pub sw_down: *const f32,
     pub lw_down: *const f32,
     pub shf: *const f32,
@@ -193,7 +193,7 @@ pub struct NhConstSurfaceStatePtrs {
     pub sea_ice_thick: *const f32,
     pub sea_ice_tsfc: *const f32,
     pub sea_ice_albedo: *const f32,
-    pub lightning_acc: *const f32,
+    pub lightning_acc: *const f64,
 }
 
 #[repr(C)]
@@ -724,6 +724,6 @@ mod tests {
         assert!((rho_deep - 1028.21993233072).abs() < 1e-10, "rho_deep={rho_deep}");
         assert!((tf_surf + 1.91).abs() < 0.05, "tf_surf={tf_surf}");
         assert!((tf_deep - (tf_surf - 0.3765)).abs() < 0.01, "tf_deep={tf_deep}");
-        assert!(vram_d1 < 1_300_000_000, "vram_d1={vram_d1}");
+        assert!(vram_d1 < 1_500_000_000, "vram_d1={vram_d1}");
     }
 }

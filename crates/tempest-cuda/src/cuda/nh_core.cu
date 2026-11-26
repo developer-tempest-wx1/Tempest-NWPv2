@@ -19,6 +19,16 @@ inline void set_error(const char* msg) {
     snprintf(g_last_error, sizeof(g_last_error), "%s", msg);
 }
 
+inline cudaError_t upload_f64_and_f32(double* d_f64, float* d_f32, const double* h_src, size_t n) {
+    cudaError_t err = cudaMemcpy(d_f64, h_src, n * sizeof(double), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) return err;
+    std::vector<float> tmp(n);
+    for (size_t idx = 0; idx < n; ++idx) {
+        tmp[idx] = static_cast<float>(h_src[idx]);
+    }
+    return cudaMemcpy(d_f32, tmp.data(), n * sizeof(float), cudaMemcpyHostToDevice);
+}
+
 #define CUDA_CHECK(expr)                                                        \
     do {                                                                        \
         cudaError_t _err = (expr);                                              \
@@ -349,7 +359,7 @@ __device__ inline float horiz_face_val_y_f(
 
 __device__ inline float vert_tvd_face_val_f(
     const float* f, int32_t k_face, int32_t j, int32_t i, float dir_w,
-    const double* dzeta, int32_t nz, int32_t ny, int32_t nx, int32_t bc_x, int32_t bc_y
+    const float* dzeta_f, int32_t nz, int32_t ny, int32_t nx, int32_t bc_x, int32_t bc_y
 ) {
     // Reconstruct scalar onto interface k_face (between k_face-1 and k_face).
     if (k_face <= 0) return read_s_f(f, 0, j, i, nz, ny, nx, bc_x, bc_y);
@@ -360,9 +370,9 @@ __device__ inline float vert_tvd_face_val_f(
         if (km == 0) return vc;
         const float vm = read_s_f(f, km - 1, j, i, nz, ny, nx, bc_x, bc_y);
         const float vp = read_s_f(f, km + 1, j, i, nz, ny, nx, bc_x, bc_y);
-        const float dz_km = static_cast<float>(dzeta[km]);
-        const float dz_prev = static_cast<float>(dzeta[km - 1]);
-        const float dz_next = static_cast<float>(dzeta[km + 1]);
+        const float dz_km = dzeta_f[km];
+        const float dz_prev = dzeta_f[km - 1];
+        const float dz_next = dzeta_f[km + 1];
         const float dl = (vc - vm) / (0.5f * (dz_km + dz_prev));
         const float dr = (vp - vc) / (0.5f * (dz_next + dz_km));
         return vc + 0.5f * dz_km * koren_slope_f(dl, dr);
@@ -372,9 +382,9 @@ __device__ inline float vert_tvd_face_val_f(
         if (kp == nz - 1) return vc;
         const float vm = read_s_f(f, kp - 1, j, i, nz, ny, nx, bc_x, bc_y);
         const float vp = read_s_f(f, kp + 1, j, i, nz, ny, nx, bc_x, bc_y);
-        const float dz_kp = static_cast<float>(dzeta[kp]);
-        const float dz_prev = static_cast<float>(dzeta[kp - 1]);
-        const float dz_next = static_cast<float>(dzeta[kp + 1]);
+        const float dz_kp = dzeta_f[kp];
+        const float dz_prev = dzeta_f[kp - 1];
+        const float dz_next = dzeta_f[kp + 1];
         const float dl = (vc - vm) / (0.5f * (dz_kp + dz_prev));
         const float dr = (vp - vc) / (0.5f * (dz_next + dz_kp));
         return vc - 0.5f * dz_kp * koren_slope_f(dl, dr);
@@ -397,16 +407,16 @@ __device__ inline void compute_contravariant_at_scalar_col_f(
         return;
     }
     const int32_t nz = cfg.nz, ny = cfg.ny, nx = cfg.nx;
-    const float msf = read_2d_f(g.msf, j, i, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float msf = read_2d_f(g.msf_f, j, i, ny, nx, cfg.bc_x, cfg.bc_y);
     const float dx_f = static_cast<float>(cfg.dx_m);
     const float dy_f = static_cast<float>(cfg.dy_m);
-    const float dh_dx = (read_2d_f(g.hs, j, i + 1, ny, nx, cfg.bc_x, cfg.bc_y) -
-                         read_2d_f(g.hs, j, i - 1, ny, nx, cfg.bc_x, cfg.bc_y)) / (2.0f * dx_f);
-    const float dh_dy = (read_2d_f(g.hs, j + 1, i, ny, nx, cfg.bc_x, cfg.bc_y) -
-                         read_2d_f(g.hs, j - 1, i, ny, nx, cfg.bc_x, cfg.bc_y)) / (2.0f * dy_f);
+    const float dh_dx = (read_2d_f(g.hs_f, j, i + 1, ny, nx, cfg.bc_x, cfg.bc_y) -
+                         read_2d_f(g.hs_f, j, i - 1, ny, nx, cfg.bc_x, cfg.bc_y)) / (2.0f * dx_f);
+    const float dh_dy = (read_2d_f(g.hs_f, j + 1, i, ny, nx, cfg.bc_x, cfg.bc_y) -
+                         read_2d_f(g.hs_f, j - 1, i, ny, nx, cfg.bc_x, cfg.bc_y)) / (2.0f * dy_f);
 
-    const float ds_k = static_cast<float>(g.dzeta[k_iface]);
-    const float ds_km = static_cast<float>(g.dzeta[k_iface - 1]);
+    const float ds_k = g.dzeta_f[k_iface];
+    const float ds_km = g.dzeta_f[k_iface - 1];
     const float wt = ds_km / (ds_k + ds_km);
 
     const float u_lo = 0.5f * (read_u_f(u, k_iface - 1, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y) +
@@ -421,7 +431,7 @@ __device__ inline void compute_contravariant_at_scalar_col_f(
     const float u_w = (1.0f - wt) * u_lo + wt * u_hi;
     const float v_w = (1.0f - wt) * v_lo + wt * v_hi;
     const float w_val = read_w_f(w, k_iface, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y);
-    const float bw = static_cast<float>(g.b_w[k_iface]);
+    const float bw = g.b_w_f[k_iface];
     const float my = cfg.is_spherical ? 1.0f : msf;
     gdotzeta_out = w_val - bw * (msf * u_w * dh_dx + my * v_w * dh_dy);
 }
@@ -456,11 +466,11 @@ __global__ void nh_slow_scalar_kernel(
 
     const float dx_f = static_cast<float>(cfg.dx_m);
     const float dy_f = static_cast<float>(cfg.dy_m);
-    const float dz_k = static_cast<float>(g.dzeta[k]);
-    const float msf = static_cast<float>(g.msf[j * nx + i]);
+    const float dz_k = g.dzeta_f[k];
+    const float msf = g.msf_f[j * nx + i];
     const float my = cfg.is_spherical ? 1.0f : msf;
-    const float hs = static_cast<float>(g.hs[j * nx + i]);
-    const float g_s = 1.0f + static_cast<float>(g.db_s[k]) * hs;
+    const float hs = g.hs_f[j * nx + i];
+    const float g_s = 1.0f + g.db_s_f[k] * hs;
 
     const float uc = 0.5f * (read_u_f(u, k, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y) +
                              read_u_f(u, k, j, i + 1, nz, ny, nx, cfg.bc_x, cfg.bc_y));
@@ -479,8 +489,8 @@ __global__ void nh_slow_scalar_kernel(
     const float th_xm = horiz_face_val_x_f(thp, k, j, i,     uc, nz, ny, nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
     const float th_yp = horiz_face_val_y_f(thp, k, j + 1, i, vc, nz, ny, nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
     const float th_ym = horiz_face_val_y_f(thp, k, j,     i, vc, nz, ny, nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
-    const float th_zp = vert_tvd_face_val_f(thp, k + 1, j, i, zd_exp, g.dzeta, nz, ny, nx, cfg.bc_x, cfg.bc_y);
-    const float th_zm = vert_tvd_face_val_f(thp, k,     j, i, zd_exp, g.dzeta, nz, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float th_zp = vert_tvd_face_val_f(thp, k + 1, j, i, zd_exp, g.dzeta_f, nz, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float th_zm = vert_tvd_face_val_f(thp, k,     j, i, zd_exp, g.dzeta_f, nz, ny, nx, cfg.bc_x, cfg.bc_y);
 
     float tend_th = -(msf * uc * (th_xp - th_xm) / dx_f + my * vc * (th_yp - th_ym) / dy_f)
                     - zd_exp * (th_zp - th_zm) / dz_k;
@@ -490,8 +500,8 @@ __global__ void nh_slow_scalar_kernel(
     const float pi_xm = horiz_face_val_x_f(pip, k, j, i,     uc, nz, ny, nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
     const float pi_yp = horiz_face_val_y_f(pip, k, j + 1, i, vc, nz, ny, nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
     const float pi_ym = horiz_face_val_y_f(pip, k, j,     i, vc, nz, ny, nx, cfg.bc_x, cfg.bc_y, cfg.adv_order);
-    const float pi_zp = vert_tvd_face_val_f(pip, k + 1, j, i, zd_exp, g.dzeta, nz, ny, nx, cfg.bc_x, cfg.bc_y);
-    const float pi_zm = vert_tvd_face_val_f(pip, k,     j, i, zd_exp, g.dzeta, nz, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float pi_zp = vert_tvd_face_val_f(pip, k + 1, j, i, zd_exp, g.dzeta_f, nz, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float pi_zm = vert_tvd_face_val_f(pip, k,     j, i, zd_exp, g.dzeta_f, nz, ny, nx, cfg.bc_x, cfg.bc_y);
 
     float tend_pi = -(msf * uc * (pi_xp - pi_xm) / dx_f + my * vc * (pi_yp - pi_ym) / dy_f)
                     - zd_exp * (pi_zp - pi_zm) / dz_k;
@@ -509,11 +519,11 @@ __global__ void nh_slow_scalar_kernel(
         const float dz_c = g_s * dz_k;
         float lap_v = 0.0f;
         if (k < nz - 1) {
-            const float dz_p = 0.5f * (dz_c + (1.0f + static_cast<float>(g.db_s[k + 1]) * hs) * static_cast<float>(g.dzeta[k + 1]));
+            const float dz_p = 0.5f * (dz_c + (1.0f + g.db_s_f[k + 1] * hs) * g.dzeta_f[k + 1]);
             lap_v += (read_s_f(thp, k + 1, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y) - th0) / (dz_p * dz_c);
         }
         if (k > 0) {
-            const float dz_m = 0.5f * (dz_c + (1.0f + static_cast<float>(g.db_s[k - 1]) * hs) * static_cast<float>(g.dzeta[k - 1]));
+            const float dz_m = 0.5f * (dz_c + (1.0f + g.db_s_f[k - 1] * hs) * g.dzeta_f[k - 1]);
             lap_v -= (th0 - read_s_f(thp, k - 1, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y)) / (dz_m * dz_c);
         }
         tend_th += static_cast<float>(cfg.kh_const) * (lap_h + lap_v);
@@ -596,12 +606,12 @@ __global__ void nh_slow_u_kernel(
     const int32_t ir = (cfg.bc_x == 1) ? wrap_idx(i, nx) : ((i >= nx) ? nx - 1 : i);
     const float dx_f = static_cast<float>(cfg.dx_m);
     const float dy_f = static_cast<float>(cfg.dy_m);
-    const float msf_l0 = static_cast<float>(g.msf[j * nx + il]);
-    const float msf_r0 = static_cast<float>(g.msf[j * nx + ir]);
+    const float msf_l0 = g.msf_f[j * nx + il];
+    const float msf_r0 = g.msf_f[j * nx + ir];
     const float msf = 0.5f * (msf_l0 + msf_r0);
     const float my = cfg.is_spherical ? 1.0f : msf;
-    const float hs_u = 0.5f * (static_cast<float>(g.hs[j * nx + il]) + static_cast<float>(g.hs[j * nx + ir]));
-    const float g_u = 1.0f + static_cast<float>(g.db_s[k]) * hs_u;
+    const float hs_u = 0.5f * (g.hs_f[j * nx + il] + g.hs_f[j * nx + ir]);
+    const float g_u = 1.0f + g.db_s_f[k] * hs_u;
 
     const float uc = read_u_f(u, k, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y);
     const float vc = 0.25f * (
@@ -637,28 +647,28 @@ __global__ void nh_slow_u_kernel(
         dudy = (up3_left_f(u_get(k, j + 2, i), u_get(k, j + 1, i), uc) -
                 up3_left_f(u_get(k, j + 1, i), uc, u_get(k, j - 1, i))) / dy_f;
     }
-    const float dz_k = static_cast<float>(g.dzeta[k]);
+    const float dz_k = g.dzeta_f[k];
     const float zd_cap = 0.45f * dz_k / fmaxf(tau_stage, 1e-6f);
     const float zd_exp = fmaxf(-zd_cap, fminf(zd_cap, zeta_dot));
     float dudz = 0.0f;
     if (zd_exp >= 0.0f && k > 0) {
-        dudz = (uc - u_get(k - 1, j, i)) / (0.5f * (dz_k + static_cast<float>(g.dzeta[k - 1])));
+        dudz = (uc - u_get(k - 1, j, i)) / (0.5f * (dz_k + g.dzeta_f[k - 1]));
     } else if (zd_exp < 0.0f && k < nz - 1) {
-        dudz = (u_get(k + 1, j, i) - uc) / (0.5f * (static_cast<float>(g.dzeta[k + 1]) + dz_k));
+        dudz = (u_get(k + 1, j, i) - uc) / (0.5f * (g.dzeta_f[k + 1] + dz_k));
     }
 
     float tend = -(msf * uc * dudx + my * vc * dudy) - zd_exp * dudz;
 
     if (cfg.use_coriolis) {
-        const float f_u = 0.5f * (static_cast<float>(g.fcor[j * nx + il]) + static_cast<float>(g.fcor[j * nx + ir]));
+        const float f_u = 0.5f * (g.fcor_f[j * nx + il] + g.fcor_f[j * nx + ir]);
         if (cfg.is_spherical) {
             const float tan_phi = fminf(20.0f, fmaxf(-20.0f, (f_u * msf) / (2.0f * OMEGA_F)));
             tend += (f_u + (uc * tan_phi) / EARTH_RADIUS_F) * vc;
         } else {
-            const float dm_dy = (read_2d_f(g.msf, j + 1, il, ny, nx, cfg.bc_x, cfg.bc_y) -
-                                 read_2d_f(g.msf, j - 1, il, ny, nx, cfg.bc_x, cfg.bc_y) +
-                                 read_2d_f(g.msf, j + 1, ir, ny, nx, cfg.bc_x, cfg.bc_y) -
-                                 read_2d_f(g.msf, j - 1, ir, ny, nx, cfg.bc_x, cfg.bc_y)) / (4.0f * dy_f);
+            const float dm_dy = (read_2d_f(g.msf_f, j + 1, il, ny, nx, cfg.bc_x, cfg.bc_y) -
+                                 read_2d_f(g.msf_f, j - 1, il, ny, nx, cfg.bc_x, cfg.bc_y) +
+                                 read_2d_f(g.msf_f, j + 1, ir, ny, nx, cfg.bc_x, cfg.bc_y) -
+                                 read_2d_f(g.msf_f, j - 1, ir, ny, nx, cfg.bc_x, cfg.bc_y)) / (4.0f * dy_f);
             const float dm_dx = (msf_r0 - msf_l0) / dx_f;
             tend += (f_u + uc * dm_dy - vc * dm_dx) * vc;
         }
@@ -670,11 +680,11 @@ __global__ void nh_slow_u_kernel(
         const float dz_c = g_u * dz_k;
         float lap_v = 0.0f;
         if (k < nz - 1) {
-            const float dz_p = 0.5f * (dz_c + (1.0f + static_cast<float>(g.db_s[k + 1]) * hs_u) * static_cast<float>(g.dzeta[k + 1]));
+            const float dz_p = 0.5f * (dz_c + (1.0f + g.db_s_f[k + 1] * hs_u) * g.dzeta_f[k + 1]);
             lap_v += (u_get(k + 1, j, i) - uc) / (dz_p * dz_c);
         }
         if (k > 0) {
-            const float dz_m = 0.5f * (dz_c + (1.0f + static_cast<float>(g.db_s[k - 1]) * hs_u) * static_cast<float>(g.dzeta[k - 1]));
+            const float dz_m = 0.5f * (dz_c + (1.0f + g.db_s_f[k - 1] * hs_u) * g.dzeta_f[k - 1]);
             lap_v -= (uc - u_get(k - 1, j, i)) / (dz_m * dz_c);
         }
         tend += static_cast<float>(cfg.km_const) * (lap_h + lap_v);
@@ -743,12 +753,12 @@ __global__ void nh_slow_v_kernel(
     const int32_t jr = (cfg.bc_y == 1) ? wrap_idx(j, ny) : ((j >= ny) ? ny - 1 : j);
     const float dx_f = static_cast<float>(cfg.dx_m);
     const float dy_f = static_cast<float>(cfg.dy_m);
-    const float msf_l0 = static_cast<float>(g.msf[jl * nx + i]);
-    const float msf_r0 = static_cast<float>(g.msf[jr * nx + i]);
+    const float msf_l0 = g.msf_f[jl * nx + i];
+    const float msf_r0 = g.msf_f[jr * nx + i];
     const float msf = 0.5f * (msf_l0 + msf_r0);
     const float my = cfg.is_spherical ? 1.0f : msf;
-    const float hs_v = 0.5f * (static_cast<float>(g.hs[jl * nx + i]) + static_cast<float>(g.hs[jr * nx + i]));
-    const float g_v = 1.0f + static_cast<float>(g.db_s[k]) * hs_v;
+    const float hs_v = 0.5f * (g.hs_f[jl * nx + i] + g.hs_f[jr * nx + i]);
+    const float g_v = 1.0f + g.db_s_f[k] * hs_v;
 
     const float vc = read_v_f(v, k, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y);
     const float uc = 0.25f * (
@@ -783,28 +793,28 @@ __global__ void nh_slow_v_kernel(
         dvdy = (up3_left_f(v_get(k, j + 2, i), v_get(k, j + 1, i), vc) -
                 up3_left_f(v_get(k, j + 1, i), vc, v_get(k, j - 1, i))) / dy_f;
     }
-    const float dz_k = static_cast<float>(g.dzeta[k]);
+    const float dz_k = g.dzeta_f[k];
     const float zd_cap = 0.45f * dz_k / fmaxf(tau_stage, 1e-6f);
     const float zd_exp = fmaxf(-zd_cap, fminf(zd_cap, zeta_dot));
     float dvdz = 0.0f;
     if (zd_exp >= 0.0f && k > 0) {
-        dvdz = (vc - v_get(k - 1, j, i)) / (0.5f * (dz_k + static_cast<float>(g.dzeta[k - 1])));
+        dvdz = (vc - v_get(k - 1, j, i)) / (0.5f * (dz_k + g.dzeta_f[k - 1]));
     } else if (zd_exp < 0.0f && k < nz - 1) {
-        dvdz = (v_get(k + 1, j, i) - vc) / (0.5f * (static_cast<float>(g.dzeta[k + 1]) + dz_k));
+        dvdz = (v_get(k + 1, j, i) - vc) / (0.5f * (g.dzeta_f[k + 1] + dz_k));
     }
 
     float tend = -(msf * uc * dvdx + my * vc * dvdy) - zd_exp * dvdz;
 
     if (cfg.use_coriolis) {
-        const float f_v = 0.5f * (static_cast<float>(g.fcor[jl * nx + i]) + static_cast<float>(g.fcor[jr * nx + i]));
+        const float f_v = 0.5f * (g.fcor_f[jl * nx + i] + g.fcor_f[jr * nx + i]);
         if (cfg.is_spherical) {
             const float tan_phi = fminf(20.0f, fmaxf(-20.0f, (f_v * msf) / (2.0f * OMEGA_F)));
             tend -= (f_v + (uc * tan_phi) / EARTH_RADIUS_F) * uc;
         } else {
-            const float dm_dx = (read_2d_f(g.msf, jl, i + 1, ny, nx, cfg.bc_x, cfg.bc_y) -
-                                 read_2d_f(g.msf, jl, i - 1, ny, nx, cfg.bc_x, cfg.bc_y) +
-                                 read_2d_f(g.msf, jr, i + 1, ny, nx, cfg.bc_x, cfg.bc_y) -
-                                 read_2d_f(g.msf, jr, i - 1, ny, nx, cfg.bc_x, cfg.bc_y)) / (4.0f * dx_f);
+            const float dm_dx = (read_2d_f(g.msf_f, jl, i + 1, ny, nx, cfg.bc_x, cfg.bc_y) -
+                                 read_2d_f(g.msf_f, jl, i - 1, ny, nx, cfg.bc_x, cfg.bc_y) +
+                                 read_2d_f(g.msf_f, jr, i + 1, ny, nx, cfg.bc_x, cfg.bc_y) -
+                                 read_2d_f(g.msf_f, jr, i - 1, ny, nx, cfg.bc_x, cfg.bc_y)) / (4.0f * dx_f);
             const float dm_dy = (msf_r0 - msf_l0) / dy_f;
             tend -= (f_v + uc * dm_dy - vc * dm_dx) * uc;
         }
@@ -816,11 +826,11 @@ __global__ void nh_slow_v_kernel(
         const float dz_c = g_v * dz_k;
         float lap_v = 0.0f;
         if (k < nz - 1) {
-            const float dz_p = 0.5f * (dz_c + (1.0f + static_cast<float>(g.db_s[k + 1]) * hs_v) * static_cast<float>(g.dzeta[k + 1]));
+            const float dz_p = 0.5f * (dz_c + (1.0f + g.db_s_f[k + 1] * hs_v) * g.dzeta_f[k + 1]);
             lap_v += (v_get(k + 1, j, i) - vc) / (dz_p * dz_c);
         }
         if (k > 0) {
-            const float dz_m = 0.5f * (dz_c + (1.0f + static_cast<float>(g.db_s[k - 1]) * hs_v) * static_cast<float>(g.dzeta[k - 1]));
+            const float dz_m = 0.5f * (dz_c + (1.0f + g.db_s_f[k - 1] * hs_v) * g.dzeta_f[k - 1]);
             lap_v -= (vc - v_get(k - 1, j, i)) / (dz_m * dz_c);
         }
         tend += static_cast<float>(cfg.km_const) * (lap_h + lap_v);
@@ -884,11 +894,11 @@ __global__ void nh_slow_w_kernel(
     const size_t idx = static_cast<size_t>(k) * ny * nx + static_cast<size_t>(j) * nx + i;
     const float dx_f = static_cast<float>(cfg.dx_m);
     const float dy_f = static_cast<float>(cfg.dy_m);
-    const float msf = static_cast<float>(g.msf[j * nx + i]);
+    const float msf = g.msf_f[j * nx + i];
     const float my = cfg.is_spherical ? 1.0f : msf;
-    const float hs = static_cast<float>(g.hs[j * nx + i]);
-    const float ds_k = static_cast<float>(g.dzeta[k]);
-    const float ds_km = static_cast<float>(g.dzeta[k - 1]);
+    const float hs = g.hs_f[j * nx + i];
+    const float ds_k = g.dzeta_f[k];
+    const float ds_km = g.dzeta_f[k - 1];
     const float wt = ds_km / (ds_k + ds_km);
 
     const float u_w = (1.0f - wt) * 0.5f * (read_u_f(u, k - 1, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y) +
@@ -901,7 +911,7 @@ __global__ void nh_slow_w_kernel(
                                             read_v_f(v, k, j + 1, i, nz, ny, nx, cfg.bc_x, cfg.bc_y));
     float gz_w = 0.0f;
     compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, k, j, i, gz_w);
-    const float g_w = 1.0f + static_cast<float>(g.db_w[k]) * hs;
+    const float g_w = 1.0f + g.db_w_f[k] * hs;
     const float zeta_dot = gz_w / fmaxf(g_w, 1e-4f);
 
     auto w_get = [&](int32_t kk, int32_t jj, int32_t ii) -> float {
@@ -940,8 +950,8 @@ __global__ void nh_slow_w_kernel(
         const float lap_h = (msf * msf) * (w_get(k, j, i + 1) - 2.0f * wc + w_get(k, j, i - 1)) / (dx_f * dx_f)
                           + (my  * my ) * (w_get(k, j + 1, i) - 2.0f * wc + w_get(k, j - 1, i)) / (dy_f * dy_f);
         const float dz_w = g_w * 0.5f * (ds_k + ds_km);
-        const float dz_p = (1.0f + static_cast<float>(g.db_s[k]) * hs) * ds_k;
-        const float dz_m = (1.0f + static_cast<float>(g.db_s[k - 1]) * hs) * ds_km;
+        const float dz_p = (1.0f + g.db_s_f[k] * hs) * ds_k;
+        const float dz_m = (1.0f + g.db_s_f[k - 1] * hs) * ds_km;
         const float lap_v = ((w_get(k + 1, j, i) - wc) / dz_p - (wc - w_get(k - 1, j, i)) / dz_m) / dz_w;
         tend += static_cast<float>(cfg.km_const) * (lap_h + lap_v);
     }
@@ -986,7 +996,7 @@ __global__ void nh_ieva_vert_advect_scalar_kernel(
     const int32_t nz = cfg.nz, ny = cfg.ny, nx = cfg.nx;
     const size_t col_stride = static_cast<size_t>(ny) * nx;
     const size_t col = static_cast<size_t>(j) * nx + i;
-    const float hs = static_cast<float>(g.hs[col]);
+    const float hs = g.hs_f[col];
     const float tau_safe = fmaxf(tau_stage, 1e-6f);
 
     bool any_imp = false;
@@ -995,10 +1005,10 @@ __global__ void nh_ieva_vert_advect_scalar_kernel(
     for (int32_t k = 0; k < nz; ++k) {
         float gz_hi = 0.0f;
         compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, k + 1, j, i, gz_hi);
-        const float g_s = 1.0f + static_cast<float>(g.db_s[k]) * hs;
+        const float g_s = 1.0f + g.db_s_f[k] * hs;
         const float zd = 0.5f * (gz_lo + gz_hi) / fmaxf(g_s, 1e-4f);
         gz_lo = gz_hi;
-        const float dz_k = static_cast<float>(g.dzeta[k]);
+        const float dz_k = g.dzeta_f[k];
         const float zd_cap = 0.45f * dz_k / tau_safe;
         if (fabsf(zd) > zd_cap) {
             any_imp = true;
@@ -1012,10 +1022,10 @@ __global__ void nh_ieva_vert_advect_scalar_kernel(
     for (int32_t k = 0; k < nz; ++k) {
         float gz_hi = 0.0f;
         compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, k + 1, j, i, gz_hi);
-        const float g_s = 1.0f + static_cast<float>(g.db_s[k]) * hs;
+        const float g_s = 1.0f + g.db_s_f[k] * hs;
         const float zd = 0.5f * (gz_lo + gz_hi) / fmaxf(g_s, 1e-4f);
         gz_lo = gz_hi;
-        const float dz_k = static_cast<float>(g.dzeta[k]);
+        const float dz_k = g.dzeta_f[k];
         const float zd_cap = 0.45f * dz_k / tau_safe;
         const float zd_exp = fmaxf(-zd_cap, fminf(zd_cap, zd));
         const double zd_imp = static_cast<double>(zd - zd_exp);
@@ -1048,10 +1058,10 @@ __global__ void nh_ieva_vert_advect_scalar_kernel(
     for (int32_t k = 0; k < nz; ++k) {
         float gz_hi = 0.0f;
         compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, k + 1, j, i, gz_hi);
-        const float g_s = 1.0f + static_cast<float>(g.db_s[k]) * hs;
+        const float g_s = 1.0f + g.db_s_f[k] * hs;
         const float zd = 0.5f * (gz_lo + gz_hi) / fmaxf(g_s, 1e-4f);
         gz_lo = gz_hi;
-        const float dz_k = static_cast<float>(g.dzeta[k]);
+        const float dz_k = g.dzeta_f[k];
         const float zd_cap = 0.45f * dz_k / tau_safe;
         const float zd_exp = fmaxf(-zd_cap, fminf(zd_cap, zd));
         const double zd_imp = static_cast<double>(zd - zd_exp);
@@ -1100,7 +1110,7 @@ __global__ void nh_ieva_vert_advect_u_kernel(
     const size_t col = static_cast<size_t>(j) * (nx + 1) + i;
     const int32_t il = (cfg.bc_x == 1) ? wrap_idx(i - 1, nx) : ((i <= 0) ? 0 : i - 1);
     const int32_t ir = (cfg.bc_x == 1) ? wrap_idx(i, nx) : ((i >= nx) ? nx - 1 : i);
-    const float hs_u = 0.5f * (static_cast<float>(g.hs[j * nx + il]) + static_cast<float>(g.hs[j * nx + ir]));
+    const float hs_u = 0.5f * (g.hs_f[j * nx + il] + g.hs_f[j * nx + ir]);
     const float tau_safe = fmaxf(tau_stage, 1e-6f);
 
     bool any_imp = false;
@@ -1111,10 +1121,10 @@ __global__ void nh_ieva_vert_advect_u_kernel(
         float gzl_hi = 0.0f, gzr_hi = 0.0f;
         compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, k + 1, j, il, gzl_hi);
         compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, k + 1, j, ir, gzr_hi);
-        const float g_u = 1.0f + static_cast<float>(g.db_s[k]) * hs_u;
+        const float g_u = 1.0f + g.db_s_f[k] * hs_u;
         const float zd = 0.25f * (gzl_lo + gzl_hi + gzr_lo + gzr_hi) / fmaxf(g_u, 1e-4f);
         gzl_lo = gzl_hi; gzr_lo = gzr_hi;
-        const float dz_k = static_cast<float>(g.dzeta[k]);
+        const float dz_k = g.dzeta_f[k];
         if (fabsf(zd) > 0.45f * dz_k / tau_safe) {
             any_imp = true;
             break;
@@ -1128,10 +1138,10 @@ __global__ void nh_ieva_vert_advect_u_kernel(
         float gzl_hi = 0.0f, gzr_hi = 0.0f;
         compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, k + 1, j, il, gzl_hi);
         compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, k + 1, j, ir, gzr_hi);
-        const float g_u = 1.0f + static_cast<float>(g.db_s[k]) * hs_u;
+        const float g_u = 1.0f + g.db_s_f[k] * hs_u;
         const float zd = 0.25f * (gzl_lo + gzl_hi + gzr_lo + gzr_hi) / fmaxf(g_u, 1e-4f);
         gzl_lo = gzl_hi; gzr_lo = gzr_hi;
-        const float dz_k = static_cast<float>(g.dzeta[k]);
+        const float dz_k = g.dzeta_f[k];
         const float zd_cap = 0.45f * dz_k / tau_safe;
         const float zd_exp = fmaxf(-zd_cap, fminf(zd_cap, zd));
         const double zd_imp = static_cast<double>(zd - zd_exp);
@@ -1180,7 +1190,7 @@ __global__ void nh_ieva_vert_advect_v_kernel(
     const size_t col = static_cast<size_t>(j) * nx + i;
     const int32_t jl = (cfg.bc_y == 1) ? wrap_idx(j - 1, ny) : ((j <= 0) ? 0 : j - 1);
     const int32_t jr = (cfg.bc_y == 1) ? wrap_idx(j, ny) : ((j >= ny) ? ny - 1 : j);
-    const float hs_v = 0.5f * (static_cast<float>(g.hs[jl * nx + i]) + static_cast<float>(g.hs[jr * nx + i]));
+    const float hs_v = 0.5f * (g.hs_f[jl * nx + i] + g.hs_f[jr * nx + i]);
     const float tau_safe = fmaxf(tau_stage, 1e-6f);
 
     bool any_imp = false;
@@ -1191,10 +1201,10 @@ __global__ void nh_ieva_vert_advect_v_kernel(
         float gzl_hi = 0.0f, gzr_hi = 0.0f;
         compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, k + 1, jl, i, gzl_hi);
         compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, k + 1, jr, i, gzr_hi);
-        const float g_v = 1.0f + static_cast<float>(g.db_s[k]) * hs_v;
+        const float g_v = 1.0f + g.db_s_f[k] * hs_v;
         const float zd = 0.25f * (gzl_lo + gzl_hi + gzr_lo + gzr_hi) / fmaxf(g_v, 1e-4f);
         gzl_lo = gzl_hi; gzr_lo = gzr_hi;
-        const float dz_k = static_cast<float>(g.dzeta[k]);
+        const float dz_k = g.dzeta_f[k];
         if (fabsf(zd) > 0.45f * dz_k / tau_safe) {
             any_imp = true;
             break;
@@ -1208,10 +1218,10 @@ __global__ void nh_ieva_vert_advect_v_kernel(
         float gzl_hi = 0.0f, gzr_hi = 0.0f;
         compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, k + 1, jl, i, gzl_hi);
         compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, k + 1, jr, i, gzr_hi);
-        const float g_v = 1.0f + static_cast<float>(g.db_s[k]) * hs_v;
+        const float g_v = 1.0f + g.db_s_f[k] * hs_v;
         const float zd = 0.25f * (gzl_lo + gzl_hi + gzr_lo + gzr_hi) / fmaxf(g_v, 1e-4f);
         gzl_lo = gzl_hi; gzr_lo = gzr_hi;
-        const float dz_k = static_cast<float>(g.dzeta[k]);
+        const float dz_k = g.dzeta_f[k];
         const float zd_cap = 0.45f * dz_k / tau_safe;
         const float zd_exp = fmaxf(-zd_cap, fminf(zd_cap, zd));
         const double zd_imp = static_cast<double>(zd - zd_exp);
@@ -1258,16 +1268,16 @@ __global__ void nh_ieva_vert_advect_w_kernel(
     if (nz < 3) return;
     const size_t col_stride = static_cast<size_t>(ny) * nx;
     const size_t col = static_cast<size_t>(j) * nx + i;
-    const float hs = static_cast<float>(g.hs[col]);
+    const float hs = g.hs_f[col];
     const float tau_safe = fmaxf(tau_stage, 1e-6f);
 
     bool any_imp = false;
     for (int32_t k = 1; k < nz; ++k) {
         float gz_w = 0.0f;
         compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, k, j, i, gz_w);
-        const float g_w = 1.0f + static_cast<float>(g.db_w[k]) * hs;
+        const float g_w = 1.0f + g.db_w_f[k] * hs;
         const float zd = gz_w / fmaxf(g_w, 1e-4f);
-        const float dz_min = fminf(static_cast<float>(g.dzeta[k]), static_cast<float>(g.dzeta[k - 1]));
+        const float dz_min = fminf(g.dzeta_f[k], g.dzeta_f[k - 1]);
         if (fabsf(zd) > 0.45f * dz_min / tau_safe) {
             any_imp = true;
             break;
@@ -1279,9 +1289,9 @@ __global__ void nh_ieva_vert_advect_w_kernel(
     for (int32_t k = 1; k < nz; ++k) {
         float gz_w = 0.0f;
         compute_contravariant_at_scalar_col_f(cfg, g, u, v, w, k, j, i, gz_w);
-        const float g_w = 1.0f + static_cast<float>(g.db_w[k]) * hs;
+        const float g_w = 1.0f + g.db_w_f[k] * hs;
         const float zd = gz_w / fmaxf(g_w, 1e-4f);
-        const float dz_min = fminf(static_cast<float>(g.dzeta[k]), static_cast<float>(g.dzeta[k - 1]));
+        const float dz_min = fminf(g.dzeta_f[k], g.dzeta_f[k - 1]);
         const float zd_cap = 0.45f * dz_min / tau_safe;
         const float zd_exp = fmaxf(-zd_cap, fminf(zd_cap, zd));
         const double zd_imp = static_cast<double>(zd - zd_exp);
@@ -1331,9 +1341,9 @@ __global__ void nh_compute_div_kernel(
     const size_t idx = static_cast<size_t>(k) * ny * nx + static_cast<size_t>(j) * nx + i;
     const float dx_f = static_cast<float>(cfg.dx_m);
     const float dy_f = static_cast<float>(cfg.dy_m);
-    const float db_s_k = static_cast<float>(g.db_s[k]);
-    const float msf = static_cast<float>(g.msf[j * nx + i]);
-    const float hs = static_cast<float>(g.hs[j * nx + i]);
+    const float db_s_k = g.db_s_f[k];
+    const float msf = g.msf_f[j * nx + i];
+    const float hs = g.hs_f[j * nx + i];
     const float g_s = 1.0f + db_s_k * hs;
 
     const float u_r = read_u_f(u, k, j, i + 1, nz, ny, nx, cfg.bc_x, cfg.bc_y);
@@ -1341,15 +1351,15 @@ __global__ void nh_compute_div_kernel(
     const float v_n = read_v_f(v, k, j + 1, i, nz, ny, nx, cfg.bc_x, cfg.bc_y);
     const float v_s = read_v_f(v, k, j,     i, nz, ny, nx, cfg.bc_x, cfg.bc_y);
 
-    const float msf_r = read_2d_f(g.msf, j, i + 1, ny, nx, cfg.bc_x, cfg.bc_y);
-    const float msf_l = read_2d_f(g.msf, j, i - 1, ny, nx, cfg.bc_x, cfg.bc_y);
-    const float msf_n = read_2d_f(g.msf, j + 1, i, ny, nx, cfg.bc_x, cfg.bc_y);
-    const float msf_s = read_2d_f(g.msf, j - 1, i, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float msf_r = read_2d_f(g.msf_f, j, i + 1, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float msf_l = read_2d_f(g.msf_f, j, i - 1, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float msf_n = read_2d_f(g.msf_f, j + 1, i, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float msf_s = read_2d_f(g.msf_f, j - 1, i, ny, nx, cfg.bc_x, cfg.bc_y);
 
-    const float hs_r = read_2d_f(g.hs, j, i + 1, ny, nx, cfg.bc_x, cfg.bc_y);
-    const float hs_l = read_2d_f(g.hs, j, i - 1, ny, nx, cfg.bc_x, cfg.bc_y);
-    const float hs_n = read_2d_f(g.hs, j + 1, i, ny, nx, cfg.bc_x, cfg.bc_y);
-    const float hs_s = read_2d_f(g.hs, j - 1, i, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float hs_r = read_2d_f(g.hs_f, j, i + 1, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float hs_l = read_2d_f(g.hs_f, j, i - 1, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float hs_n = read_2d_f(g.hs_f, j + 1, i, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float hs_s = read_2d_f(g.hs_f, j - 1, i, ny, nx, cfg.bc_x, cfg.bc_y);
 
     const float gu_r = 1.0f + db_s_k * 0.5f * (hs + hs_r);
     const float gu_l = 1.0f + db_s_k * 0.5f * (hs + hs_l);
@@ -1412,9 +1422,9 @@ __global__ void nh_acoustic_u_kernel(
 
     const float dx_f = static_cast<float>(cfg.dx_m);
     const float dy_f = static_cast<float>(cfg.dy_m);
-    const float hs_l = static_cast<float>(g.hs[j * nx + il]);
-    const float hs_r = static_cast<float>(g.hs[j * nx + ir]);
-    const float msf_u = 0.5f * (static_cast<float>(g.msf[j * nx + il]) + static_cast<float>(g.msf[j * nx + ir]));
+    const float hs_l = g.hs_f[j * nx + il];
+    const float hs_r = g.hs_f[j * nx + ir];
+    const float msf_u = 0.5f * (g.msf_f[j * nx + il] + g.msf_f[j * nx + ir]);
 
     float dpidx_z = 0.0f;
     if (cfg.bc_x == 1 || (i > 0 && i < nx)) {
@@ -1432,7 +1442,7 @@ __global__ void nh_acoustic_u_kernel(
         }
     }
 
-    const float z_u = static_cast<float>(g.zeta_s[k]) + static_cast<float>(g.b_s[k]) * (0.5f * (hs_l + hs_r));
+    const float z_u = g.zeta_s_f[k] + g.b_s_f[k] * (0.5f * (hs_l + hs_r));
     float qvl, qhl, qvr, qhr;
     const float thb = eval_theta_bar_f32(z_u, static_cast<float>(cfg.theta_sfc_k), static_cast<float>(cfg.n_ref_s));
     const float vf_l = moisture_load_scalar_f(cfg.has_moist, idxl, qv, qc, qr, qi, qs, qg, qvl, qhl);
@@ -1482,9 +1492,9 @@ __global__ void nh_acoustic_v_kernel(
 
     const float dx_f = static_cast<float>(cfg.dx_m);
     const float dy_f = static_cast<float>(cfg.dy_m);
-    const float hs_l = static_cast<float>(g.hs[jl * nx + i]);
-    const float hs_r = static_cast<float>(g.hs[jr * nx + i]);
-    const float msf_v = 0.5f * (static_cast<float>(g.msf[jl * nx + i]) + static_cast<float>(g.msf[jr * nx + i]));
+    const float hs_l = g.hs_f[jl * nx + i];
+    const float hs_r = g.hs_f[jr * nx + i];
+    const float msf_v = 0.5f * (g.msf_f[jl * nx + i] + g.msf_f[jr * nx + i]);
     const float my_v = cfg.is_spherical ? 1.0f : msf_v;
 
     float dpidy_z = 0.0f;
@@ -1503,7 +1513,7 @@ __global__ void nh_acoustic_v_kernel(
         }
     }
 
-    const float z_v = static_cast<float>(g.zeta_s[k]) + static_cast<float>(g.b_s[k]) * (0.5f * (hs_l + hs_r));
+    const float z_v = g.zeta_s_f[k] + g.b_s_f[k] * (0.5f * (hs_l + hs_r));
     float qvl, qhl, qvr, qhr;
     const float thb = eval_theta_bar_f32(z_v, static_cast<float>(cfg.theta_sfc_k), static_cast<float>(cfg.n_ref_s));
     const float vf_l = moisture_load_scalar_f(cfg.has_moist, idxl, qv, qc, qr, qi, qs, qg, qvl, qhl);
@@ -1553,26 +1563,26 @@ __global__ void nh_acoustic_vert_implicit_kernel(
 
     const float dx_f = static_cast<float>(cfg.dx_m);
     const float dy_f = static_cast<float>(cfg.dy_m);
-    const float hs = static_cast<float>(g.hs[h_idx]);
-    const float msf = static_cast<float>(g.msf[h_idx]);
-    const float dh_dx = (read_2d_f(g.hs, j, i + 1, ny, nx, cfg.bc_x, cfg.bc_y) -
-                         read_2d_f(g.hs, j, i - 1, ny, nx, cfg.bc_x, cfg.bc_y)) / (2.0f * dx_f);
-    const float dh_dy = (read_2d_f(g.hs, j + 1, i, ny, nx, cfg.bc_x, cfg.bc_y) -
-                         read_2d_f(g.hs, j - 1, i, ny, nx, cfg.bc_x, cfg.bc_y)) / (2.0f * dy_f);
+    const float hs = g.hs_f[h_idx];
+    const float msf = g.msf_f[h_idx];
+    const float dh_dx = (read_2d_f(g.hs_f, j, i + 1, ny, nx, cfg.bc_x, cfg.bc_y) -
+                         read_2d_f(g.hs_f, j, i - 1, ny, nx, cfg.bc_x, cfg.bc_y)) / (2.0f * dx_f);
+    const float dh_dy = (read_2d_f(g.hs_f, j + 1, i, ny, nx, cfg.bc_x, cfg.bc_y) -
+                         read_2d_f(g.hs_f, j - 1, i, ny, nx, cfg.bc_x, cfg.bc_y)) / (2.0f * dy_f);
     const float slope_h = msf * dh_dx;
     const float slope_y = (cfg.is_spherical ? 1.0f : msf) * dh_dy;
 
-    const float msf_r = read_2d_f(g.msf, j, i + 1, ny, nx, cfg.bc_x, cfg.bc_y);
-    const float msf_l = read_2d_f(g.msf, j, i - 1, ny, nx, cfg.bc_x, cfg.bc_y);
-    const float msf_n = read_2d_f(g.msf, j + 1, i, ny, nx, cfg.bc_x, cfg.bc_y);
-    const float msf_s = read_2d_f(g.msf, j - 1, i, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float msf_r = read_2d_f(g.msf_f, j, i + 1, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float msf_l = read_2d_f(g.msf_f, j, i - 1, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float msf_n = read_2d_f(g.msf_f, j + 1, i, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float msf_s = read_2d_f(g.msf_f, j - 1, i, ny, nx, cfg.bc_x, cfg.bc_y);
     const float mu_r = 0.5f * (msf + msf_r), mu_l = 0.5f * (msf + msf_l);
     const float mv_n = 0.5f * (msf + msf_n), mv_s = 0.5f * (msf + msf_s);
 
-    const float hs_r = read_2d_f(g.hs, j, i + 1, ny, nx, cfg.bc_x, cfg.bc_y);
-    const float hs_l = read_2d_f(g.hs, j, i - 1, ny, nx, cfg.bc_x, cfg.bc_y);
-    const float hs_n = read_2d_f(g.hs, j + 1, i, ny, nx, cfg.bc_x, cfg.bc_y);
-    const float hs_s = read_2d_f(g.hs, j - 1, i, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float hs_r = read_2d_f(g.hs_f, j, i + 1, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float hs_l = read_2d_f(g.hs_f, j, i - 1, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float hs_n = read_2d_f(g.hs_f, j + 1, i, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float hs_s = read_2d_f(g.hs_f, j - 1, i, ny, nx, cfg.bc_x, cfg.bc_y);
     const float hsu_r = 0.5f * (hs + hs_r), hsu_l = 0.5f * (hs + hs_l);
     const float hsv_n = 0.5f * (hs + hs_n), hsv_s = 0.5f * (hs + hs_s);
 
@@ -1590,8 +1600,8 @@ __global__ void nh_acoustic_vert_implicit_kernel(
             vw = 0.5f * (read_v_f(v, 0, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y) +
                          read_v_f(v, 0, j + 1, i, nz, ny, nx, cfg.bc_x, cfg.bc_y));
         } else {
-            const float ds_k = static_cast<float>(g.dzeta[k_iface]);
-            const float ds_km = static_cast<float>(g.dzeta[k_iface - 1]);
+            const float ds_k = g.dzeta_f[k_iface];
+            const float ds_km = g.dzeta_f[k_iface - 1];
             const float wt = ds_km / (ds_k + ds_km);
             uw = (1.0f - wt) * 0.5f * (read_u_f(u, k_iface - 1, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y) +
                                        read_u_f(u, k_iface - 1, j, i + 1, nz, ny, nx, cfg.bc_x, cfg.bc_y)) +
@@ -1602,7 +1612,7 @@ __global__ void nh_acoustic_vert_implicit_kernel(
                  wt          * 0.5f * (read_v_f(v, k_iface, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y) +
                                        read_v_f(v, k_iface, j + 1, i, nz, ny, nx, cfg.bc_x, cfg.bc_y));
         }
-        return -static_cast<float>(g.b_w[k_iface]) * (slope_h * uw + slope_y * vw);
+        return -g.b_w_f[k_iface] * (slope_h * uw + slope_y * vw);
     };
 
     const float w0_new = -omega_h_at(0);
@@ -1615,9 +1625,9 @@ __global__ void nh_acoustic_vert_implicit_kernel(
 
     for (int32_t k = 0; k < nz; ++k) {
         const size_t idx = static_cast<size_t>(k) * col_stride + h_idx;
-        const float dz_k = static_cast<float>(g.dzeta[k]);
-        const float db_s_k = static_cast<float>(g.db_s[k]);
-        const float z_s = static_cast<float>(g.zeta_s[k]) + static_cast<float>(g.b_s[k]) * hs;
+        const float dz_k = g.dzeta_f[k];
+        const float db_s_k = g.db_s_f[k];
+        const float z_s = g.zeta_s_f[k] + g.b_s_f[k] * hs;
         const float g_s = 1.0f + db_s_k * hs;
         const float dz_s = g_s * dz_k;
 
@@ -1660,9 +1670,9 @@ __global__ void nh_acoustic_vert_implicit_kernel(
             pip[static_cast<size_t>(k - 1) * col_stride + h_idx] = pi_hat_prev;
 
             const size_t w_idx = static_cast<size_t>(k) * col_stride + h_idx;
-            const float z_w = static_cast<float>(g.zeta_w[k]) + static_cast<float>(g.b_w[k]) * hs;
-            const float g_w = 1.0f + static_cast<float>(g.db_w[k]) * hs;
-            const float dz_km = static_cast<float>(g.dzeta[k - 1]);
+            const float z_w = g.zeta_w_f[k] + g.b_w_f[k] * hs;
+            const float g_w = 1.0f + g.db_w_f[k] * hs;
+            const float dz_km = g.dzeta_f[k - 1];
             const float dz_w = g_w * 0.5f * (dz_k + dz_km);
 
             const float thb_w = eval_theta_bar_f32(z_w, th_sfc_f, n_ref_f);
@@ -1714,7 +1724,7 @@ __global__ void nh_acoustic_vert_implicit_kernel(
     // Pass 2: Backward substitution for w[nz-1..1], then update pi_p[nz-1..0] and theta_p[nz-1..0]
     float w_above = 0.0f; // w[nz] = 0
     float thb_w_hi = eval_theta_bar_f32(
-        static_cast<float>(g.zeta_w[nz]) + static_cast<float>(g.b_w[nz]) * hs, th_sfc_f, n_ref_f
+        g.zeta_w_f[nz] + g.b_w_f[nz] * hs, th_sfc_f, n_ref_f
     );
     for (int32_t k = nz - 1; k >= 0; --k) {
         float w_below = w0_new;
@@ -1725,9 +1735,9 @@ __global__ void nh_acoustic_vert_implicit_kernel(
         }
 
         const size_t idx = static_cast<size_t>(k) * col_stride + h_idx;
-        const float z_s = static_cast<float>(g.zeta_s[k]) + static_cast<float>(g.b_s[k]) * hs;
-        const float g_s = 1.0f + static_cast<float>(g.db_s[k]) * hs;
-        const float dz_s = g_s * static_cast<float>(g.dzeta[k]);
+        const float z_s = g.zeta_s_f[k] + g.b_s_f[k] * hs;
+        const float g_s = 1.0f + g.db_s_f[k] * hs;
+        const float dz_s = g_s * g.dzeta_f[k];
         float thb = 0.0f, pib = 0.0f;
         eval_theta_pi_bar_f32(z_s, th_sfc_f, pi_sfc_f, n_ref_f, thb, pib);
         const float c_ac = (R_D_F / CV_D_F) * pib;
@@ -1740,7 +1750,7 @@ __global__ void nh_acoustic_vert_implicit_kernel(
 
         // Symplectic Forward-Backward vertical theta_bar advection using updated w^{m+1}
         const float thb_w_lo = eval_theta_bar_f32(
-            static_cast<float>(g.zeta_w[k]) + static_cast<float>(g.b_w[k]) * hs, th_sfc_f, n_ref_f
+            g.zeta_w_f[k] + g.b_w_f[k] * hs, th_sfc_f, n_ref_f
         );
         const float w_avg = 0.5f * (w_above + w_below);
         thp[idx] += dts * (rth[idx] - w_avg * (thb_w_hi - thb_w_lo) / dz_s);
@@ -1758,15 +1768,15 @@ __device__ inline float cell_mass_vol_f(
     const NhGridConfig& cfg, const DeviceStaticGrid& g, float pi_sfc_f,
     int32_t k, int32_t j, int32_t i
 ) {
-    const float hs = static_cast<float>(g.hs[j * cfg.nx + i]);
-    const float msf = static_cast<float>(g.msf[j * cfg.nx + i]);
-    const float z_s = static_cast<float>(g.zeta_s[k]) + static_cast<float>(g.b_s[k]) * hs;
-    const float g_s = 1.0f + static_cast<float>(g.db_s[k]) * hs;
+    const float hs = g.hs_f[j * cfg.nx + i];
+    const float msf = g.msf_f[j * cfg.nx + i];
+    const float z_s = g.zeta_s_f[k] + g.b_s_f[k] * hs;
+    const float g_s = 1.0f + g.db_s_f[k] * hs;
     const float rhob = eval_rho_bar_f32(
         z_s, static_cast<float>(cfg.theta_sfc_k), pi_sfc_f, static_cast<float>(cfg.n_ref_s)
     );
     const float area_inv = cfg.is_spherical ? msf : (msf * msf);
-    return rhob * g_s * static_cast<float>(g.dzeta[k]) / area_inv;
+    return rhob * g_s * g.dzeta_f[k] / area_inv;
 }
 
 __device__ inline float face_flux_x_f(
@@ -1780,17 +1790,17 @@ __device__ inline float face_flux_x_f(
     const int32_t ir = (cfg.bc_x == 1)
         ? wrap_idx(i_face, cfg.nx)
         : ((i_face < 0) ? 0 : ((i_face >= cfg.nx) ? (cfg.nx - 1) : i_face));
-    const float hs_u = 0.5f * (static_cast<float>(g.hs[j * cfg.nx + il]) + static_cast<float>(g.hs[j * cfg.nx + ir]));
-    const float msf_u = 0.5f * (static_cast<float>(g.msf[j * cfg.nx + il]) + static_cast<float>(g.msf[j * cfg.nx + ir]));
-    const float z_u = static_cast<float>(g.zeta_s[k]) + static_cast<float>(g.b_s[k]) * hs_u;
-    const float g_u = 1.0f + static_cast<float>(g.db_s[k]) * hs_u;
+    const float hs_u = 0.5f * (g.hs_f[j * cfg.nx + il] + g.hs_f[j * cfg.nx + ir]);
+    const float msf_u = 0.5f * (g.msf_f[j * cfg.nx + il] + g.msf_f[j * cfg.nx + ir]);
+    const float z_u = g.zeta_s_f[k] + g.b_s_f[k] * hs_u;
+    const float g_u = 1.0f + g.db_s_f[k] * hs_u;
     const float rhob = eval_rho_bar_f32(
         z_u, static_cast<float>(cfg.theta_sfc_k), pi_sfc_f, static_cast<float>(cfg.n_ref_s)
     );
     const float uval = read_u_f(u, k, j, i_face, cfg.nz, cfg.ny, cfg.nx, cfg.bc_x, cfg.bc_y);
     return cfg.is_spherical
-        ? (rhob * g_u * static_cast<float>(g.dzeta[k]) * uval)
-        : (rhob * g_u * static_cast<float>(g.dzeta[k]) * uval / msf_u);
+        ? (rhob * g_u * g.dzeta_f[k] * uval)
+        : (rhob * g_u * g.dzeta_f[k] * uval / msf_u);
 }
 
 __device__ inline float face_flux_y_f(
@@ -1804,15 +1814,15 @@ __device__ inline float face_flux_y_f(
     const int32_t jr = (cfg.bc_y == 1)
         ? wrap_idx(j_face, cfg.ny)
         : ((j_face < 0) ? 0 : ((j_face >= cfg.ny) ? (cfg.ny - 1) : j_face));
-    const float hs_v = 0.5f * (static_cast<float>(g.hs[jl * cfg.nx + i]) + static_cast<float>(g.hs[jr * cfg.nx + i]));
-    const float msf_v = 0.5f * (static_cast<float>(g.msf[jl * cfg.nx + i]) + static_cast<float>(g.msf[jr * cfg.nx + i]));
-    const float z_v = static_cast<float>(g.zeta_s[k]) + static_cast<float>(g.b_s[k]) * hs_v;
-    const float g_v = 1.0f + static_cast<float>(g.db_s[k]) * hs_v;
+    const float hs_v = 0.5f * (g.hs_f[jl * cfg.nx + i] + g.hs_f[jr * cfg.nx + i]);
+    const float msf_v = 0.5f * (g.msf_f[jl * cfg.nx + i] + g.msf_f[jr * cfg.nx + i]);
+    const float z_v = g.zeta_s_f[k] + g.b_s_f[k] * hs_v;
+    const float g_v = 1.0f + g.db_s_f[k] * hs_v;
     const float rhob = eval_rho_bar_f32(
         z_v, static_cast<float>(cfg.theta_sfc_k), pi_sfc_f, static_cast<float>(cfg.n_ref_s)
     );
     const float vval = read_v_f(v, k, j_face, i, cfg.nz, cfg.ny, cfg.nx, cfg.bc_x, cfg.bc_y);
-    return rhob * g_v * static_cast<float>(g.dzeta[k]) * vval / msf_v;
+    return rhob * g_v * g.dzeta_f[k] * vval / msf_v;
 }
 
 __device__ inline float face_flux_z_f(
@@ -1820,9 +1830,9 @@ __device__ inline float face_flux_z_f(
     const float* u, const float* v, const float* w, int32_t k_face, int32_t j, int32_t i
 ) {
     if (k_face <= 0 || k_face >= cfg.nz) return 0.0f;
-    const float hs = static_cast<float>(g.hs[j * cfg.nx + i]);
-    const float msf = static_cast<float>(g.msf[j * cfg.nx + i]);
-    const float z_w = static_cast<float>(g.zeta_w[k_face]) + static_cast<float>(g.b_w[k_face]) * hs;
+    const float hs = g.hs_f[j * cfg.nx + i];
+    const float msf = g.msf_f[j * cfg.nx + i];
+    const float z_w = g.zeta_w_f[k_face] + g.b_w_f[k_face] * hs;
     const float rhob = eval_rho_bar_f32(
         z_w, static_cast<float>(cfg.theta_sfc_k), pi_sfc_f, static_cast<float>(cfg.n_ref_s)
     );
@@ -1864,7 +1874,7 @@ __device__ inline void compute_fluxes_for_cell_f(
     const float q_zl_up = (wz >= 0.0f)
         ? read_s_f(q, k - 1, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y)
         : read_s_f(q, k,     j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y);
-    const float q_zl_ho = vert_tvd_face_val_f(q, k, j, i, wz, g.dzeta, nz, ny, nx, cfg.bc_x, cfg.bc_y);
+    const float q_zl_ho = vert_tvd_face_val_f(q, k, j, i, wz, g.dzeta_f, nz, ny, nx, cfg.bc_x, cfg.bc_y);
     fz_l_low = wz * q_zl_up;
     fz_l_hi  = wz * fmaxf(0.0f, q_zl_ho);
 }
@@ -2097,7 +2107,7 @@ __global__ void nh_tracer_vert_column_kernel(
                 const float q_up = (fz_top >= 0.0f)
                     ? read_s_f(q, k, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y)
                     : read_s_f(q, k + 1, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y);
-                const float q_ho = vert_tvd_face_val_f(q, k + 1, j, i, fz_top, g.dzeta, nz, ny, nx, cfg.bc_x, cfg.bc_y);
+                const float q_ho = vert_tvd_face_val_f(q, k + 1, j, i, fz_top, g.dzeta_f, nz, ny, nx, cfg.bc_x, cfg.bc_y);
                 fzr_low = fz_top * q_up;
                 fzr_hi = fz_top * fmaxf(0.0f, q_ho);
             }
@@ -2121,7 +2131,7 @@ __global__ void nh_tracer_vert_column_kernel(
                 const float q_up = (fz_top >= 0.0f)
                     ? read_s_f(q, k, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y)
                     : read_s_f(q, k + 1, j, i, nz, ny, nx, cfg.bc_x, cfg.bc_y);
-                const float q_ho = vert_tvd_face_val_f(q, k + 1, j, i, fz_top, g.dzeta, nz, ny, nx, cfg.bc_x, cfg.bc_y);
+                const float q_ho = vert_tvd_face_val_f(q, k + 1, j, i, fz_top, g.dzeta_f, nz, ny, nx, cfg.bc_x, cfg.bc_y);
                 const float A = fz_top * (fmaxf(0.0f, q_ho) - q_up);
                 const float r_donor = (A >= 0.0f)
                     ? r_out_buf[idx]
@@ -2200,7 +2210,7 @@ __global__ void nh_estimate_cs_max_kernel(
     float cs_msf = 0.0f;
     if (k < cfg.nz && j < cfg.ny && i < cfg.nx) {
         const size_t idx = static_cast<size_t>(k) * cfg.ny * cfg.nx + j * cfg.nx + i;
-        const float z = static_cast<float>(g.zeta_s[k] + g.b_s[k] * g.hs[j * cfg.nx + i]);
+        const float z = g.zeta_s_f[k] + g.b_s_f[k] * g.hs_f[j * cfg.nx + i];
         const float pi_sfc_f = powf(static_cast<float>(cfg.p_sfc_pa) / P0_PA_F, KAPPA_F);
         float thb = 0.0f, pib = 0.0f;
         eval_theta_pi_bar_f32(
@@ -2208,7 +2218,7 @@ __global__ void nh_estimate_cs_max_kernel(
         );
         const float t_tot = fmaxf(50.0f, (thb + thp[idx]) * fmaxf(1e-4f, pib + pip[idx]));
         const float cs = sqrtf(GAMMA_GAS_F * R_D_F * t_tot);
-        float msf_eff = static_cast<float>(g.msf[j * cfg.nx + i]);
+        float msf_eff = g.msf_f[j * cfg.nx + i];
         if (cfg.is_spherical && cfg.polar_filter_lat_deg > 0.0 && cfg.polar_filter_lat_deg < 89.9) {
             const float cos_crit = cosf(static_cast<float>(cfg.polar_filter_lat_deg) * (PI_CONST_F / 180.0f));
             msf_eff = fminf(msf_eff, 1.0f / fmaxf(cos_crit, 1e-3f));
@@ -2258,8 +2268,8 @@ __global__ void nh_lbc_relax_qv_kernel(
     float q_tgt = fmaxf(0.0f, lbc_qv[idx]);
     if (cap_sat != 0 && thp != nullptr && pip != nullptr && q_tgt > q_cur) {
         const float pi_sfc_f = powf(static_cast<float>(cfg.p_sfc_pa) / P0_PA_F, KAPPA_F);
-        const float hs = static_cast<float>(g.hs[h_idx]);
-        const float z = static_cast<float>(g.zeta_s[k]) + static_cast<float>(g.b_s[k]) * hs;
+        const float hs = g.hs_f[h_idx];
+        const float z = g.zeta_s_f[k] + g.b_s_f[k] * hs;
         float thb = 0.0f, pib = 0.0f;
         eval_theta_pi_bar_f32(
             z, static_cast<float>(cfg.theta_sfc_k), pi_sfc_f, static_cast<float>(cfg.n_ref_s), thb, pib
@@ -2331,7 +2341,10 @@ inline DeviceStaticGrid static_view(const NhCudaHandle* h) {
     return DeviceStaticGrid{
         h->d_zeta_w, h->d_zeta_s, h->d_dzeta,
         h->d_b_w, h->d_b_s, h->d_db_w, h->d_db_s,
-        h->d_hs, h->d_msf, h->d_fcor
+        h->d_hs, h->d_msf, h->d_fcor,
+        h->d_zeta_w_f, h->d_zeta_s_f, h->d_dzeta_f,
+        h->d_b_w_f, h->d_b_s_f, h->d_db_w_f, h->d_db_s_f,
+        h->d_hs_f, h->d_msf_f, h->d_fcor_f
     };
 }
 
@@ -2685,10 +2698,10 @@ uint64_t nh_cuda_estimate_vram_bytes_ex(
     if (has_iau) float32_arrays += 4;
     if (has_physics) float32_arrays += 2; // d_rad_dth_dt + d_tke
     const uint64_t field_bytes = cells * float32_arrays * 4ULL;
-    uint64_t static_2d = static_cast<uint64_t>(ny) * static_cast<uint64_t>(nx) * 24ULL;
+    uint64_t static_2d = static_cast<uint64_t>(ny) * static_cast<uint64_t>(nx) * 36ULL;
     if (has_physics) {
-        // 9 static + 22 surface 2D + 8 soil (4*2) + 3 intra-step scratch = 42 float32 arrays per column
-        static_2d += static_cast<uint64_t>(ny) * static_cast<uint64_t>(nx) * 42ULL * 4ULL;
+        // 9 static + 18 float32 2D + 4 double 2D accumulators (8 f32 eq) + 8 double soil (16 f32 eq) + 3 scratch = 54 f32 eq
+        static_2d += static_cast<uint64_t>(ny) * static_cast<uint64_t>(nx) * 54ULL * 4ULL;
     }
     const uint64_t overhead = 128ULL * 1024ULL * 1024ULL; // CUDA runtime context + margin
     return field_bytes + static_2d + overhead;
@@ -2745,16 +2758,27 @@ NhCudaHandle* nh_cuda_create(
     CUDA_CHECK_PTR(cudaMalloc(&h->d_msf, n2 * sizeof(double)));
     CUDA_CHECK_PTR(cudaMalloc(&h->d_fcor, n2 * sizeof(double)));
 
-    CUDA_CHECK_PTR(cudaMemcpy(h->d_zeta_w, zeta_w, (nz + 1) * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK_PTR(cudaMemcpy(h->d_zeta_s, zeta_s, nz * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK_PTR(cudaMemcpy(h->d_dzeta, dzeta, nz * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK_PTR(cudaMemcpy(h->d_b_w, b_w, (nz + 1) * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK_PTR(cudaMemcpy(h->d_b_s, b_s, nz * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK_PTR(cudaMemcpy(h->d_db_w, db_dzeta_w, (nz + 1) * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK_PTR(cudaMemcpy(h->d_db_s, db_dzeta_s, nz * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK_PTR(cudaMemcpy(h->d_hs, hs_m, n2 * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK_PTR(cudaMemcpy(h->d_msf, msf, n2 * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK_PTR(cudaMemcpy(h->d_fcor, f_cor, n2 * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK_PTR(cudaMalloc(&h->d_zeta_w_f, (nz + 1) * sizeof(float)));
+    CUDA_CHECK_PTR(cudaMalloc(&h->d_zeta_s_f, nz * sizeof(float)));
+    CUDA_CHECK_PTR(cudaMalloc(&h->d_dzeta_f, nz * sizeof(float)));
+    CUDA_CHECK_PTR(cudaMalloc(&h->d_b_w_f, (nz + 1) * sizeof(float)));
+    CUDA_CHECK_PTR(cudaMalloc(&h->d_b_s_f, nz * sizeof(float)));
+    CUDA_CHECK_PTR(cudaMalloc(&h->d_db_w_f, (nz + 1) * sizeof(float)));
+    CUDA_CHECK_PTR(cudaMalloc(&h->d_db_s_f, nz * sizeof(float)));
+    CUDA_CHECK_PTR(cudaMalloc(&h->d_hs_f, n2 * sizeof(float)));
+    CUDA_CHECK_PTR(cudaMalloc(&h->d_msf_f, n2 * sizeof(float)));
+    CUDA_CHECK_PTR(cudaMalloc(&h->d_fcor_f, n2 * sizeof(float)));
+
+    CUDA_CHECK_PTR(upload_f64_and_f32(h->d_zeta_w, h->d_zeta_w_f, zeta_w, nz + 1));
+    CUDA_CHECK_PTR(upload_f64_and_f32(h->d_zeta_s, h->d_zeta_s_f, zeta_s, nz));
+    CUDA_CHECK_PTR(upload_f64_and_f32(h->d_dzeta, h->d_dzeta_f, dzeta, nz));
+    CUDA_CHECK_PTR(upload_f64_and_f32(h->d_b_w, h->d_b_w_f, b_w, nz + 1));
+    CUDA_CHECK_PTR(upload_f64_and_f32(h->d_b_s, h->d_b_s_f, b_s, nz));
+    CUDA_CHECK_PTR(upload_f64_and_f32(h->d_db_w, h->d_db_w_f, db_dzeta_w, nz + 1));
+    CUDA_CHECK_PTR(upload_f64_and_f32(h->d_db_s, h->d_db_s_f, db_dzeta_s, nz));
+    CUDA_CHECK_PTR(upload_f64_and_f32(h->d_hs, h->d_hs_f, hs_m, n2));
+    CUDA_CHECK_PTR(upload_f64_and_f32(h->d_msf, h->d_msf_f, msf, n2));
+    CUDA_CHECK_PTR(upload_f64_and_f32(h->d_fcor, h->d_fcor_f, f_cor, n2));
 
     CUDA_CHECK_PTR(cudaMalloc(&h->d_u, h->n_u * sizeof(float)));
     CUDA_CHECK_PTR(cudaMalloc(&h->d_v, h->n_v * sizeof(float)));
@@ -2829,6 +2853,9 @@ void nh_cuda_destroy(NhCudaHandle* h) {
     cf(h->d_zeta_w); cf(h->d_zeta_s); cf(h->d_dzeta);
     cf(h->d_b_w); cf(h->d_b_s); cf(h->d_db_w); cf(h->d_db_s);
     cf(h->d_hs); cf(h->d_msf); cf(h->d_fcor);
+    cf(h->d_zeta_w_f); cf(h->d_zeta_s_f); cf(h->d_dzeta_f);
+    cf(h->d_b_w_f); cf(h->d_b_s_f); cf(h->d_db_w_f); cf(h->d_db_s_f);
+    cf(h->d_hs_f); cf(h->d_msf_f); cf(h->d_fcor_f);
     cf(h->d_u); cf(h->d_v); cf(h->d_w); cf(h->d_thp); cf(h->d_pip);
     cf(h->d_qv); cf(h->d_qc); cf(h->d_qr); cf(h->d_qi); cf(h->d_qs); cf(h->d_qg);
     cf(h->d_u_n); cf(h->d_v_n); cf(h->d_w_n); cf(h->d_thp_n); cf(h->d_pip_n);
@@ -2971,9 +2998,9 @@ int32_t nh_cuda_rebind_tile_grid(
     }
     h->cfg = *cfg;
     const size_t n2 = static_cast<size_t>(cfg->ny) * static_cast<size_t>(cfg->nx);
-    CUDA_CHECK(cudaMemcpy(h->d_hs, hs_m, n2 * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(h->d_msf, msf, n2 * sizeof(double), cudaMemcpyHostToDevice));
-    CUDA_CHECK(cudaMemcpy(h->d_fcor, f_cor, n2 * sizeof(double), cudaMemcpyHostToDevice));
+    CUDA_CHECK(upload_f64_and_f32(h->d_hs, h->d_hs_f, hs_m, n2));
+    CUDA_CHECK(upload_f64_and_f32(h->d_msf, h->d_msf_f, msf, n2));
+    CUDA_CHECK(upload_f64_and_f32(h->d_fcor, h->d_fcor_f, f_cor, n2));
     if (refresh_polar_fft(h, msf) != 0) return -1;
     return 0;
 }

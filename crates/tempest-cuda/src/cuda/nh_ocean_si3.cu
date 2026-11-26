@@ -207,13 +207,15 @@ struct NhOceanSi3Handle {
     float *d_msf = nullptr, *d_fcor = nullptr, *d_bathy = nullptr, *d_tmask = nullptr;
     int32_t *d_mbkt = nullptr;
 
-    // 3D ocean prognostic & turbulence/density arrays [nz, ny, nx] (11 arrays total)
-    float *d_temp = nullptr, *d_sal = nullptr, *d_u = nullptr, *d_v = nullptr, *d_w = nullptr;
+    // 3D ocean prognostic & turbulence/density arrays [nz, ny, nx] (temp/sal in FP64 + FP64 scratch)
+    double *d_temp = nullptr, *d_sal = nullptr, *d_tmp_tr = nullptr;
+    float *d_u = nullptr, *d_v = nullptr, *d_w = nullptr;
     float *d_tke = nullptr, *d_avm = nullptr, *d_avt = nullptr, *d_rhd = nullptr;
     float *d_tmp1 = nullptr, *d_tmp2 = nullptr;
 
-    // 2D barotropic & coupled flux fields [ny, nx]
-    float *d_ssh = nullptr, *d_ub = nullptr, *d_vb = nullptr;
+    // 2D barotropic & coupled flux fields [ny, nx] (ssh in FP64)
+    double *d_ssh = nullptr;
+    float *d_ub = nullptr, *d_vb = nullptr;
     float *d_ub_rhs = nullptr, *d_vb_rhs = nullptr, *d_eta_ib = nullptr, *d_mld = nullptr;
     float *d_taux_atm = nullptr, *d_tauy_atm = nullptr;
     float *d_taux_oce = nullptr, *d_tauy_oce = nullptr;
@@ -266,7 +268,7 @@ __global__ void oce_surface_forcing_kernel(
     NhOceanConfig cfg, const float* tmask,
     const float* u10m, const float* v10m, const float* t2m, const float* q2m, const float* mslp,
     const float* sw_dn, const float* lw_dn, const float* p_liq, const float* p_ice,
-    const float* temp_k,
+    const double* temp_k,
     float* eta_ib, float* taux_atm, float* tauy_atm, float* qsr_oce, float* qns_oce, float* emp_oce
 ) {
     const int32_t i = blockIdx.x * blockDim.x + threadIdx.x;
@@ -292,7 +294,7 @@ __global__ void oce_surface_forcing_kernel(
     const double wspd = fmax(0.5, sqrt(u10 * u10 + v10 * v10));
     const double ta = t2m ? fmax(190.0, fmin(330.0, static_cast<double>(t2m[col]))) : 285.0;
     const double qa = q2m ? fmax(1e-6, fmin(0.05, static_cast<double>(q2m[col]))) : 0.006;
-    const double ts = fmax(268.0, fmin(315.0, static_cast<double>(temp_k[col])));
+    const double ts = fmax(268.0, fmin(315.0, temp_k[col]));
 
     // Large & Pond / COARE-like open-ocean bulk coefficients
     const double cd = (wspd < 11.0) ? 1.2e-3 : fmin(2.6e-3, (0.49 + 0.065 * wspd) * 1.0e-3);
@@ -329,7 +331,7 @@ __global__ void oce_eos_tke_kernel(
     NhOceanConfig cfg, double dt_s,
     const double* dz, const double* z_t, const double* z_w,
     const float* tmask, const int32_t* mbkt,
-    const float* temp_k, const float* sal_psu,
+    const double* temp_k, const double* sal_psu,
     const float* u_oce, const float* v_oce,
     const float* taux_oce, const float* tauy_oce, const float* ice_frac,
     float* rhd, float* tke, float* avm, float* avt, float* mld
@@ -372,8 +374,8 @@ __global__ void oce_eos_tke_kernel(
             avt[idx] = 0.0f;
             continue;
         }
-        const double ct_c = static_cast<double>(temp_k[idx]) - O_RT0;
-        const double sa = static_cast<double>(sal_psu[idx]);
+        const double ct_c = temp_k[idx] - O_RT0;
+        const double sa = sal_psu[idx];
         const double rho = eval_teos10_rho_hd(ct_c, sa, z_t[k]);
         rhd[idx] = static_cast<float>((rho - cfg.rho0) / cfg.rho0);
 
@@ -409,10 +411,8 @@ __global__ void oce_eos_tke_kernel(
         const double dz_w = 0.5 * (dz[k - 1] + dz[k]);
 
         // Local adiabatic N^2 at interface z_w[k]
-        const double rho_up = eval_teos10_rho_hd(static_cast<double>(temp_k[idx_up]) - O_RT0,
-                                                 static_cast<double>(sal_psu[idx_up]), z_w[k]);
-        const double rho_dn = eval_teos10_rho_hd(static_cast<double>(temp_k[idx_dn]) - O_RT0,
-                                                 static_cast<double>(sal_psu[idx_dn]), z_w[k]);
+        const double rho_up = eval_teos10_rho_hd(temp_k[idx_up] - O_RT0, sal_psu[idx_up], z_w[k]);
+        const double rho_dn = eval_teos10_rho_hd(temp_k[idx_dn] - O_RT0, sal_psu[idx_dn], z_w[k]);
         const double n2_bv = (O_GRAVITY / cfg.rho0) * (rho_dn - rho_up) / dz_w;
 
         // Vertical velocity shear squared
@@ -560,7 +560,7 @@ __global__ void si3_mevp_vel_kernel(
     NhOceanConfig cfg, double dt_step,
     const float* tmask, const float* msf, const float* fcor,
     const float* a_i, const float* v_i, const float* v_s,
-    const float* u_oce, const float* v_oce, const float* ssh,
+    const float* u_oce, const float* v_oce, const double* ssh,
     const float* taux_atm, const float* tauy_atm,
     const float* s1, const float* s2, const float* s12,
     const float* u_ice_in, const float* v_ice_in,
@@ -890,7 +890,7 @@ __global__ void si3_thermo_bl99_frazil_kernel(
     const float* u_oce, const float* v_oce, const float* u_ice, const float* v_ice,
     const float* qsr_oce, const float* qns_oce, const float* emp_oce,
     const float* taux_atm, const float* tauy_atm,
-    float* temp_k, float* sal_psu, float* ssh,
+    double* temp_k, double* sal_psu, double* ssh,
     float* a_i, float* v_i, float* v_s, float* sv_i, float* e_i,
     float* t_su, float* t_s, float* a_ip, float* v_ip,
     float* qsr_tot, float* qns_tot, float* emp_tot, float* sfx_tot,
@@ -1236,9 +1236,9 @@ __global__ void si3_thermo_bl99_frazil_kernel(
     const double h0_new = fmax(0.5 * dz[0], dz[0] + ssh_new);
     const double sal_new = fmax(0.0, (salt_oce_before - SI3_RHOI * (sv_after - sv_before)) / (h0_new * cfg.rho0));
 
-    temp_k[col] = static_cast<float>(O_RT0 + fmax(tf_c, fmin(42.0, t0_new_c)));
-    sal_psu[col] = static_cast<float>(sal_new);
-    ssh[col] = static_cast<float>(ssh_new);
+    temp_k[col] = O_RT0 + fmax(tf_c, fmin(42.0, t0_new_c));
+    sal_psu[col] = sal_new;
+    ssh[col] = ssh_new;
 
     // Total fluxes to 3D ocean (taux, tauy, qsr, qns, emp)
     qsr_tot[col] = static_cast<float>(qsr_net_surf);
@@ -1298,7 +1298,7 @@ __global__ void si3_thermo_bl99_frazil_kernel(
 __global__ void oce_barotropic_uv_kernel(
     NhOceanConfig cfg, double dt_bt,
     const float* tmask, const float* bathy, const float* msf, const float* fcor,
-    const float* ssh, const float* eta_ib, const float* taux_oce, const float* tauy_oce,
+    const double* ssh, const float* eta_ib, const float* taux_oce, const float* tauy_oce,
     const float* ub_rhs, const float* vb_rhs,
     const float* ub_in, const float* vb_in,
     float* ub_out, float* vb_out
@@ -1330,8 +1330,8 @@ __global__ void oce_barotropic_uv_kernel(
         const double v_avg = 0.25 * (vb_in[col] + vb_in[col_e] +
                                      vb_in[static_cast<size_t>(jm) * cfg.nx + i] +
                                      vb_in[static_cast<size_t>(jm) * cfg.nx + ip]);
-        const double eta_e = static_cast<double>(ssh[col_e] - eta_ib[col_e]);
-        const double eta_c = static_cast<double>(ssh[col] - eta_ib[col]);
+        const double eta_e = ssh[col_e] - static_cast<double>(eta_ib[col_e]);
+        const double eta_c = ssh[col] - static_cast<double>(eta_ib[col]);
         const double grad_x = -O_GRAVITY * (eta_e - eta_c) / dx;
         const double fc = 0.5 * (fcor[col] + fcor[col_e]);
         const double cor = fc * v_avg;
@@ -1353,8 +1353,8 @@ __global__ void oce_barotropic_uv_kernel(
         const double u_avg = 0.25 * (ub_in[col] + ub_in[col_n] +
                                      ub_in[static_cast<size_t>(j) * cfg.nx + im] +
                                      ub_in[static_cast<size_t>(jp) * cfg.nx + im]);
-        const double eta_n = static_cast<double>(ssh[col_n] - eta_ib[col_n]);
-        const double eta_c = static_cast<double>(ssh[col] - eta_ib[col]);
+        const double eta_n = ssh[col_n] - static_cast<double>(eta_ib[col_n]);
+        const double eta_c = ssh[col] - static_cast<double>(eta_ib[col]);
         const double grad_y = -O_GRAVITY * (eta_n - eta_c) / dy;
         const double fc = 0.5 * (fcor[col] + fcor[col_n]);
         const double cor = -fc * u_avg;
@@ -1373,7 +1373,7 @@ __global__ void oce_barotropic_uv_kernel(
 __global__ void oce_barotropic_ssh_kernel(
     NhOceanConfig cfg, double dt_bt,
     const float* tmask, const float* bathy, const float* msf,
-    const float* ub, const float* vb, float* ssh
+    const float* ub, const float* vb, double* ssh
 ) {
     const int32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     const int32_t j = blockIdx.y * blockDim.y + threadIdx.y;
@@ -1381,7 +1381,7 @@ __global__ void oce_barotropic_ssh_kernel(
     const size_t col = static_cast<size_t>(j) * cfg.nx + i;
 
     if (tmask[col] < 0.5f) {
-        ssh[col] = 0.0f;
+        ssh[col] = 0.0;
         return;
     }
 
@@ -1405,15 +1405,15 @@ __global__ void oce_barotropic_ssh_kernel(
 
     const double div_u = (he * static_cast<double>(ub[col]) - hw * static_cast<double>(ub[col_w])) / dx
                        + (hn * static_cast<double>(vb[col]) - hs * static_cast<double>(vb[col_s])) / dy;
-    const double ssh_new = fmax(-8.0, fmin(8.0, static_cast<double>(ssh[col]) - dt_bt * div_u));
-    ssh[col] = static_cast<float>(ssh_new);
+    const double ssh_new = fmax(-8.0, fmin(8.0, ssh[col] - dt_bt * div_u));
+    ssh[col] = ssh_new;
 }
 
 // 8. 3D Hydrostatic Pressure Gradient + Coriolis + Biharmonic/Laplacian Visc + Implicit Thomas Vertical Mixing
 __global__ void oce_baroclinic_3d_kernel(
     NhOceanConfig cfg, double dt_s,
     const double* dz, const float* tmask, const int32_t* mbkt, const float* msf, const float* fcor,
-    const float* rhd, const float* avm, const float* ssh, const float* ub, const float* vb,
+    const float* rhd, const float* avm, const double* ssh, const float* ub, const float* vb,
     const float* taux_oce, const float* tauy_oce,
     const float* u_oce_in, const float* v_oce_in,
     float* u_oce_out, float* v_oce_out
@@ -1575,7 +1575,7 @@ __global__ void oce_tracer_adv_diff_step_kernel(
     NhOceanConfig cfg, double dt_s, int32_t is_temp,
     const double* dz, const double* z_w, const float* tmask, const int32_t* mbkt,
     const float* msf, const float* u_oce, const float* v_oce, const float* w_oce,
-    const float* avt, const float* qsr_tot, const float* tracer_in, float* tracer_out
+    const float* avt, const float* qsr_tot, const double* tracer_in, double* tracer_out
 ) {
     const int32_t i = blockIdx.x * blockDim.x + threadIdx.x;
     const int32_t j = blockIdx.y * blockDim.y + threadIdx.y;
@@ -1585,7 +1585,7 @@ __global__ void oce_tracer_adv_diff_step_kernel(
     const int32_t kbot = mbkt[col];
 
     if (tmask[col] < 0.5f || kbot <= 0) {
-        for (int32_t k = 0; k < cfg.nz; ++k) tracer_out[static_cast<size_t>(k) * n2 + col] = 0.0f;
+        for (int32_t k = 0; k < cfg.nz; ++k) tracer_out[static_cast<size_t>(k) * n2 + col] = 0.0;
         return;
     }
 
@@ -1683,14 +1683,12 @@ __global__ void oce_tracer_adv_diff_step_kernel(
         const size_t idx = static_cast<size_t>(k) * n2 + col;
         if (k < kbot) {
             if (is_temp) {
-                const double tf_k = eval_teos10_fzp_hd(static_cast<double>(tracer_out[idx]) /* unused */, z_w[k]);
-                (void)tf_k;
-                tracer_out[idx] = static_cast<float>(fmax(O_RT0 - 2.6, fmin(318.0, col_out[k])));
+                tracer_out[idx] = fmax(O_RT0 - 2.6, fmin(318.0, col_out[k]));
             } else {
-                tracer_out[idx] = static_cast<float>(fmax(0.0, fmin(48.0, col_out[k])));
+                tracer_out[idx] = fmax(0.0, fmin(48.0, col_out[k]));
             }
         } else {
-            tracer_out[idx] = 0.0f;
+            tracer_out[idx] = 0.0;
         }
     }
 }
@@ -1703,9 +1701,10 @@ void nh_oce_free(NhOceanSi3Handle* h) {
 
     fd(h->d_dz); fd(h->d_zt); fd(h->d_zw);
     ff(h->d_msf); ff(h->d_fcor); ff(h->d_bathy); ff(h->d_tmask); fi(h->d_mbkt);
-    ff(h->d_temp); ff(h->d_sal); ff(h->d_u); ff(h->d_v); ff(h->d_w);
+    fd(h->d_temp); fd(h->d_sal); fd(h->d_tmp_tr);
+    ff(h->d_u); ff(h->d_v); ff(h->d_w);
     ff(h->d_tke); ff(h->d_avm); ff(h->d_avt); ff(h->d_rhd); ff(h->d_tmp1); ff(h->d_tmp2);
-    ff(h->d_ssh); ff(h->d_ub); ff(h->d_vb); ff(h->d_ub_rhs); ff(h->d_vb_rhs); ff(h->d_eta_ib); ff(h->d_mld);
+    fd(h->d_ssh); ff(h->d_ub); ff(h->d_vb); ff(h->d_ub_rhs); ff(h->d_vb_rhs); ff(h->d_eta_ib); ff(h->d_mld);
     ff(h->d_taux_atm); ff(h->d_tauy_atm); ff(h->d_taux_oce); ff(h->d_tauy_oce);
     ff(h->d_qsr_oce); ff(h->d_qns_oce); ff(h->d_emp_oce);
     ff(h->d_qsr_tot); ff(h->d_qns_tot); ff(h->d_emp_tot); ff(h->d_sfx_tot);
@@ -1726,8 +1725,8 @@ extern "C" {
 uint64_t nh_ocean_si3_estimate_vram_bytes(int32_t nz, int32_t ny, int32_t nx, int32_t enable_si3) {
     const uint64_t n2 = static_cast<uint64_t>(ny) * static_cast<uint64_t>(nx);
     const uint64_t n3 = static_cast<uint64_t>(nz) * n2;
-    const uint64_t bytes_3d = 11ULL * n3 * sizeof(float);
-    const uint64_t bytes_2d = 28ULL * n2 * sizeof(float);
+    const uint64_t bytes_3d = 9ULL * n3 * sizeof(float) + 3ULL * n3 * sizeof(double);
+    const uint64_t bytes_2d = 27ULL * n2 * sizeof(float) + n2 * sizeof(double);
     const uint64_t bytes_si3 = enable_si3
         ? ((8ULL * TEMPEST_SI3_NCAT + TEMPEST_SI3_NCAT * TEMPEST_SI3_NLAY + 12ULL) * n2 * sizeof(float))
         : (4ULL * n2 * sizeof(float));
@@ -1775,6 +1774,13 @@ NhOceanSi3Handle* nh_ocean_si3_create(const NhOceanConfig* cfg_in, const NhOcean
         if (e != cudaSuccess) { oce_set_cuda_err(__FILE__, __LINE__, e); return false; }
         return true;
     };
+    auto alloc_d = [&](double** p, size_t cnt) -> bool {
+        cudaError_t e = cudaMalloc(p, cnt * sizeof(double));
+        if (e != cudaSuccess) { oce_set_cuda_err(__FILE__, __LINE__, e); return false; }
+        e = cudaMemset(*p, 0, cnt * sizeof(double));
+        if (e != cudaSuccess) { oce_set_cuda_err(__FILE__, __LINE__, e); return false; }
+        return true;
+    };
 
     if (cudaMalloc(&h->d_dz, h->cfg.nz * sizeof(double)) != cudaSuccess ||
         cudaMalloc(&h->d_zt, h->cfg.nz * sizeof(double)) != cudaSuccess ||
@@ -1790,11 +1796,11 @@ NhOceanSi3Handle* nh_ocean_si3_create(const NhOceanConfig* cfg_in, const NhOcean
 
     bool ok = alloc_f(&h->d_msf, h->n2) && alloc_f(&h->d_fcor, h->n2) &&
               alloc_f(&h->d_bathy, h->n2) && alloc_f(&h->d_tmask, h->n2) &&
-              alloc_f(&h->d_temp, h->n3) && alloc_f(&h->d_sal, h->n3) &&
+              alloc_d(&h->d_temp, h->n3) && alloc_d(&h->d_sal, h->n3) && alloc_d(&h->d_tmp_tr, h->n3) &&
               alloc_f(&h->d_u, h->n3) && alloc_f(&h->d_v, h->n3) && alloc_f(&h->d_w, h->n3) &&
               alloc_f(&h->d_tke, h->n3) && alloc_f(&h->d_avm, h->n3) && alloc_f(&h->d_avt, h->n3) &&
               alloc_f(&h->d_rhd, h->n3) && alloc_f(&h->d_tmp1, h->n3) && alloc_f(&h->d_tmp2, h->n3) &&
-              alloc_f(&h->d_ssh, h->n2) && alloc_f(&h->d_ub, h->n2) && alloc_f(&h->d_vb, h->n2) &&
+              alloc_d(&h->d_ssh, h->n2) && alloc_f(&h->d_ub, h->n2) && alloc_f(&h->d_vb, h->n2) &&
               alloc_f(&h->d_ub_rhs, h->n2) && alloc_f(&h->d_vb_rhs, h->n2) &&
               alloc_f(&h->d_eta_ib, h->n2) && alloc_f(&h->d_mld, h->n2) &&
               alloc_f(&h->d_taux_atm, h->n2) && alloc_f(&h->d_tauy_atm, h->n2) &&
@@ -1861,12 +1867,17 @@ int32_t nh_ocean_si3_upload_state(NhOceanSi3Handle* h, const NhOceanConstStatePt
         OCE_CHECK(cudaMemcpy(dst, s, cnt * sizeof(float), cudaMemcpyHostToDevice));
         return 0;
     };
+    auto cp_d = [&](double* dst, const double* s, size_t cnt) -> int32_t {
+        if (!dst || !s) return 0;
+        OCE_CHECK(cudaMemcpy(dst, s, cnt * sizeof(double), cudaMemcpyHostToDevice));
+        return 0;
+    };
     const size_t n_cat = TEMPEST_SI3_NCAT * h->n2;
     const size_t n_e = TEMPEST_SI3_NCAT * TEMPEST_SI3_NLAY * h->n2;
-    if (cp(h->d_temp, src->temp_k, h->n3) || cp(h->d_sal, src->sal_psu, h->n3) ||
+    if (cp_d(h->d_temp, src->temp_k, h->n3) || cp_d(h->d_sal, src->sal_psu, h->n3) ||
         cp(h->d_u, src->u_oce, h->n3) || cp(h->d_v, src->v_oce, h->n3) || cp(h->d_tke, src->tke, h->n3) ||
         cp(h->d_avm, src->avm, h->n3) || cp(h->d_avt, src->avt, h->n3) ||
-        cp(h->d_ssh, src->ssh, h->n2) || cp(h->d_ub, src->ub, h->n2) ||
+        cp_d(h->d_ssh, src->ssh, h->n2) || cp(h->d_ub, src->ub, h->n2) ||
         cp(h->d_vb, src->vb, h->n2) || cp(h->d_mld, src->mld, h->n2) ||
         cp(h->d_a_i, src->a_i, n_cat) || cp(h->d_v_i, src->v_i, n_cat) ||
         cp(h->d_v_s, src->v_s, n_cat) || cp(h->d_sv_i, src->sv_i, n_cat) ||
@@ -1888,12 +1899,17 @@ int32_t nh_ocean_si3_download_state(NhOceanSi3Handle* h, const NhOceanStatePtrs*
         OCE_CHECK(cudaMemcpy(d, s, cnt * sizeof(float), cudaMemcpyDeviceToHost));
         return 0;
     };
+    auto cp_d = [&](double* d, const double* s, size_t cnt) -> int32_t {
+        if (!d || !s) return 0;
+        OCE_CHECK(cudaMemcpy(d, s, cnt * sizeof(double), cudaMemcpyDeviceToHost));
+        return 0;
+    };
     const size_t n_cat = TEMPEST_SI3_NCAT * h->n2;
     const size_t n_e = TEMPEST_SI3_NCAT * TEMPEST_SI3_NLAY * h->n2;
-    if (cp(dst->temp_k, h->d_temp, h->n3) || cp(dst->sal_psu, h->d_sal, h->n3) ||
+    if (cp_d(dst->temp_k, h->d_temp, h->n3) || cp_d(dst->sal_psu, h->d_sal, h->n3) ||
         cp(dst->u_oce, h->d_u, h->n3) || cp(dst->v_oce, h->d_v, h->n3) || cp(dst->tke, h->d_tke, h->n3) ||
         cp(dst->avm, h->d_avm, h->n3) || cp(dst->avt, h->d_avt, h->n3) ||
-        cp(dst->ssh, h->d_ssh, h->n2) || cp(dst->ub, h->d_ub, h->n2) ||
+        cp_d(dst->ssh, h->d_ssh, h->n2) || cp(dst->ub, h->d_ub, h->n2) ||
         cp(dst->vb, h->d_vb, h->n2) || cp(dst->mld, h->d_mld, h->n2) ||
         cp(dst->a_i, h->d_a_i, n_cat) || cp(dst->v_i, h->d_v_i, n_cat) ||
         cp(dst->v_s, h->d_v_s, n_cat) || cp(dst->sv_i, h->d_sv_i, n_cat) ||
@@ -2053,14 +2069,16 @@ int32_t nh_ocean_si3_step(NhOceanSi3Handle* h, const NhOceanForcingPtrs* f, doub
     // 6. 3D Tracers (Conservative advection + 2-band traqsr + Implicit Thomas vertical mixing)
     oce_tracer_adv_diff_step_kernel<<<grid, block>>>(
         h->cfg, dt_s, 1, h->d_dz, h->d_zw, h->d_tmask, h->d_mbkt, h->d_msf,
-        h->d_u, h->d_v, h->d_w, h->d_avt, h->d_qsr_tot, h->d_temp, h->d_tmp1
+        h->d_u, h->d_v, h->d_w, h->d_avt, h->d_qsr_tot, h->d_temp, h->d_tmp_tr
     );
+    OCE_CHECK(cudaGetLastError());
+    OCE_CHECK(cudaMemcpy(h->d_temp, h->d_tmp_tr, h->n3 * sizeof(double), cudaMemcpyDeviceToDevice));
     oce_tracer_adv_diff_step_kernel<<<grid, block>>>(
         h->cfg, dt_s, 0, h->d_dz, h->d_zw, h->d_tmask, h->d_mbkt, h->d_msf,
-        h->d_u, h->d_v, h->d_w, h->d_avt, h->d_qsr_tot, h->d_sal, h->d_tmp2
+        h->d_u, h->d_v, h->d_w, h->d_avt, h->d_qsr_tot, h->d_sal, h->d_tmp_tr
     );
-    OCE_CHECK(cudaMemcpy(h->d_temp, h->d_tmp1, h->n3 * sizeof(float), cudaMemcpyDeviceToDevice));
-    OCE_CHECK(cudaMemcpy(h->d_sal, h->d_tmp2, h->n3 * sizeof(float), cudaMemcpyDeviceToDevice));
+    OCE_CHECK(cudaGetLastError());
+    OCE_CHECK(cudaMemcpy(h->d_sal, h->d_tmp_tr, h->n3 * sizeof(double), cudaMemcpyDeviceToDevice));
     OCE_CHECK(cudaDeviceSynchronize());
     return 0;
 }

@@ -64,14 +64,14 @@ typedef struct NhOceanStaticPtrs {
  *   ice_frac, ice_thick, ice_tsfc, ice_albedo: aggregate surface state ([ny, nx])
  */
 typedef struct NhOceanStatePtrs {
-    float* temp_k;
-    float* sal_psu;
+    double* temp_k;
+    double* sal_psu;
     float* u_oce;
     float* v_oce;
     float* tke;
     float* avm;
     float* avt;
-    float* ssh;
+    double* ssh;
     float* ub;
     float* vb;
     float* mld;
@@ -96,14 +96,14 @@ typedef struct NhOceanStatePtrs {
 } NhOceanStatePtrs;
 
 typedef struct NhOceanConstStatePtrs {
-    const float* temp_k;
-    const float* sal_psu;
+    const double* temp_k;
+    const double* sal_psu;
     const float* u_oce;
     const float* v_oce;
     const float* tke;
     const float* avm;
     const float* avt;
-    const float* ssh;
+    const double* ssh;
     const float* ub;
     const float* vb;
     const float* mld;

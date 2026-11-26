@@ -39,6 +39,7 @@ DEFAULT_OCEAN_DZ_M: Tuple[float, ...] = (
 
 OCEAN_3D_FIELDS = ("temp_k", "sal_psu", "u_oce", "v_oce", "tke", "avm", "avt")
 OCEAN_2D_FIELDS = ("ssh", "ub", "vb", "mld")
+OCEAN_FP64_FIELDS = frozenset(("temp_k", "sal_psu", "ssh"))
 SI3_CAT_FIELDS = ("a_i", "v_i", "v_s", "sv_i", "t_su", "t_s", "a_ip", "v_ip")
 SI3_2D_FIELDS = ("u_ice", "v_ice", "stress1", "stress2", "stress12", "ice_frac", "ice_thick", "ice_tsfc", "ice_albedo")
 OCEAN_STATE_STRUCT_ORDER = OCEAN_3D_FIELDS + OCEAN_2D_FIELDS + SI3_CAT_FIELDS[:4] + ("e_i",) + SI3_CAT_FIELDS[4:] + SI3_2D_FIELDS
@@ -259,9 +260,12 @@ class NemoSi3GPUSolver:
         s2 = (self.ny, self.nx)
         s_cat = (SI3_NCAT, self.ny, self.nx)
         s_e = (SI3_NCAT * SI3_NLAY, self.ny, self.nx)
-        st: Dict[str, np.ndarray] = {k: np.zeros(z_shape, dtype=np.float32) for k in OCEAN_3D_FIELDS}
+        st: Dict[str, np.ndarray] = {
+            k: np.zeros(z_shape, dtype=(np.float64 if k in OCEAN_FP64_FIELDS else np.float32))
+            for k in OCEAN_3D_FIELDS
+        }
         for k in OCEAN_2D_FIELDS:
-            st[k] = np.zeros(s2, dtype=np.float32)
+            st[k] = np.zeros(s2, dtype=(np.float64 if k in OCEAN_FP64_FIELDS else np.float32))
         for k in SI3_CAT_FIELDS:
             st[k] = np.zeros(s_cat, dtype=np.float32)
         st["e_i"] = np.zeros(s_e, dtype=np.float32)
@@ -281,7 +285,8 @@ class NemoSi3GPUSolver:
             if arr is None:
                 kwargs[k] = 0
             else:
-                c_arr = np.ascontiguousarray(arr, dtype=np.float32)
+                dt = np.float64 if k in OCEAN_FP64_FIELDS else np.float32
+                c_arr = np.ascontiguousarray(arr, dtype=dt)
                 refs.append(c_arr)
                 kwargs[k] = c_arr.ctypes.data
         return NhOceanStatePtrsC(**kwargs), refs
@@ -582,7 +587,8 @@ class NemoSi3GPUSolver:
         for k in OCEAN_STATE_STRUCT_ORDER:
             if k not in oce_state:
                 continue
-            arr = np.asarray(oce_state[k], dtype=np.float32)
+            dt = np.float64 if k in OCEAN_FP64_FIELDS else np.float32
+            arr = np.asarray(oce_state[k], dtype=dt)
             if k in OCEAN_3D_FIELDS:
                 dims = ("z_oce", "y", "x")
             elif k in SI3_CAT_FIELDS:
@@ -620,5 +626,6 @@ class NemoSi3GPUSolver:
             meta = dict(ds.attrs)
             for k in OCEAN_STATE_STRUCT_ORDER:
                 if k in ds:
-                    state[k] = np.asarray(ds[k].values, dtype=np.float32)
+                    dt = np.float64 if k in OCEAN_FP64_FIELDS else np.float32
+                    state[k] = np.asarray(ds[k].values, dtype=dt)
         return state, meta

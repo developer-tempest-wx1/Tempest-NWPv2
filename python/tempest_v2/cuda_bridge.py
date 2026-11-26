@@ -367,6 +367,7 @@ def _pack_struct_ptrs(
     cls: type,
     mapping: Dict[str, np.ndarray],
     field_names: Tuple[str, ...],
+    fp64_fields: frozenset[str] = frozenset(),
 ) -> Tuple[ctypes.Structure, List[np.ndarray]]:
     kept: List[np.ndarray] = []
     kwargs: Dict[str, ctypes.c_void_p] = {}
@@ -375,7 +376,8 @@ def _pack_struct_ptrs(
         if arr is None:
             kwargs[name] = ctypes.c_void_p(0)
         else:
-            c_arr = np.ascontiguousarray(arr, dtype=np.float32)
+            dt = np.float64 if name in fp64_fields else np.float32
+            c_arr = np.ascontiguousarray(arr, dtype=dt)
             kept.append(c_arr)
             kwargs[name] = ctypes.c_void_p(c_arr.ctypes.data)
     return cls(**kwargs), kept
@@ -388,6 +390,9 @@ class NonHydrostaticGPUSolver:
     """
 
     SPECIES = ("qv", "qc", "qr", "qi", "qs", "qg")
+    SURFACE_FP64_FIELDS = frozenset(
+        ("soil_t", "soil_m", "rain_acc", "snow_acc", "graupel_acc", "lightning_acc")
+    )
     SURFACE_STATIC_FIELDS = (
         "lat_deg",
         "lon_deg",
@@ -908,12 +913,15 @@ class NonHydrostaticGPUSolver:
         }
 
     def empty_surface_state(self) -> Dict[str, np.ndarray]:
-        """Allocate physical float32 default 2D + 4-layer soil surface state dict."""
+        """Allocate physical default 2D + 4-layer soil surface state dict (lossless FP64 for soil & precip)."""
         s2 = (self.ny, self.nx)
         s4 = (4, self.ny, self.nx)
-        out: Dict[str, np.ndarray] = {k: np.zeros(s2, dtype=np.float32) for k in self.SURFACE_2D_FIELDS}
-        out["soil_t"] = np.full(s4, 285.0, dtype=np.float32)
-        out["soil_m"] = np.full(s4, 0.28, dtype=np.float32)
+        out: Dict[str, np.ndarray] = {
+            k: np.zeros(s2, dtype=(np.float64 if k in self.SURFACE_FP64_FIELDS else np.float32))
+            for k in self.SURFACE_2D_FIELDS
+        }
+        out["soil_t"] = np.full(s4, 285.0, dtype=np.float64)
+        out["soil_m"] = np.full(s4, 0.28, dtype=np.float64)
         out["t_skin"].fill(286.0)
         out["sst_bulk"].fill(284.0)
         out["lake_tbot"].fill(281.0)
@@ -924,10 +932,11 @@ class NonHydrostaticGPUSolver:
     def _slice_tile_surface(self, src: Dict[str, np.ndarray], tile: _TileBox) -> Dict[str, np.ndarray]:
         out: Dict[str, np.ndarray] = {}
         for k, v in src.items():
+            dt = np.float64 if k in self.SURFACE_FP64_FIELDS else np.float32
             if v.ndim == 3:
-                out[k] = np.ascontiguousarray(v[:, tile.pj0 : tile.pj1, tile.pi0 : tile.pi1], dtype=np.float32)
+                out[k] = np.ascontiguousarray(v[:, tile.pj0 : tile.pj1, tile.pi0 : tile.pi1], dtype=dt)
             else:
-                out[k] = np.ascontiguousarray(v[tile.pj0 : tile.pj1, tile.pi0 : tile.pi1], dtype=np.float32)
+                out[k] = np.ascontiguousarray(v[tile.pj0 : tile.pj1, tile.pi0 : tile.pi1], dtype=dt)
         return out
 
     def _write_tile_surface_interior(self, dst: Dict[str, np.ndarray], src: Dict[str, np.ndarray], tile: _TileBox) -> None:
@@ -1003,7 +1012,9 @@ class NonHydrostaticGPUSolver:
 
     def upload_surface(self, surf: Dict[str, np.ndarray]) -> None:
         if len(self._tiles) == 1:
-            ptrs, kept = _pack_struct_ptrs(NhSurfaceStatePtrsC, surf, self.SURFACE_STATE_STRUCT_ORDER)
+            ptrs, kept = _pack_struct_ptrs(
+                NhSurfaceStatePtrsC, surf, self.SURFACE_STATE_STRUCT_ORDER, self.SURFACE_FP64_FIELDS
+            )
             self._raise_if_err(self.lib.nh_cuda_upload_surface(self._handle, ctypes.byref(ptrs)), "upload_surface")
             del kept
         else:
@@ -1011,18 +1022,23 @@ class NonHydrostaticGPUSolver:
                 self._surface_state_host = self.empty_surface_state()
             for k, v in surf.items():
                 if k in self.SURFACE_STATE_STRUCT_ORDER:
-                    self._surface_state_host[k] = np.ascontiguousarray(v, dtype=np.float32).copy()
+                    dt = np.float64 if k in self.SURFACE_FP64_FIELDS else np.float32
+                    self._surface_state_host[k] = np.ascontiguousarray(v, dtype=dt).copy()
             if self._tile_handles:
                 for h, tile in zip(self._tile_handles, self._tiles):
                     sf_slice = self._slice_tile_surface(self._surface_state_host, tile)
-                    ptrs, kept = _pack_struct_ptrs(NhSurfaceStatePtrsC, sf_slice, self.SURFACE_STATE_STRUCT_ORDER)
+                    ptrs, kept = _pack_struct_ptrs(
+                        NhSurfaceStatePtrsC, sf_slice, self.SURFACE_STATE_STRUCT_ORDER, self.SURFACE_FP64_FIELDS
+                    )
                     self._raise_if_err(self.lib.nh_cuda_upload_surface(h, ctypes.byref(ptrs)), "tile upload_surface")
                     del kept
 
     def download_surface(self) -> Dict[str, np.ndarray]:
         if len(self._tiles) == 1:
             out = self.empty_surface_state()
-            ptrs, kept = _pack_struct_ptrs(NhSurfaceStatePtrsC, out, self.SURFACE_STATE_STRUCT_ORDER)
+            ptrs, kept = _pack_struct_ptrs(
+                NhSurfaceStatePtrsC, out, self.SURFACE_STATE_STRUCT_ORDER, self.SURFACE_FP64_FIELDS
+            )
             self._raise_if_err(self.lib.nh_cuda_download_surface(self._handle, ctypes.byref(ptrs)), "download_surface")
             del kept
             return out
@@ -1030,7 +1046,9 @@ class NonHydrostaticGPUSolver:
             out = self.empty_surface_state()
             for h, tile in zip(self._tile_handles, self._tiles):
                 sf_slice = self._slice_tile_surface(out, tile)
-                ptrs, kept = _pack_struct_ptrs(NhSurfaceStatePtrsC, sf_slice, self.SURFACE_STATE_STRUCT_ORDER)
+                ptrs, kept = _pack_struct_ptrs(
+                    NhSurfaceStatePtrsC, sf_slice, self.SURFACE_STATE_STRUCT_ORDER, self.SURFACE_FP64_FIELDS
+                )
                 self._raise_if_err(self.lib.nh_cuda_download_surface(h, ctypes.byref(ptrs)), "tile download_surface")
                 del kept
                 self._write_tile_surface_interior(out, sf_slice, tile)
@@ -1237,7 +1255,9 @@ class NonHydrostaticGPUSolver:
                             self._raise_if_err(self.lib.nh_cuda_set_surface_static(h, ctypes.byref(ss_ptrs)), "tile set_surface_static")
                             del kept_ss
                         sf_slice = self._slice_tile_surface(self._surface_state_host, tile)
-                        sf_ptrs, kept_sf = _pack_struct_ptrs(NhSurfaceStatePtrsC, sf_slice, self.SURFACE_STATE_STRUCT_ORDER)
+                        sf_ptrs, kept_sf = _pack_struct_ptrs(
+                            NhSurfaceStatePtrsC, sf_slice, self.SURFACE_STATE_STRUCT_ORDER, self.SURFACE_FP64_FIELDS
+                        )
                         self._raise_if_err(self.lib.nh_cuda_upload_surface(h, ctypes.byref(sf_ptrs)), "tile upload_surface")
                         del kept_sf
                         pcache = self._tile_phys_caches[t_idx]
@@ -1277,7 +1297,9 @@ class NonHydrostaticGPUSolver:
                             ),
                             "tile download_phys_cache",
                         )
-                        sf_d_ptrs, kept_sfd = _pack_struct_ptrs(NhSurfaceStatePtrsC, sf_slice, self.SURFACE_STATE_STRUCT_ORDER)
+                        sf_d_ptrs, kept_sfd = _pack_struct_ptrs(
+                            NhSurfaceStatePtrsC, sf_slice, self.SURFACE_STATE_STRUCT_ORDER, self.SURFACE_FP64_FIELDS
+                        )
                         self._raise_if_err(self.lib.nh_cuda_download_surface(h, ctypes.byref(sf_d_ptrs)), "tile download_surface")
                         del kept_sfd
                         self._write_tile_surface_interior(next_surf, sf_slice, tile)
