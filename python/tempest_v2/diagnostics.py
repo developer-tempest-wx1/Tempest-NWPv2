@@ -573,12 +573,55 @@ def compute_synoptic_convective_2d(
         contrib = ux_b * vy_a - ux_a * vy_b
         srh_0_3km = np.where(in3, srh_0_3km + contrib, srh_0_3km)
 
+    # Surface precipitation rate [kg m^-2 s^-1] (needed for active-convection gust gating & output)
+    p_tot = (
+        np.asarray(surf_state.get("rain_acc", np.zeros((spec.ny, spec.nx))), dtype=np.float64)
+        + np.asarray(surf_state.get("snow_acc", np.zeros((spec.ny, spec.nx))), dtype=np.float64)
+        + np.asarray(surf_state.get("graupel_acc", np.zeros((spec.ny, spec.nx))), dtype=np.float64)
+    )
+    if prev_precip_total is not None and interval_s > 0.0:
+        precip_rate = np.maximum(p_tot - np.asarray(prev_precip_total, dtype=np.float64), 0.0) / float(interval_s)
+    else:
+        precip_rate = np.zeros((spec.ny, spec.nx), dtype=np.float64)
+
     u10 = np.asarray(surf_state.get("u10m", u_3d[0]), dtype=np.float64)
     v10 = np.asarray(surf_state.get("v10m", v_3d[0]), dtype=np.float64)
     wspd10 = np.hypot(u10, v10)
-    ustar = np.maximum(np.asarray(surf_state.get("ustar", 0.04 * wspd10), dtype=np.float64), 0.0)
-    # Beljaars (1987) / Brasseur (2001) / ECMWF IFS 3s peak gust (~3*sigma_u = 7.2*ustar) + convective downdraft term
-    gust10m = wspd10 + 7.2 * ustar + 0.15 * np.sqrt(np.maximum(cape_sb, 0.0))
+    ustar_raw = np.asarray(surf_state.get("ustar", np.zeros_like(wspd10)), dtype=np.float64)
+    # Cold-start T+00 fallback: GPU surface kernel floors ustar >= 0.015 m/s once physics runs;
+    # when ustar == 0 (uninitialized T+00), use neutral WMO open-terrain u* = kappa / ln(10/0.03) * wspd10.
+    ustar = np.where(ustar_raw > 1e-6, ustar_raw, 0.0688 * wspd10)
+
+    # ECMWF IFS Cy48r1+ SPPGUST (Beljaars 1987; Panofsky et al. 1977; ZUGN=7.2, RUGNA/RUGNB=0.5/12, RPARZI=1000 m):
+    # Singularity-free form: u_eff = (u*^3 + (0.5/12) * kappa * z_i * max(B_0, 0))^(1/3)
+    # Reduces identically to 7.2*u* in neutral/stable conditions (B_0 <= 0).
+    shf_sfc = np.asarray(surf_state.get("shf", np.zeros((spec.ny, spec.nx))), dtype=np.float64)
+    lhf_sfc = np.asarray(surf_state.get("lhf", np.zeros((spec.ny, spec.nx))), dtype=np.float64)
+    rho_sfc = np.maximum(rho[0], 0.2)
+    buoy_flux = (GRAVITY_M_S2 / np.maximum(t2m, 180.0)) * (
+        shf_sfc / (rho_sfc * CP_D) + 0.608 * t2m * lhf_sfc / (rho_sfc * _LV0)
+    )
+    u_turb_eff = np.cbrt(ustar**3 + (0.5 / 12.0) * 0.4 * 1000.0 * np.maximum(buoy_flux, 0.0))
+
+    # Bechtold & Bidlot (2009) / IFS convective downdraft gust: active ONLY with precipitating convection
+    # (eliminates spurious clear-sky CAPE gusts on sunny summer / heatwave afternoons).
+    pr_mmh = 3600.0 * precip_rate
+    q_prec_low = np.max(np.where(agl <= 2500.0, qr + qg, 0.0), axis=0)
+    f_conv_act = np.maximum(
+        np.clip((pr_mmh - 0.1) / 1.5, 0.0, 1.0),
+        np.clip((q_prec_low - 1.0e-4) / 5.0e-4, 0.0, 1.0),
+    )
+    f_cape_act = np.clip(np.maximum(cape_mu, cape_sb) / 200.0, 0.0, 1.0)
+    u_500m = _interp_agl(500.0, u_3d)
+    v_500m = _interp_agl(500.0, v_3d)
+    u_1500m = _interp_agl(1500.0, u_3d)
+    v_1500m = _interp_agl(1500.0, v_3d)
+    conv_shear = np.maximum(0.0, np.hypot(u_1500m, v_1500m) - np.hypot(u_500m, v_500m))
+    gust_conv = np.maximum(
+        0.6 * conv_shear * f_conv_act * f_cape_act,
+        0.08 * np.sqrt(np.maximum(cape_sb, 0.0)) * f_conv_act,
+    )
+    gust10m = wspd10 + 7.2 * u_turb_eff + gust_conv
 
     # Highest freezing level [m ASL]
     freezing_level_m = np.zeros((spec.ny, spec.nx), dtype=np.float64)
@@ -621,17 +664,6 @@ def compute_synoptic_convective_2d(
     beta_fog2m = 144.7 * np.power(lwc_2m_g_m3, 0.88)
     beta_tot = np.maximum(beta_c + beta_fog2m + beta_r + beta_i + beta_s + beta_g + beta_haze + 0.015, 0.05992)
     vis_m = np.clip(2996.0 / beta_tot, 10.0, 50_000.0)
-
-    # Surface precipitation rate [kg m^-2 s^-1]
-    p_tot = (
-        np.asarray(surf_state.get("rain_acc", np.zeros((spec.ny, spec.nx))), dtype=np.float64)
-        + np.asarray(surf_state.get("snow_acc", np.zeros((spec.ny, spec.nx))), dtype=np.float64)
-        + np.asarray(surf_state.get("graupel_acc", np.zeros((spec.ny, spec.nx))), dtype=np.float64)
-    )
-    if prev_precip_total is not None and interval_s > 0.0:
-        precip_rate = np.maximum(p_tot - np.asarray(prev_precip_total, dtype=np.float64), 0.0) / float(interval_s)
-    else:
-        precip_rate = np.zeros((spec.ny, spec.nx), dtype=np.float64)
 
     return {
         "td2m": td2m.astype(np.float32),
