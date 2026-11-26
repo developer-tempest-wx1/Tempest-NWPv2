@@ -2260,9 +2260,11 @@ __global__ void nh_microphysics_kernel(
     DeviceStaticGrid g,
     double dt_s,
     const float* lsm,
+    const float* w,
     float* thp, float* pip,
     float* qv, float* qc, float* qr, float* qi, float* qs, float* qg,
     float* rain_acc, float* snow_acc, float* graupel_acc,
+    float* lightning_acc,
     float* precip_liq_rate, float* precip_ice_rate,
     float* dz_scratch, double* tri_mass, double* tri_mair
 ) {
@@ -2291,6 +2293,8 @@ __global__ void nh_microphysics_kernel(
         {-LS0_F, -LF0_F, -LF0_F,  0.0f,   0.0f,   0.0f},
         {-LS0_F, -LF0_F, -LF0_F,  0.0f,   0.0f,   0.0f}
     };
+
+    double phi_chg_col = 0.0;
 
     // Pass 1: In-situ Thermodynamics + Saturation Adjustment + Transitions
     for (int32_t k = 0; k < nz; ++k) {
@@ -2371,6 +2375,18 @@ __global__ void nh_microphysics_kernel(
                     const float qck1 = (0.104f * GRAVITY_F * 0.55f * powf(rho, 4.0f / 3.0f)) / (1.71e-5f * cbrtf(nc * 1000.0f));
                     sx2x[1][2] += qck1 * powf(q[1], 7.0f / 3.0f);
                 }
+            } else {
+                // Classical land/sea collision-coalescence autoconversion (Tripoli & Cotton 1980 / ICE-T, r_c0 = 8.0 um):
+                // Sea (80 cm^-3): qc0 ~ 0.16 g/kg; Land (200 cm^-3): qc0 ~ 0.36-0.43 g/kg (protects thin radiation fog qc < 0.3 g/kg)
+                const float nc_auto = fmaxf(n_drop, 2.0e7f);
+                constexpr float RC0_ICET_CUBE = 8.0e-6f * 8.0e-6f * 8.0e-6f;
+                const float qc0_icet = (4.0f / 3.0f) * PI_CONST_F * RC0_ICET_CUBE * 1000.0f * nc_auto / rho;
+                if (q[1] > qc0_icet) {
+                    const float qck1 = (0.104f * GRAVITY_F * 0.55f * powf(rho, 4.0f / 3.0f))
+                                     / (1.71e-5f * cbrtf(nc_auto * 1000.0f));
+                    const float ramp = fminf(1.0f, (q[1] - qc0_icet) / fmaxf(0.25f * qc0_icet, 1.0e-5f));
+                    sx2x[1][2] += qck1 * powf(q[1], 7.0f / 3.0f) * ramp;
+                }
             }
 
             if (q[2] > 1e-8f) {
@@ -2415,7 +2431,11 @@ __global__ void nh_microphysics_kernel(
             }
             if (q[3] > 1e-6f) {
                 const float eff_stick = expf(0.025f * (t_k - T_FREEZE_F));
-                sx2x[3][4] += 1.0e-3f * eff_stick * rho * q[3];
+                if (use_ice_t) {
+                    sx2x[3][4] += 1.0e-3f * eff_stick * (q[3] - 1.0e-6f);
+                } else {
+                    sx2x[3][4] += 1.0e-3f * eff_stick * rho * q[3];
+                }
             }
             if (q[4] > 1e-8f) {
                 if (q[1] > 1e-6f) {
@@ -2450,12 +2470,21 @@ __global__ void nh_microphysics_kernel(
                 sx2x[4][5] += (use_ice_t ? 5.0e-3f : 1.5e-2f) * q[4] * (rho * q[1]);
             }
         } else {
-            const float dtemp = t_k - T_FREEZE_F;
-            if (q[4] > 1e-9f) {
-                sx2x[4][2] += 1.2e-3f * dtemp * powf(rho * q[4], 0.65f) / rho;
+            const bool use_wb = (pcfg.cy46_physics != 0);
+            float dtemp_melt = t_k - T_FREEZE_F;
+            if (use_wb) {
+                const float qsw_m = qsat_water(t_k, p_k);
+                const float dqsw_m = dqsat_water_dt(t_k, p_k);
+                const float t_wb = t_k - (LV0_F / CP_D_F) * fmaxf(0.0f, qsw_m - q[0]) / (1.0f + (LV0_F / CP_D_F) * dqsw_m);
+                dtemp_melt = fmaxf(0.0f, t_wb - T_FREEZE_F);
             }
-            if (q[5] > 1e-9f) {
-                sx2x[5][2] += 8.0e-4f * dtemp * powf(rho * q[5], 0.65f) / rho;
+            if (dtemp_melt > 0.0f) {
+                if (q[4] > 1e-9f) {
+                    sx2x[4][2] += 1.2e-3f * dtemp_melt * powf(rho * q[4], 0.65f) / rho;
+                }
+                if (q[5] > 1e-9f) {
+                    sx2x[5][2] += 8.0e-4f * dtemp_melt * powf(rho * q[5], 0.65f) / rho;
+                }
             }
         }
 
@@ -2503,6 +2532,15 @@ __global__ void nh_microphysics_kernel(
         qs[idx] = q[4];
         qg[idx] = q[5];
         update_pip_diabatic_const_rho(pib, thv_old, thv_new, pip ? &pip[idx] : nullptr);
+
+        if (lightning_acc && w && t_k <= 268.15f && t_k >= 243.15f) {
+            const float w_c = 0.5f * (w[static_cast<size_t>(k) * n2 + col] + w[static_cast<size_t>(k + 1) * n2 + col]);
+            if (w_c > 0.5f && (q[5] > 1.0e-5f || (q[1] > 5.0e-5f && (q[3] + q[4]) > 1.0e-4f))) {
+                const float q_chg = q[5] + 0.15f * (q[3] + q[4]);
+                phi_chg_col += static_cast<double>(w_c - 0.5f) * static_cast<double>(rho)
+                             * static_cast<double>(q_chg) * static_cast<double>(dz_k);
+            }
+        }
     }
 
     // Pass 2: Subcycled Conservative Float64 Budget Column Fallout (qc, qr, qi, qs, qg)
@@ -2591,6 +2629,10 @@ __global__ void nh_microphysics_kernel(
     if (rain_acc) rain_acc[col] = static_cast<float>(static_cast<double>(rain_acc[col]) + acc_col[0] + acc_col[1]);
     if (snow_acc) snow_acc[col] = static_cast<float>(static_cast<double>(snow_acc[col]) + acc_col[2] + acc_col[3]);
     if (graupel_acc) graupel_acc[col] = static_cast<float>(static_cast<double>(graupel_acc[col]) + acc_col[4]);
+    if (lightning_acc && phi_chg_col > 0.0) {
+        // McCaul et al. (2009) / Lopez (2016) mixed-phase charging flash density [flashes km^-2]
+        lightning_acc[col] = static_cast<float>(static_cast<double>(lightning_acc[col]) + 2.5e-4 * phi_chg_col * dt_s);
+    }
     if (precip_liq_rate) precip_liq_rate[col] = static_cast<float>((acc_col[0] + acc_col[1]) / dt_s);
     if (precip_ice_rate) precip_ice_rate[col] = static_cast<float>((acc_col[2] + acc_col[3] + acc_col[4]) / dt_s);
 }
@@ -2709,6 +2751,7 @@ int32_t ensure_physics_buffers(NhCudaHandle* h) {
     NH_CUDA_CHECK(alloc_z(&h->d_rain_acc, n2));
     NH_CUDA_CHECK(alloc_z(&h->d_snow_acc, n2));
     NH_CUDA_CHECK(alloc_z(&h->d_graupel_acc, n2));
+    NH_CUDA_CHECK(alloc_z(&h->d_lightning_acc, n2));
     NH_CUDA_CHECK(alloc_z(&h->d_sw_down, n2));
     NH_CUDA_CHECK(alloc_z(&h->d_lw_down, n2));
     NH_CUDA_CHECK(alloc_z(&h->d_shf, n2));
@@ -2763,7 +2806,7 @@ void nh_physics_free_buffers(NhCudaHandle* h) {
     cf(h->d_t_skin); cf(h->d_soil_t); cf(h->d_soil_m); cf(h->d_snow_swe);
     cf(h->d_sst_bulk); cf(h->d_dt_cool); cf(h->d_dt_warm);
     cf(h->d_lake_tbot); cf(h->d_lake_hmld); cf(h->d_lake_ctheta); cf(h->d_lake_hice);
-    cf(h->d_rain_acc); cf(h->d_snow_acc); cf(h->d_graupel_acc);
+    cf(h->d_rain_acc); cf(h->d_snow_acc); cf(h->d_graupel_acc); cf(h->d_lightning_acc);
     cf(h->d_sw_down); cf(h->d_lw_down); cf(h->d_shf); cf(h->d_lhf);
     cf(h->d_ustar); cf(h->d_pblh); cf(h->d_t2m); cf(h->d_q2m); cf(h->d_u10m); cf(h->d_v10m);
     cf(h->d_sea_ice_frac); cf(h->d_sea_ice_thick); cf(h->d_sea_ice_tsfc); cf(h->d_sea_ice_albedo);
@@ -2863,6 +2906,11 @@ int32_t nh_cuda_upload_surface(NhCudaHandle* h, const NhConstSurfaceStatePtrs* s
     }
     if (cp(h->d_sea_ice_tsfc, src->sea_ice_tsfc, n2) != 0) return -1;
     if (cp(h->d_sea_ice_albedo, src->sea_ice_albedo, n2) != 0) return -1;
+    if (src->lightning_acc) {
+        if (cp(h->d_lightning_acc, src->lightning_acc, n2) != 0) return -1;
+    } else {
+        NH_CUDA_CHECK(cudaMemset(h->d_lightning_acc, 0, n2 * sizeof(float)));
+    }
     return 0;
 }
 
@@ -2909,6 +2957,7 @@ int32_t nh_cuda_download_surface(NhCudaHandle* h, const NhSurfaceStatePtrs* dst)
     if (cp(dst->sea_ice_thick, h->d_sea_ice_thick, n2) != 0) return -1;
     if (cp(dst->sea_ice_tsfc, h->d_sea_ice_tsfc, n2) != 0) return -1;
     if (cp(dst->sea_ice_albedo, h->d_sea_ice_albedo, n2) != 0) return -1;
+    if (cp(dst->lightning_acc, h->d_lightning_acc, n2) != 0) return -1;
     return 0;
 }
 
@@ -3019,9 +3068,9 @@ int32_t nh_cuda_step_physics(NhCudaHandle* h, double dt_s) {
         // 4. 6-Class Mixed-Phase Microphysics + SLW Preservation + Subcycled Fallout
         if (h->pcfg.enable_microphysics && h->cfg.has_moist) {
             nh_microphysics_kernel<<<grid, block>>>(
-                h->cfg, h->pcfg, g, dt_s, h->d_lsm,
+                h->cfg, h->pcfg, g, dt_s, h->d_lsm, h->d_w,
                 h->d_thp, h->d_pip, h->d_qv, h->d_qc, h->d_qr, h->d_qi, h->d_qs, h->d_qg,
-                h->d_rain_acc, h->d_snow_acc, h->d_graupel_acc,
+                h->d_rain_acc, h->d_snow_acc, h->d_graupel_acc, h->d_lightning_acc,
                 h->d_precip_liq_rate, h->d_precip_ice_rate,
                 h->d_div, h->d_tri_c, h->d_tri_d
             );

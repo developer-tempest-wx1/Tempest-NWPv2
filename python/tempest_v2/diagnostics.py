@@ -136,14 +136,23 @@ def _bolton_theta_e_and_lcl(temp_k: np.ndarray, qv: np.ndarray, p_pa: np.ndarray
 
 
 def _moist_adiabat_t_from_theta_e(theta_e: np.ndarray, p_pa: np.ndarray) -> np.ndarray:
-    """Invert Bolton theta_e along a saturated moist adiabat at pressure p_pa via 2 analytical-derivative Newton steps."""
-    t_est = np.clip(theta_e * ((np.maximum(p_pa, 1000.0) / P0_PA) ** KAPPA), 150.0, 340.0)
-    for _ in range(2):
+    """Invert Bolton theta_e along a saturated moist adiabat at pressure p_pa via bracketed bisection + Newton."""
+    t_hi = np.clip(theta_e * ((np.maximum(p_pa, 1000.0) / P0_PA) ** KAPPA), 150.0, 330.0)
+    t_lo = np.full_like(t_hi, 140.0)
+    for _ in range(5):
+        t_mid = 0.5 * (t_lo + t_hi)
+        qs_m = _qsat_water(t_mid, p_pa)
+        te_m, _ = _bolton_theta_e_and_lcl(t_mid, qs_m, p_pa)
+        too_low = te_m < theta_e
+        t_lo = np.where(too_low, t_mid, t_lo)
+        t_hi = np.where(too_low, t_hi, t_mid)
+    t_est = 0.5 * (t_lo + t_hi)
+    for _ in range(4):
         qs = _qsat_water(t_est, p_pa)
         te_cur, _ = _bolton_theta_e_and_lcl(t_est, qs, p_pa)
         t_safe = np.maximum(t_est, 150.0)
         d_te_dt = np.maximum(te_cur * (1.0 / t_safe + (_LV0 * _LV0 * qs) / (CP_D * 461.5 * (t_safe**3))), 0.8)
-        t_est = np.clip(t_est + (theta_e - te_cur) / d_te_dt, 140.0, 340.0)
+        t_est = np.clip(t_est + (theta_e - te_cur) / d_te_dt, t_lo, t_hi)
     return t_est
 
 
@@ -491,7 +500,8 @@ def compute_synoptic_convective_2d(
     # Column moisture & cloud condensate paths
     tcwv = np.sum(rho * qv * dz_s, axis=0)
     lwp = np.sum(rho * (qc + qr) * dz_s, axis=0)
-    iwp = np.sum(rho * (qi + qs) * dz_s, axis=0)
+    iwp = np.sum(rho * (qi + qs + qg) * dz_s, axis=0)
+    gwp = np.sum(rho * qg * dz_s, axis=0)
 
     # Tiered & total cloud cover: Sundqvist (1989) mixed-phase subgrid RH + resolved condensate + ecRad Exp-Ran overlap
     f_liq = np.clip((t_3d - 250.16) / 23.0, 0.0, 1.0) ** 2
@@ -665,6 +675,26 @@ def compute_synoptic_convective_2d(
     beta_tot = np.maximum(beta_c + beta_fog2m + beta_r + beta_i + beta_s + beta_g + beta_haze + 0.015, 0.05992)
     vis_m = np.clip(2996.0 / beta_tot, 10.0, 50_000.0)
 
+    # Yair et al. (2010) Lightning Potential Index [J kg^-1] over mixed-phase charging zone (-20..0 C)
+    w_raw = state_3d.get("w")
+    if w_raw is not None:
+        w_arr = np.asarray(w_raw, dtype=np.float64)
+        w_c = 0.5 * (w_arr[:-1] + w_arr[1:]) if w_arr.shape[0] == spec.nz + 1 else w_arr
+        chg_m = (t_3d <= 273.15) & (t_3d >= 253.15)
+        qi_lpi = qg * (
+            np.sqrt(np.maximum(qi * qg, 0.0)) / np.maximum(qi + qg, 1e-12)
+            + np.sqrt(np.maximum(qs * qg, 0.0)) / np.maximum(qs + qg, 1e-12)
+        )
+        eps_lpi = np.where(
+            chg_m,
+            2.0 * np.sqrt(np.maximum(qi_lpi * qc, 0.0)) / np.maximum(qi_lpi + qc, 1e-12),
+            0.0,
+        )
+        dz_chg = np.sum(np.where(chg_m, dz_s, 0.0), axis=0)
+        lpi = np.sum(np.where(chg_m, eps_lpi * (w_c**2) * dz_s, 0.0), axis=0) / np.maximum(dz_chg, 500.0)
+    else:
+        lpi = np.zeros((spec.ny, spec.nx), dtype=np.float64)
+
     return {
         "td2m": td2m.astype(np.float32),
         "rh2m": rh2m.astype(np.float32),
@@ -676,6 +706,8 @@ def compute_synoptic_convective_2d(
         "tcwv": tcwv.astype(np.float32),
         "lwp": lwp.astype(np.float32),
         "iwp": iwp.astype(np.float32),
+        "gwp": gwp.astype(np.float32),
+        "lpi": lpi.astype(np.float32),
         "cape_sb": np.asarray(cape_sb, dtype=np.float32),
         "cin_sb": np.asarray(cin_sb, dtype=np.float32),
         "cape_mu": np.asarray(cape_mu, dtype=np.float32),

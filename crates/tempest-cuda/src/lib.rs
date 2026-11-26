@@ -160,6 +160,7 @@ pub struct NhSurfaceStatePtrs {
     pub sea_ice_thick: *mut f32,
     pub sea_ice_tsfc: *mut f32,
     pub sea_ice_albedo: *mut f32,
+    pub lightning_acc: *mut f32,
 }
 
 #[repr(C)]
@@ -192,6 +193,7 @@ pub struct NhConstSurfaceStatePtrs {
     pub sea_ice_thick: *const f32,
     pub sea_ice_tsfc: *const f32,
     pub sea_ice_albedo: *const f32,
+    pub lightning_acc: *const f32,
 }
 
 #[repr(C)]

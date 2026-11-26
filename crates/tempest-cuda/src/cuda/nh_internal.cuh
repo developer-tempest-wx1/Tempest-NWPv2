@@ -392,7 +392,7 @@ struct NhCudaHandle {
     float *d_t_skin = nullptr, *d_soil_t = nullptr, *d_soil_m = nullptr, *d_snow_swe = nullptr;
     float *d_sst_bulk = nullptr, *d_dt_cool = nullptr, *d_dt_warm = nullptr;
     float *d_lake_tbot = nullptr, *d_lake_hmld = nullptr, *d_lake_ctheta = nullptr, *d_lake_hice = nullptr;
-    float *d_rain_acc = nullptr, *d_snow_acc = nullptr, *d_graupel_acc = nullptr;
+    float *d_rain_acc = nullptr, *d_snow_acc = nullptr, *d_graupel_acc = nullptr, *d_lightning_acc = nullptr;
     float *d_sw_down = nullptr, *d_lw_down = nullptr, *d_shf = nullptr, *d_lhf = nullptr;
     float *d_ustar = nullptr, *d_pblh = nullptr, *d_t2m = nullptr, *d_q2m = nullptr, *d_u10m = nullptr, *d_v10m = nullptr;
     float *d_sea_ice_frac = nullptr, *d_sea_ice_thick = nullptr, *d_sea_ice_tsfc = nullptr, *d_sea_ice_albedo = nullptr;

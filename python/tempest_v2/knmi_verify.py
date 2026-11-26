@@ -727,6 +727,8 @@ def sample_wx1_at_stations(
         graup_acc = (
             np.asarray(ds["graupel_acc"].values, dtype=np.float64) if "graupel_acc" in ds else np.zeros_like(t2m_c)
         )
+        has_lightning = "lightning_acc" in ds
+        lightning_acc = np.asarray(ds["lightning_acc"].values, dtype=np.float64) if has_lightning else None
         tot_precip_mm = np.maximum(0.0, rain_acc + snow_acc + graup_acc)
 
         if "precip_rate" in ds:
@@ -751,6 +753,7 @@ def sample_wx1_at_stations(
         rain_step_mm = _part_delta(rain_acc, "rain_acc")
         snow_step_mm = _part_delta(snow_acc, "snow_acc")
         graup_step_mm = _part_delta(graup_acc, "graupel_acc")
+        lightning_step = _part_delta(lightning_acc, "lightning_acc") if lightning_acc is not None else np.full_like(t2m_c, np.nan)
 
         x_coords = np.asarray(ds.coords["x"].values, dtype=np.float64) if "x" in ds.coords else None
         y_coords = np.asarray(ds.coords["y"].values, dtype=np.float64) if "y" in ds.coords else None
@@ -786,6 +789,25 @@ def sample_wx1_at_stations(
         mx = maximum_filter(safe, size=size_nb25, mode="nearest")
         return np.where(mx > -1e30, mx, np.nan)
 
+    coloc_fallback_2d = np.where(
+        (
+            np.isfinite(graup_step_mm)
+            & (graup_step_mm >= 0.05)
+            & np.isfinite(cape_mu)
+            & (cape_mu >= 50.0)
+        )
+        | (
+            np.isfinite(cape_mu)
+            & (cape_mu >= 300.0)
+            & np.isfinite(iwp)
+            & (iwp >= 0.25)
+            & np.isfinite(precip_step_mm)
+            & (precip_step_mm >= 1.5)
+        ),
+        1.0,
+        0.0,
+    )
+
     fields_2d = {
         "mod_t2m_c": t2m_c,
         "mod_td2m_c": td2m_c,
@@ -803,14 +825,17 @@ def sample_wx1_at_stations(
         "mod_rain_step_mm": rain_step_mm,
         "mod_snow_step_mm": snow_step_mm,
         "mod_graupel_step_mm": graup_step_mm,
+        "mod_lightning_step": lightning_step,
         "mod_cape_mu": cape_mu,
         "mod_cin_sb": cin_sb,
         "mod_iwp": iwp,
         "mod_freezing_level_m": frzlvl_m,
+        "mod_nb25_lightning_step": _nb25_max(lightning_step),
         "mod_nb25_graup_mm": _nb25_max(graup_step_mm),
         "mod_nb25_cape_mu": _nb25_max(cape_mu),
         "mod_nb25_iwp": _nb25_max(iwp),
         "mod_nb25_precip_mm": _nb25_max(precip_step_mm),
+        "mod_nb25_thunder_cell": _nb25_max(coloc_fallback_2d),
     }
     if has_vis_fog:
         fields_2d["mod_vis_fog_m"] = vis_fog_m
@@ -878,6 +903,7 @@ def sample_wx1_at_stations(
         "rain_acc": rain_acc,
         "snow_acc": snow_acc,
         "graupel_acc": graup_acc,
+        "lightning_acc": lightning_acc,
         "rim_max_mmh": float(np.max(precip_mmh[rim_mask])),
         "int_max_mmh": float(np.max(precip_mmh[~rim_mask])),
         "nl_max_mmh": float(np.max(precip_mmh[nl_mask])) if np.any(nl_mask) else float("nan"),
@@ -1050,20 +1076,29 @@ def compute_binary_contingency(
 
 
 def _mod_thunder_indicator(row: Dict[str, Any], *, neighborhood_25km: bool = False) -> Optional[bool]:
-    """Classical microphysics+instability thunder diagnostic (graupel+CAPE/precip or deep IWP+CAPE)."""
+    """Classical prognostic charging lightning or co-located microphysics+instability thunder diagnostic."""
     if neighborhood_25km:
+        lt = float(row.get("mod_nb25_lightning_step", float("nan")))
         gr = float(row.get("mod_nb25_graup_mm", row.get("mod_graupel_step_mm", float("nan"))))
         cape = float(row.get("mod_nb25_cape_mu", row.get("mod_cape_mu", float("nan"))))
         iwp = float(row.get("mod_nb25_iwp", row.get("mod_iwp", float("nan"))))
         pr = float(row.get("mod_nb25_precip_mm", row.get("mod_precip_cmp", row.get("mod_precip_step_mm", float("nan")))))
+        nb_cell = float(row.get("mod_nb25_thunder_cell", float("nan")))
     else:
+        lt = float(row.get("mod_lightning_step", float("nan")))
         gr = float(row.get("mod_graupel_step_mm", float("nan")))
         cape = float(row.get("mod_cape_mu", float("nan")))
         iwp = float(row.get("mod_iwp", float("nan")))
         pr = float(row.get("mod_precip_cmp", row.get("mod_precip_step_mm", float("nan"))))
-    if not math.isfinite(gr) and not math.isfinite(cape):
+        nb_cell = float("nan")
+
+    if math.isfinite(lt) and lt >= 0.01:
+        return True
+    if not math.isfinite(lt) and not math.isfinite(gr) and not math.isfinite(cape) and not math.isfinite(nb_cell):
         return None
-    if math.isfinite(gr) and gr >= 0.05 and ((math.isfinite(cape) and cape >= 50.0) or (math.isfinite(pr) and pr >= 0.5)):
+    if neighborhood_25km and math.isfinite(nb_cell):
+        return nb_cell >= 0.5
+    if math.isfinite(gr) and gr >= 0.05 and math.isfinite(cape) and cape >= 50.0:
         return True
     if math.isfinite(cape) and cape >= 300.0 and math.isfinite(iwp) and iwp >= 0.25 and math.isfinite(pr) and pr >= 1.5:
         return True
@@ -2442,6 +2477,8 @@ def verify_run_against_knmi(
                         "snow_acc": s if s is not None else np.zeros_like(r),
                         "graupel_acc": g if g is not None else np.zeros_like(r),
                     }
+                    if "lightning_acc" in ds_p:
+                        prev_precip_parts["lightning_acc"] = np.asarray(ds_p["lightning_acc"].values, dtype=np.float64)
                 prev_lead_h = lead_h
             continue
 
@@ -2494,6 +2531,8 @@ def verify_run_against_knmi(
             "snow_acc": grid["snow_acc"],
             "graupel_acc": grid["graupel_acc"],
         }
+        if grid.get("lightning_acc") is not None:
+            prev_precip_parts["lightning_acc"] = grid["lightning_acc"]
         prev_lead_h = lead_h
 
         for row in matched:

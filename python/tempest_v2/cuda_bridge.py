@@ -126,6 +126,7 @@ class NhSurfaceStatePtrsC(ctypes.Structure):
         ("sea_ice_thick", ctypes.c_void_p),
         ("sea_ice_tsfc", ctypes.c_void_p),
         ("sea_ice_albedo", ctypes.c_void_p),
+        ("lightning_acc", ctypes.c_void_p),
     ]
 
 
@@ -426,6 +427,7 @@ class NonHydrostaticGPUSolver:
         "sea_ice_thick",
         "sea_ice_tsfc",
         "sea_ice_albedo",
+        "lightning_acc",
     )
     SURFACE_STATE_STRUCT_ORDER = (
         "t_skin",
@@ -456,6 +458,7 @@ class NonHydrostaticGPUSolver:
         "sea_ice_thick",
         "sea_ice_tsfc",
         "sea_ice_albedo",
+        "lightning_acc",
     )
 
     def __init__(

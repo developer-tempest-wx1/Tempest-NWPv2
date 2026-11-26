@@ -158,6 +158,7 @@ typedef struct NhSurfaceStatePtrs {
     float* sea_ice_thick;  /* Optional mean sea-ice thickness [m] */
     float* sea_ice_tsfc;   /* Optional sea-ice surface temp [K] */
     float* sea_ice_albedo; /* Optional sea-ice broadband albedo [-] */
+    float* lightning_acc;  /* Optional accumulated lightning flash density [flashes km^-2] */
 } NhSurfaceStatePtrs;
 
 typedef struct NhConstSurfaceStatePtrs {
@@ -189,6 +190,7 @@ typedef struct NhConstSurfaceStatePtrs {
     const float* sea_ice_thick;
     const float* sea_ice_tsfc;
     const float* sea_ice_albedo;
+    const float* lightning_acc;
 } NhConstSurfaceStatePtrs;
 
 typedef struct NhCudaHandle NhCudaHandle;
